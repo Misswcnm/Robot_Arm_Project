@@ -1,0 +1,38 @@
+# Build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# C++ build
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled DDS
+*.idl
+*.h.tmp
+*.c.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Colcon
+src/*/COLCON_IGNORE

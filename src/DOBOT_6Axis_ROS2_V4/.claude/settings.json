@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/ylx/TCP-IP-CR-CPP-V3/ 2>/dev/null || echo \"Directory not found\")",
+      "Read(//home/ylx/TCP-IP-CR-CPP-V3/**)"
+    ]
+  }
+}
