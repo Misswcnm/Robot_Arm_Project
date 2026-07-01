@@ -211,21 +211,22 @@ namespace parseTool
         std::stringstream ss;
         ss << "PositiveKin(";
         ss << request->j1 << "," << request->j2 << "," << request->j3 << "," << request->j4 << "," << request->j5 << ","
-           << request->j6 << ",";
+           << request->j6;
+        // CR5: user/tool 作为可选位置参数（不用命名格式）
         if (request->user != "")
-            ss << ",user=" << request->user;
+            ss << "," << request->user;
         if (request->tool != "")
-            ss << ", tool=" << request->tool;
+            ss << "," << request->tool;
         ss << ")";
         return ss.str();
     }
     std::string parserInverseKinRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::InverseKin::Request> request)
     {
-        // InverseKin(X,Y,Z,Rx,Ry,Rz,User,Tool,useJointNear,JointNear)
+        // InverseKin(X,Y,Z,Rx,Ry,Rz,user,tool,useJointNear,jointNear) — 位置参数
         std::stringstream ss;
         ss << "InverseKin(" << request->x << "," << request->y << "," << request->z << "," << request->rx << "," << request->ry
-           << "," << request->rz << ", user=" << request->user << ",tool=" << request->tool
-           << ",useJointNear=" << request->use_joint_near << ",jointNear=" << request->joint_near << ")";
+           << "," << request->rz << "," << request->user << "," << request->tool
+           << "," << request->use_joint_near << "," << request->joint_near << ")";
         return ss.str();
     }
     std::string parserGetAngleRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::GetAngle::Request> request)
@@ -545,19 +546,23 @@ namespace parseTool
     }
     std::string parsermovJRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::MovJ::Request> request)
     {
-        std::string stringOrder = "MovJ(";
+        std::string stringOrder;
         char cmdCoordinate[100];
-        sprintf(cmdCoordinate, "{%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f}", request->a, request->b, request->c, request->d,
+        sprintf(cmdCoordinate, "%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f", request->a, request->b, request->c, request->d,
                 request->e, request->f);
 
         if (request->mode)
         {
-            stringOrder = stringOrder + "joint=" + cmdCoordinate;
+            // CR5 旧固件: 关节运动用 JointMovJ（V3 命令名）
+            stringOrder = "JointMovJ(";
         }
         else
         {
-            stringOrder = stringOrder + "pose=" + cmdCoordinate;
+            // CR5 旧固件: 笛卡尔运动用 MovJ（位置参数格式）
+            stringOrder = "MovJ(";
         }
+        stringOrder = stringOrder + cmdCoordinate;
+
         if (!(request->param_value.empty() || request->param_value[0].empty()))
         {
             for (size_t i = 0; i < request->param_value.size(); i++)
@@ -574,17 +579,10 @@ namespace parseTool
     {
         std::string stringOrder = "MovL(";
         char cmdCoordinate[100];
-        sprintf(cmdCoordinate, "{%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f}", request->a, request->b, request->c, request->d,
+        sprintf(cmdCoordinate, "%0.3f,%0.3f,%0.3f,%0.3f,%0.3f,%0.3f", request->a, request->b, request->c, request->d,
                 request->e, request->f);
+        stringOrder = stringOrder + cmdCoordinate;
 
-        if (request->mode)
-        {
-            stringOrder = stringOrder + "joint=" + cmdCoordinate;
-        }
-        else
-        {
-            stringOrder = stringOrder + "pose=" + cmdCoordinate;
-        }
         if (!(request->param_value.empty() || request->param_value[0].empty()))
         {
             for (size_t i = 0; i < request->param_value.size(); i++)

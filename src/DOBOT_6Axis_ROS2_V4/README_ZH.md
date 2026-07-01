@@ -71,9 +71,12 @@ ros2 launch dobot_moveit moveit_demo.launch.py
 ros2 launch dobot_gazebo dobot_gazebo.launch.py
 
 # 控制真实机械臂
+ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py
+
 ros2 launch dobot_bringup_v4 dobot_bringup_ros2.launch.py
 ros2 launch dobot_moveit dobot_moveit.launch.py
 ```
+
 
 ---
 

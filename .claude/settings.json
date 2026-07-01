@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from ultralytics import YOLO; print\\('YOLO available'\\)\")",
+      "Bash(python3 -c \"from ultralytics import YOLO; print\\('YOLO OK'\\)\")"
+    ]
+  }
+}
