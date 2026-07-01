@@ -245,12 +245,10 @@ class VisualServo:
 
         # 5. 动态补偿比例 + 单步限幅
         self._step_count += 1
-        if self._step_count <= 1:
+        if self._step_count <= 2:
             ratio = 0.7
-        elif self._step_count <= 2:
+        elif self._step_count <= 5:
             ratio = 0.5
-        elif self._step_count <= 4:
-            ratio = 0.35
         else:
             ratio = 0.2
 
@@ -258,30 +256,36 @@ class VisualServo:
         T_delta = self.X @ T_icp_mm @ self.X_inv
         T_correction = np.linalg.inv(T_delta)
 
-        t_correction = T_correction[:3, 3]
+        # 提取完整修正量 (平移+旋转)
+        t_full = T_correction[:3, 3]
+        R_full = T_correction[:3, :3]
+
         # 单步限幅: |t| ≤ 30mm
-        t_norm_corr = np.linalg.norm(t_correction)
+        t_norm_corr = np.linalg.norm(t_full)
         if t_norm_corr > 30:
-            t_correction *= 30.0 / t_norm_corr
-        t_partial = t_correction * ratio
+            t_full *= 30.0 / t_norm_corr
 
-        T_correction_partial = np.eye(4)
-        T_correction_partial[:3, 3] = t_partial  # 仅平移, 不管旋转
-
-        T_target = T_cur @ T_correction_partial
-
-        dp = [T_target[i, 3] - T_cur[i, 3] for i in range(3)]
-        out['delta_mm'] = [round(v, 1) for v in dp]
+        t_partial = t_full * ratio
+        R_partial = Rot.from_matrix(R_full)
+        rotvec_partial = R_partial.as_rotvec() * ratio
+        R_partial = Rot.from_rotvec(rotvec_partial).as_matrix()
 
         pre = self.robot.get_tool()
         cur_rpy = pre[3:6] if pre else [0,0,0]
+        use_joint = (t_norm < 20 or r_deg > 5)
 
-        # 误差小时用JointMovJ修正姿态+位置, 误差大时用MovL仅平移
-        if t_norm < 20:
-            # JointMovJ: 完整6DOF补偿
+        if use_joint:
+            # JointMovJ: 完整6DOF (含旋转)
+            T_corr_p = np.eye(4)
+            T_corr_p[:3,:3] = R_partial
+            T_corr_p[:3,3] = t_partial
+            T_target = T_cur @ T_corr_p
+            dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
+            out['delta_mm'] = [round(v,1) for v in dp]
+
             j_now = self.robot.get_joints()
             if j_now:
-                drot_tool = Rot.from_matrix(T_correction_partial[:3,:3]).as_rotvec()
+                drot_tool = rotvec_partial  # 已经是rotvec
                 drot_base = T_cur[:3,:3] @ drot_tool
                 cart = np.hstack([dp, drot_base])
                 J = _compute_jacobian(j_now)
@@ -297,7 +301,12 @@ class VisualServo:
                         out['ok'] = True; return out
                     self.robot.recover()
         else:
-            # MovL: 仅XYZ, 姿态不变
+            # MovL: 仅XYZ平移, 姿态不变
+            T_corr_p = np.eye(4)
+            T_corr_p[:3,3] = t_partial
+            T_target = T_cur @ T_corr_p
+            dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
+            out['delta_mm'] = [round(v,1) for v in dp]
             target_xyz = [T_target[0,3], T_target[1,3], T_target[2,3]]
             target_pose = target_xyz + cur_rpy
             print(f'  补偿 {ratio*100:.0f}% (step{self._step_count},MovL): '
@@ -306,7 +315,6 @@ class VisualServo:
             if self.robot.movl(target_pose) and self.robot.check_moved(pre):
                 out['ok'] = True; return out
 
-        # 失败 → 恢复, 重采ICP
         print('  ⚠ 移动失败 → 恢复后重采')
         self.robot.recover()
         out['ok'] = True; return out
