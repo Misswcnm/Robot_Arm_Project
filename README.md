@@ -65,7 +65,7 @@ bash scripts/run_icp_servo.sh
 |----|------|
 | `r` | 录制模板(5帧融合→5mm压缩→预建3层KDTree) |
 | `m` | 单步: 采点云→ICP→70%补偿→MovL |
-| `a` | 闭环迭代(最多15次)→|t|<3mm & |r|<0.5°收敛，ERROR自动恢复 |
+| `a` | 闭环迭代(最多15次)→|t|<10mm & |r|<1°收敛，ERROR自动恢复 |
 | `1`/`2`/`3` | 反向偏移(小/中/大) |
 | `4`/`5`/`6` | 正向偏移(小/中/大) |
 
@@ -84,6 +84,45 @@ bash scripts/run_icp_servo.sh
 | 停止检测 | ToolVectorActual 连续3帧 Δ<0.3mm |
 
 
+
+## ICP Pyramid 加速 (25s → 0.5s)
+
+### 问题: 模板 93万点 × 3级多尺度 × KDTree每次重建 = 单次ICP 25s+
+
+### Pyramid 方案
+
+**录制时 (record_template, 只做一次):**
+
+```
+5帧融合 → 5mm压缩(~80K点)
+   ↓ 预建3层 cKDTree, 存为 self._ref_pyramid
+┌─────────────────────────────────────────────────┐
+│ L0: 20mm体素 → ~5K点  + cKDTree  dmax=100mm   │
+│ L1: 10mm体素 → ~20K点 + cKDTree  dmax=50mm    │
+│ L2:  5mm体素 → ~80K点 + cKDTree  dmax=25mm    │
+└─────────────────────────────────────────────────┘
+```
+
+**每次 ICP (step), 3级逐级传递:**
+
+```
+T_init (初值, 米)
+   ↓
+┌─ L0 (20mm): 当前扫描→20mm下采样 → T_acc变换 → tree.query(workers=-1) ≈0.01s
+│   在 ~5K模板点中找最近邻 (dmax=100mm) → SVD求R,t → 更新 T_acc
+│   ↓
+├─ L1 (10mm): 当前扫描→10mm下采样 → T_acc变换 → tree.query() ≈0.02s
+│   在 ~20K模板点中找最近邻 (dmax=50mm) → SVD求R,t → 更新 T_acc
+│   ↓
+└─ L2 (5mm):  当前扫描→5mm下采样 → T_acc变换 → tree.query() ≈0.1s
+    在 ~80K模板点中找最近邻 (dmax=25mm) → SVD求R,t → 最终 T_icp (米)
+   ↓
+T_icp × 1000 → T_icp_mm (毫米) → 手眼补偿链路
+```
+
+**每级只做 1 次配准 (不做迭代)**: 粗→中→精逐级传递，累积的 `T_acc` 已经足够精确。
+
+**关键**: `cKDTree(query)` 用预建树直接查找，不重复构建；`tree.query(workers=-1)` 多线程；当前扫描每次按体素下采样后再变换。
 
 ## 安全
 

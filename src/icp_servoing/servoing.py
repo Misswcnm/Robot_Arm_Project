@@ -30,6 +30,7 @@ class VisualServo:
         self._T_base_camera_ref = None
         self._last_tool = None
         self._step_count = 0
+        self._total_dp = 0.0; self._total_dr = 0.0
 
     # ── Quality gate ──
     @staticmethod
@@ -67,6 +68,7 @@ class VisualServo:
     def record_template(self, n_frames: int = 5) -> bool:
         """多帧融合→5mm压缩→预建3层KDTree pyramid"""
         print(f'🎯 录制模板 ({n_frames} 帧)...')
+        pc_node = getattr(self, '_pc_node', None)
         frames = []
         for i in range(n_frames):
             pc = self._capture_pc(vs=0.005)
@@ -119,12 +121,14 @@ class VisualServo:
         return T
 
     def _capture_pc(self, vs: float = 0.005) -> np.ndarray | None:
-        """用最新点云, 不清空缓存"""
-        for _ in range(20):
-            rclpy.spin_once(self.robot._node, timeout_sec=0.1)
-            pc = getattr(self.robot._node, '_pc', None)
-            if pc is not None and len(pc) > 500:
-                return voxel_down(pc, vs)
+        """等停稳后的新点云帧"""
+        pc_node = getattr(self, '_pc_node', None)
+        if pc_node is None:
+            return None
+        pc_node.wait_fresh()  # ← 确保是新帧
+        pc = pc_node.latest_pc
+        if pc is not None and len(pc) > 500:
+            return voxel_down(pc, vs)
         return None
 
     # ── One iteration of ICP + compensation ──
@@ -179,7 +183,7 @@ class VisualServo:
             src_tf = (T_acc[:3,:3] @ src_ds.T).T + T_acc[:3,3]
 
             # Use tree.query directly (pre-built, fast)
-            dist, idx = tree.query(src_tf, distance_upper_bound=dmax)
+            dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
             mask = dist < dmax
             if mask.sum() < 10:
                 scales_info.append({'rmse': float('inf'), 'inliers': 0, 'overlap': 0})
@@ -270,79 +274,64 @@ class VisualServo:
         rotvec_partial = R_partial.as_rotvec() * ratio
         R_partial = Rot.from_rotvec(rotvec_partial).as_matrix()
 
-        pre = self.robot.get_tool()
-        cur_rpy = pre[3:6] if pre else [0,0,0]
-        use_joint = (t_norm < 20 or r_deg > 5)
+        # JointMovJ: 完整6DOF (CR5 MovL已移除)
+        T_corr_p = np.eye(4)
+        T_corr_p[:3,:3] = R_partial
+        T_corr_p[:3,3] = t_partial
+        T_target = T_cur @ T_corr_p
+        dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
+        out['delta_mm'] = [round(v,1) for v in dp]
 
-        if use_joint:
-            # JointMovJ: 完整6DOF (含旋转)
-            T_corr_p = np.eye(4)
-            T_corr_p[:3,:3] = R_partial
-            T_corr_p[:3,3] = t_partial
-            T_target = T_cur @ T_corr_p
-            dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
-            out['delta_mm'] = [round(v,1) for v in dp]
+        j_now = self.robot.get_joints()
+        if not j_now:
+            self.robot.recover()
+            out['ok'] = False; out['error'] = 'GetAngle失败'; return out
+        drot_base = T_cur[:3,:3] @ rotvec_partial
+        cart = np.hstack([dp, drot_base])
+        J = _compute_jacobian(j_now)
+        try: dtheta = np.degrees(np.linalg.pinv(J,rcond=1e-3) @ cart)
+        except:
+            self.robot.recover()
+            out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
+        target_j = [j_now[i]+dtheta[i] for i in range(6)]
+        pre_move = self.robot.get_tool()
+        print(f'  补偿 {ratio*100:.0f}% (step{self._step_count}): '
+              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
+              f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
+              f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
+        if self.robot.movj(target_j):
+            # 实际移动量 (从ToolVectorActual)
+            after = self.robot.get_tool()
+            if after and pre_move:
+                dp = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
+                Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
+                Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
+                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
+                self._total_dp += dp; self._total_dr += dr
+                print(f'  → {dp/10:.1f}cm  {dr:.1f}°')
+            out['ok'] = True; return out
 
-            j_now = self.robot.get_joints()
-            if j_now:
-                drot_tool = rotvec_partial  # 已经是rotvec
-                drot_base = T_cur[:3,:3] @ drot_tool
-                cart = np.hstack([dp, drot_base])
-                J = _compute_jacobian(j_now)
-                try: dtheta = np.degrees(np.linalg.pinv(J,rcond=1e-3) @ cart)
-                except: dtheta = None
-                if dtheta is not None:
-                    target_j = [j_now[i]+dtheta[i] for i in range(6)]
-                    print(f'  补偿 {ratio*100:.0f}% (step{self._step_count},JointMovJ): '
-                          f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
-                          f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
-                          f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
-                    if self.robot.movj(target_j) and self.robot.check_moved(pre):
-                        out['ok'] = True; return out
-                    self.robot.recover()
-        else:
-            # MovL: 仅XYZ平移, 姿态不变
-            T_corr_p = np.eye(4)
-            T_corr_p[:3,3] = t_partial
-            T_target = T_cur @ T_corr_p
-            dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
-            out['delta_mm'] = [round(v,1) for v in dp]
-            target_xyz = [T_target[0,3], T_target[1,3], T_target[2,3]]
-            target_pose = target_xyz + cur_rpy
-            print(f'  补偿 {ratio*100:.0f}% (step{self._step_count},MovL): '
-                  f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm → '
-                  f'xyz=[{target_pose[0]:.0f} {target_pose[1]:.0f} {target_pose[2]:.0f}]')
-            if self.robot.movl(target_pose) and self.robot.check_moved(pre):
-                out['ok'] = True; return out
-
-        print('  ⚠ 移动失败 → 恢复后重采')
         self.robot.recover()
-        out['ok'] = True; return out
+        out['ok'] = False; out['error'] = 'JointMovJ失败(已恢复)'
+        return out
 
-    # ── Full close-loop ──
     def align(self, max_iters: int = 15) -> bool:
-        """迭代闭环补偿; ERROR后自动恢复并继续"""
         print(f'\n{"="*55}\n  闭环对齐 (最多{max_iters}次)\n{"="*55}')
         self._step_count = 0
+        self._total_dp = 0.0; self._total_dr = 0.0
         i = 0
         while i < max_iters:
             i += 1
             print(f'\n  [{i}/{max_iters}]')
             result = self.step()
             if result.get('converged'):
-                print(f'\n✅ 闭环收敛 ({i} 次)')
+                print(f'\n✅ 闭环收敛 ({i}次)  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
                 return True
-            if not result['ok']:
-                err = result.get('error', '未知')
-                print(f'\n⚠ {err}')
-                if 'MovL' in err or 'ERROR' in err:
-                    self.robot.recover()
-                    self.robot.wait_stop()
-                    print('  ↻ 恢复后继续...')
-                    continue  # 从当前位姿继续!
-                return False
-            self.robot.wait_stop()
-        print(f'\n⚠ 达最大迭代次数({max_iters})')
+            if result['ok']:
+                continue  # 成功, 下一轮
+            # 失败: 已recover, 直接重试(从当前位姿重新ICP)
+            print(f'  ↻ 恢复后重试 (从当前位姿)')
+        print(f'\n⚠ 达最大迭代次数({max_iters})  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
         return False
 
 
