@@ -1,5 +1,7 @@
 # CR5 手眼标定 + ICP 视觉伺服
 
+复现记录见 [`docs/icp_servoing_reproduce.md`](docs/icp_servoing_reproduce.md)。
+
 ## 启动
 
 ```bash

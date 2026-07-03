@@ -12,7 +12,10 @@ from rclpy.node import Node
 from dobot_msgs_v4.srv import *
 import time
 
+"""
+定义了一个类继承自Node
 
+"""
 class AdderClient(Node):
     def __init__(self, name):
         super().__init__(name)

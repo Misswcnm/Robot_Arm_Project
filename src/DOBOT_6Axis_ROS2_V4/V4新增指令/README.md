@@ -3623,7 +3623,7 @@ while(true) {
 - 功能：沿用户坐标系笛卡尔点偏移
 
 - 格式：
-
+lL
   **RelPointUser(joint = {j1, j2, j3, j4, j5, j6}, {offsetX,offsetY,offsetZ,offsetRx,offsetRy,offsetRz})**
 
   **RelPointUser(pose= {x,y,z,rx,ry,rz}, {offsetX,offsetY,offsetZ,offsetRx,offsetRy,offsetRz})**
