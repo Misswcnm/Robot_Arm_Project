@@ -31,6 +31,8 @@ class VisualServo:
         self._last_tool = None
         self._step_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
+        self.final_icp_trans_thresh_mm = 5.0
+        self.final_icp_rot_thresh_deg = 0.5
 
     # ── Quality gate ──
     @staticmethod
@@ -56,13 +58,22 @@ class VisualServo:
 
     @staticmethod
     def converged(T_icp: np.ndarray,
-                  trans_thresh: float = 10.0,
-                  rot_thresh_deg: float = 1.0) -> bool:
-        """判断是否已收敛: T_icp ≈ I"""
+                  trans_thresh: float = 5.0,
+                  rot_thresh_deg: float = 0.5) -> bool:
+        """判断视觉剩余校正是否已收敛: T_icp ≈ I"""
         t_norm = np.linalg.norm(T_icp[:3, 3])
         r_angle = np.degrees(
             np.linalg.norm(Rot.from_matrix(T_icp[:3, :3]).as_rotvec()))
         return t_norm < trans_thresh and r_angle < rot_thresh_deg
+
+    @staticmethod
+    def pose_error(T_cur: np.ndarray, T_ref: np.ndarray) -> tuple[float, float]:
+        """Tool当前位姿相对模板位姿的误差: 返回(mm, deg)."""
+        T_err = np.linalg.inv(T_ref) @ T_cur
+        t_err = np.linalg.norm(T_err[:3, 3])
+        r_err = np.degrees(
+            np.linalg.norm(Rot.from_matrix(T_err[:3, :3]).as_rotvec()))
+        return float(t_err), float(r_err)
 
     # ── Template: pre-build pyramid with KDTree ──
     def record_template(self, n_frames: int = 5) -> bool:
@@ -165,6 +176,9 @@ class VisualServo:
         print(f'  T_init |t|={np.linalg.norm(T_init_mm[:3,3]):.0f}mm  '
               f'T_cur=[{T_cur[0,3]:.0f} {T_cur[1,3]:.0f} {T_cur[2,3]:.0f}]  '
               f'T_ref=[{self._T_base_tool_ref[0,3]:.0f} {self._T_base_tool_ref[1,3]:.0f} {self._T_base_tool_ref[2,3]:.0f}]')
+        pose_t_err, pose_r_err = self.pose_error(T_cur, self._T_base_tool_ref)
+        out['pose_error_mm'] = round(pose_t_err, 1)
+        out['pose_error_deg'] = round(pose_r_err, 2)
 
         # 2. Pyramid ICP (pre-built cKDTree, no rebuild)
         from scipy.spatial import cKDTree
@@ -229,6 +243,7 @@ class VisualServo:
         out['icp_rot_deg'] = round(r_deg, 2)
         print(f'  ICP: RMSE={out["rmse"]:.1f}mm  overl={out["overlap"]:.2f}  '
               f'|t|={t_norm:.1f}mm  |r|={r_deg:.2f}°')
+        print(f'  Tool误差: |T_cur-T_ref|={pose_t_err:.1f}mm  |r|={pose_r_err:.2f}°')
 
         # 3. Quality gate
         info = {'rmse': scales_info[-1]['rmse'] if scales_info else 99,
@@ -240,21 +255,22 @@ class VisualServo:
             print(f'  ❌ {out["error"]}')
             return out
 
-        # 4. 收敛判断
-        if self.converged(T_icp_mm):
+        # 4. 收敛判断: 只使用ICP估计的剩余校正量。
+        # Tool误差只用于实验观测, 不能参与闭环判定。
+        icp_converged = self.converged(
+            T_icp_mm,
+            self.final_icp_trans_thresh_mm,
+            self.final_icp_rot_thresh_deg)
+        if icp_converged:
             out['ok'] = True
             out['converged'] = True
-            print(f'  ✅ 已收敛')
+            print(f'  ✅ 已收敛: ICP残差={t_norm:.1f}mm/{r_deg:.2f}°  '
+                  f'Tool误差(仅监控)={pose_t_err:.1f}mm/{pose_r_err:.2f}°')
             return out
 
-        # 5. 动态补偿比例 + 单步限幅
+        # 5. 全量补偿 (单步限幅30mm兜底)
         self._step_count += 1
-        if self._step_count <= 2:
-            ratio = 0.7
-        elif self._step_count <= 5:
-            ratio = 0.5
-        else:
-            ratio = 0.2
+        ratio = 1.0
 
         #    T_delta = X @ T_icp_mm @ X⁻¹
         T_delta = self.X @ T_icp_mm @ self.X_inv
@@ -325,7 +341,12 @@ class VisualServo:
             print(f'\n  [{i}/{max_iters}]')
             result = self.step()
             if result.get('converged'):
-                print(f'\n✅ 闭环收敛 ({i}次)  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
+                pose_msg = ''
+                if 'pose_error_mm' in result:
+                    pose_msg = (f'  T_cur-T_ref误差 {result["pose_error_mm"]:.1f}mm'
+                                f'  {result.get("pose_error_deg", 0):.2f}°')
+                print(f'\n✅ 闭环收敛 ({i}次)  共补偿 {self._total_dp/10:.1f}cm  '
+                      f'{self._total_dr:.1f}°{pose_msg}')
                 return True
             if result['ok']:
                 continue  # 成功, 下一轮
