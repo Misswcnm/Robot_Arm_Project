@@ -33,6 +33,9 @@ class VisualServo:
         self._total_dp = 0.0; self._total_dr = 0.0
         self.final_icp_trans_thresh_mm = 5.0
         self.final_icp_rot_thresh_deg = 0.5
+        self.point_to_plane_trigger_mm = 5.0
+        self.point_to_plane_dmax = 0.012
+        self.point_to_plane_iters = 6
 
     # ── Quality gate ──
     @staticmethod
@@ -75,6 +78,95 @@ class VisualServo:
             np.linalg.norm(Rot.from_matrix(T_err[:3, :3]).as_rotvec()))
         return float(t_err), float(r_err)
 
+    @staticmethod
+    def _estimate_normals(pts: np.ndarray, tree, k: int = 16) -> np.ndarray:
+        """用局部PCA估计模板点法向, 供point-to-plane精配准使用."""
+        if len(pts) == 0:
+            return np.empty((0, 3), dtype=np.float64)
+        kk = min(k, len(pts))
+        _, idx = tree.query(pts, k=kk, workers=-1)
+        if kk == 1:
+            return np.tile(np.array([0.0, 0.0, 1.0]), (len(pts), 1))
+        normals = np.zeros_like(pts)
+        for i, neigh_idx in enumerate(idx):
+            q = pts[np.atleast_1d(neigh_idx)]
+            q = q - q.mean(axis=0)
+            _, _, vh = np.linalg.svd(q, full_matrices=False)
+            n = vh[-1]
+            normals[i] = n / (np.linalg.norm(n) + 1e-12)
+        return normals
+
+    @staticmethod
+    def _point_to_plane_refine(src: np.ndarray, tgt: np.ndarray, tree,
+                               normals: np.ndarray, T_init: np.ndarray,
+                               dmax: float = 0.012,
+                               max_iter: int = 6) -> tuple[np.ndarray, dict]:
+        """小残差下的point-to-plane ICP微调, 单位沿用点云(m)."""
+        T = T_init.copy()
+        last_rmse = float('inf')
+        inliers = 0
+        overlap = 0.0
+
+        for _ in range(max_iter):
+            src_tf = (T[:3, :3] @ src.T).T + T[:3, 3]
+            dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
+            mask = dist < dmax
+            inliers = int(mask.sum())
+            overlap = inliers / len(src) if len(src) else 0.0
+            if inliers < 30:
+                break
+
+            p = src_tf[mask]
+            q = tgt[idx[mask]]
+            n = normals[idx[mask]]
+            residual = np.sum((p - q) * n, axis=1)
+
+            keep = np.abs(residual) < max(dmax, 2.5 * np.median(np.abs(residual)) + 1e-6)
+            if int(keep.sum()) < 30:
+                break
+            p, n, residual = p[keep], n[keep], residual[keep]
+            inliers = int(keep.sum())
+            overlap = inliers / len(src) if len(src) else 0.0
+
+            A = np.hstack([np.cross(p, n), n])
+            try:
+                delta, *_ = np.linalg.lstsq(A, -residual, rcond=1e-4)
+            except np.linalg.LinAlgError:
+                break
+
+            rotvec = delta[:3]
+            t_step = delta[3:]
+            rot_norm = np.linalg.norm(rotvec)
+            t_norm = np.linalg.norm(t_step)
+            if rot_norm > np.radians(0.5):
+                rotvec *= np.radians(0.5) / rot_norm
+            if t_norm > 0.003:
+                t_step *= 0.003 / t_norm
+
+            R_step = Rot.from_rotvec(rotvec).as_matrix()
+            T[:3, :3] = R_step @ T[:3, :3]
+            T[:3, 3] = R_step @ T[:3, 3] + t_step
+
+            rmse = float(np.sqrt(np.mean(residual ** 2)))
+            if abs(last_rmse - rmse) < 1e-5:
+                last_rmse = rmse
+                break
+            last_rmse = rmse
+
+        src_tf = (T[:3, :3] @ src.T).T + T[:3, 3]
+        dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
+        mask = dist < dmax
+        inliers = int(mask.sum())
+        overlap = inliers / len(src) if len(src) else 0.0
+        if inliers >= 30:
+            p = src_tf[mask]
+            q = tgt[idx[mask]]
+            n = normals[idx[mask]]
+            residual = np.sum((p - q) * n, axis=1)
+            last_rmse = float(np.sqrt(np.mean(residual ** 2)))
+
+        return T, {'rmse': last_rmse, 'inliers': inliers, 'overlap': overlap}
+
     # ── Template: pre-build pyramid with KDTree ──
     def record_template(self, n_frames: int = 5) -> bool:
         """多帧融合→5mm压缩→预建3层KDTree pyramid"""
@@ -100,7 +192,8 @@ class VisualServo:
         for vs in [0.020, 0.010, 0.005]:
             pts = voxel_down(ref_5mm if vs < 0.01 else merged, vs)
             tree = cKDTree(pts)
-            self._ref_pyramid.append((pts, tree, vs))
+            normals = self._estimate_normals(pts, tree) if vs <= 0.005 else None
+            self._ref_pyramid.append((pts, tree, vs, normals))
             print(f'  L{len(self._ref_pyramid)-1}: {len(pts)}pts vs={vs*1000:.0f}mm')
 
         self._T_base_tool_ref = self._get_tool_matrix()
@@ -186,12 +279,19 @@ class VisualServo:
         scales_info = []
         dmax_list = [0.100, 0.050, 0.025]
 
-        for li, (tgt_pts, tree, vs) in enumerate(self._ref_pyramid):
+        fine_src_ds = None
+        fine_tgt_pts = fine_tree = fine_normals = None
+        for li, level in enumerate(self._ref_pyramid):
+            tgt_pts, tree, vs = level[:3]
+            normals = level[3] if len(level) > 3 else None
             dmax = dmax_list[li] if li < len(dmax_list) else 0.025
             # Downsample current scan to match this level
             idx_src = np.floor(pnow / vs).astype(np.int64)
             _, u = np.unique(idx_src, axis=0, return_index=True)
             src_ds = pnow[u]
+            if li == len(self._ref_pyramid) - 1:
+                fine_src_ds = src_ds
+                fine_tgt_pts, fine_tree, fine_normals = tgt_pts, tree, normals
 
             # Pre-apply accumulated transform
             src_tf = (T_acc[:3,:3] @ src_ds.T).T + T_acc[:3,3]
@@ -219,6 +319,20 @@ class VisualServo:
                                 'overlap': inl/len(src_ds),
                                 'scale_vs_mm': vs*1000, 'scale_dmax_mm': dmax*1000})
 
+        p2p_t_norm_mm = np.linalg.norm(T_acc[:3, 3]) * 1000.0
+        if (fine_src_ds is not None and fine_normals is not None and
+                p2p_t_norm_mm <= self.point_to_plane_trigger_mm):
+            T_p2l, p2l_info = self._point_to_plane_refine(
+                fine_src_ds, fine_tgt_pts, fine_tree, fine_normals, T_acc,
+                dmax=self.point_to_plane_dmax,
+                max_iter=self.point_to_plane_iters)
+            if p2l_info['inliers'] >= 30 and np.isfinite(p2l_info['rmse']):
+                T_acc = T_p2l
+                p2l_info['scale_vs_mm'] = 5.0
+                p2l_info['scale_dmax_mm'] = self.point_to_plane_dmax * 1000
+                p2l_info['method'] = 'p2plane'
+                scales_info.append(p2l_info)
+
         # Convert back to mm
         T_icp_mm = T_acc.copy()
         T_icp_mm[:3, 3] *= 1000.0
@@ -229,7 +343,8 @@ class VisualServo:
         out['inliers'] = scales_info[-1]['inliers'] if scales_info else 0
 
         for si, s in enumerate(scales_info):
-            print(f'    L{si}: {s["scale_vs_mm"]:.0f}mm/{s["scale_dmax_mm"]:.0f}mm '
+            method = f'({s["method"]})' if s.get('method') else ''
+            print(f'    L{si}{method}: {s["scale_vs_mm"]:.0f}mm/{s["scale_dmax_mm"]:.0f}mm '
                   f'RMSE={s["rmse"]*1000:.1f}mm inl={s["inliers"]} overl={s["overlap"]:.2f}')
 
         if out['inliers'] < 10:
