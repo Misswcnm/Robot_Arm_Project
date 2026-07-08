@@ -105,7 +105,7 @@ class CR5Robot:
                 float(rpy[0]), float(rpy[1]), float(rpy[2])]
 
     def movj_pose(self, target, label: str = 'MovJ') -> bool:
-        """直接使用控制器笛卡尔MovJ. 失败或未移动时返回False, 由上层回退Jacobian."""
+        """直接使用控制器笛卡尔MovJ. 失败或未移动时返回False."""
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
         pre_move = self.get_tool()
         self._logger.info(

@@ -40,8 +40,6 @@ def pose_error(T_cur, T_target):
 
 
 def apply_relative_move_once(robot, T_target, label):
-    from icp_servoing.servoing import _compute_jacobian
-
     tool = robot.get_tool()
     if not tool:
         print(f'  ❌ {label}: ToolVectorActual失败')
@@ -57,30 +55,8 @@ def apply_relative_move_once(robot, T_target, label):
     if robot.movj_pose(T_target, label=f'{label}/MovJ'):
         print(f'  ✅ {label}: MovJ一次到位')
         return True, T_cur
-    print(f'  ↳ {label}: MovJ不可用/不可达, 回退Jacobian关节补偿')
-
-    j_now = robot.get_joints()
-    if not j_now:
-        print(f'  ❌ {label}: GetAngle失败')
-        return False, T_cur
-
-    # dR = R_target @ R_cur.T 已经是base系旋转误差, 不能再左乘R_cur。
-    cart = np.hstack([dp, drot])
-    J = _compute_jacobian(j_now)
-    try:
-        dtheta = np.degrees(np.linalg.pinv(J, rcond=1e-3) @ cart)
-    except Exception:
-        print(f'  ❌ {label}: Jacobian奇异')
-        return False, T_cur
-
-    target_j = [j_now[i] + dtheta[i] for i in range(6)]
-    print(f'  {label}: Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
-          f'|dp|={np.linalg.norm(dp):.1f}mm |dr|={np.degrees(np.linalg.norm(drot)):.2f}°')
-    ok = robot.movj(target_j)
-    if not ok:
-        print(f'  ❌ {label}: JointMovJ失败')
-        return False, T_cur
-    return True, T_cur
+    print(f'  ❌ {label}: MovJ失败')
+    return False, T_cur
 
 
 class PointCloudNode(Node):
@@ -218,7 +194,6 @@ def main():
                         T_target = T_cur @ delta_A2B
                         ok, _ = apply_relative_move_once(robot, T_target, '相对戳点1')
                         if ok:
-                            # 一次Jacobian是局部线性近似；到达后重新读实际位姿再补算一次。
                             apply_relative_move_once(robot, T_target, '相对戳点2')
                             after = robot.get_tool()
                             if after:

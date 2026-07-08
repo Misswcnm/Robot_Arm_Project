@@ -6,7 +6,7 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   T_delta = X @ T_cam @ X⁻¹              (camera→tool frame)
   T_correction = inv(T_delta)             (取消误差的方向)
   T_target = T_cur @ T_correction_partial (70%部分补偿)
-  → Jacobian IK → JointMovJ              (CR5 MovL不可靠)
+  → MovJ(x,y,z,rx,ry,rz)                 (控制器笛卡尔点到点)
 """
 import time, rclpy
 import numpy as np
@@ -459,7 +459,6 @@ class VisualServo:
         rotvec_partial = R_partial.as_rotvec() * ratio
         R_partial = Rot.from_rotvec(rotvec_partial).as_matrix()
 
-        # JointMovJ: 完整6DOF (CR5 MovL已移除)
         T_corr_p = np.eye(4)
         T_corr_p[:3,:3] = R_partial
         T_corr_p[:3,3] = t_partial
@@ -471,7 +470,7 @@ class VisualServo:
         limit_desc = '不限幅' if step_limit is None else f'限幅{step_limit:.1f}mm'
         print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
               f'{limit_desc}): '
-              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
+              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  MovJ(pose)')
         if self.robot.movj_pose(T_target, label=f'{mode}补偿/MovJ'):
             after = self.robot.get_tool()
             if after and pre_move:
@@ -482,37 +481,8 @@ class VisualServo:
                 self._total_dp += dp_real; self._total_dr += dr
                 print(f'  → MovJ {dp_real/10:.1f}cm  {dr:.1f}°')
             out['ok'] = True; return out
-        print('  ↳ MovJ(pose)不可用/不可达, 回退Jacobian关节补偿')
-
-        j_now = self.robot.get_joints()
-        if not j_now:
-            self.robot.recover()
-            out['ok'] = False; out['error'] = 'GetAngle失败'; return out
-        drot_base = T_cur[:3,:3] @ rotvec_partial
-        cart = np.hstack([dp, drot_base])
-        J = _compute_jacobian(j_now)
-        try: dtheta = np.degrees(np.linalg.pinv(J,rcond=1e-3) @ cart)
-        except:
-            self.robot.recover()
-            out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
-        target_j = [j_now[i]+dtheta[i] for i in range(6)]
-        print(f'  Jacobian补偿: Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
-              f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
-              f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
-        if self.robot.movj(target_j):
-            # 实际移动量 (从ToolVectorActual)
-            after = self.robot.get_tool()
-            if after and pre_move:
-                dp = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
-                Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
-                Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
-                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
-                self._total_dp += dp; self._total_dr += dr
-                print(f'  → {dp/10:.1f}cm  {dr:.1f}°')
-            out['ok'] = True; return out
-
-        self.robot.recover()
-        out['ok'] = False; out['error'] = 'JointMovJ失败(已恢复)'
+        out['ok'] = False; out['error'] = 'MovJ(pose)失败'
+        print(f'  ❌ {out["error"]}')
         return out
 
     def align(self, max_iters: int = 15) -> bool:
@@ -535,34 +505,7 @@ class VisualServo:
                 return True
             if result['ok']:
                 continue  # 成功, 下一轮
-            # 失败: 已recover, 直接重试(从当前位姿重新ICP)
-            print(f'  ↻ 恢复后重试 (从当前位姿)')
+            # 失败: 直接重试(从当前位姿重新ICP)
+            print(f'  ↻ 本轮失败后重试 (从当前位姿)')
         print(f'\n⚠ 达最大迭代次数({max_iters})  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
         return False
-
-
-# ── Jacobian (小误差JointMovJ用) ──
-def _compute_jacobian(jd, eps=0.0005):
-    import math as _m
-    def _rx(a): c,s=_m.cos(a),_m.sin(a); return np.array([[1,0,0],[0,c,-s],[0,s,c]])
-    def _ry(a): c,s=_m.cos(a),_m.sin(a); return np.array([[c,0,s],[0,1,0],[-s,0,c]])
-    def _rz(a): c,s=_m.cos(a),_m.sin(a); return np.array([[c,-s,0],[s,c,0],[0,0,1]])
-    def _rz4(a): c,s=_m.cos(a),_m.sin(a); return np.array([[c,-s,0,0],[s,c,0,0],[0,0,1,0],[0,0,0,1]])
-    def _urdf_T(xyz,rpy):
-        x,y,z=xyz; r,p,yw=rpy; R=_rz(yw)@_ry(p)@_rx(r)
-        T=np.eye(4); T[:3,:3]=R; T[:3,3]=[x,y,z]; return T
-    def _fk(T_acc,j_rad):
-        T=T_acc.copy()
-        T=T@_urdf_T([0,0,0.147],[0,0,0])@_rz4(j_rad[0])
-        T=T@_urdf_T([0,0,0],[_m.pi/2,_m.pi/2,0])@_rz4(j_rad[1])
-        T=T@_urdf_T([-0.427,-0.000349,0],[0,0,0])@_rz4(j_rad[2])
-        T=T@_urdf_T([-0.357,0.000349,0.141],[0,0,-_m.pi/2])@_rz4(j_rad[3])
-        T=T@_urdf_T([0,-0.116,0],[_m.pi/2,0,0])@_rz4(j_rad[4])
-        T=T@_urdf_T([0,0.105,0],[-_m.pi/2,0,0])@_rz4(j_rad[5])
-        T[:3,3]*=1000; return T
-    jr=np.radians(jd); T0=_fk(np.eye(4),jr); p0=T0[:3,3]; J=np.zeros((6,6))
-    for i in range(6):
-        jp=jr.copy(); jp[i]+=eps; T1=_fk(np.eye(4),jp)
-        J[0:3,i]=(T1[:3,3]-p0)/eps
-        dR=T1[:3,:3]@T0[:3,:3].T; J[3:6,i]=Rot.from_matrix(dR).as_rotvec()/eps
-    return J
