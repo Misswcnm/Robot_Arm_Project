@@ -7,8 +7,7 @@ from scipy.spatial.transform import Rotation as Rot
 from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
                                 MovJ, SpeedFactor, GetAngle, GetPose,
-                                SetCollisionLevel, RobotMode, StartDrag, StopDrag,
-                                InverseKin, CheckOddMovJ)
+                                SetCollisionLevel, RobotMode, StartDrag, StopDrag)
 
 
 class CR5Robot:
@@ -28,8 +27,6 @@ class CR5Robot:
         self.GetAngle     = node.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
         self.StartDrag    = node.create_client(StartDrag,    '/dobot_bringup_ros2/srv/StartDrag')
         self.StopDrag     = node.create_client(StopDrag,     '/dobot_bringup_ros2/srv/StopDrag')
-        self.InverseKin   = node.create_client(InverseKin,   '/dobot_bringup_ros2/srv/InverseKin')
-        self.CheckOddMovJ = node.create_client(CheckOddMovJ, '/dobot_bringup_ros2/srv/CheckOddMovJ')
 
         for n, c in [('EnableRobot', self.EnableRobot), ('MovJ', self.MovJ)]:
             while not c.wait_for_service(timeout_sec=1.0):
@@ -107,109 +104,29 @@ class CR5Robot:
         return [float(T[0, 3]), float(T[1, 3]), float(T[2, 3]),
                 float(rpy[0]), float(rpy[1]), float(rpy[2])]
 
-    @staticmethod
-    def _fmt_joint_list(joints: list) -> str:
-        return '{' + ','.join(f'{float(v):.6f}' for v in joints[:6]) + '}'
-
-    @staticmethod
-    def _parse_return_floats(robot_return: str) -> list | None:
-        try:
-            s = robot_return.strip().strip('{}')
-            vals = [float(v.strip()) for v in s.split(',') if v.strip()]
-            return vals if vals else None
-        except Exception:
-            return None
-
-    def inverse_kin(self, pose: list, seed_joints: list | None = None) -> list | None:
-        """控制器逆解: xyz/rpy -> joint. 使用当前关节作近解, 防止跳到另一组解。"""
-        if not self.InverseKin.wait_for_service(timeout_sec=1.0):
-            self._logger.warn('InverseKin service不可用')
-            return None
-        if seed_joints is None:
-            seed_joints = self.get_joints()
-        if not seed_joints:
-            self._logger.warn('InverseKin失败: 无当前关节近解')
-            return None
-
-        req = InverseKin.Request()
-        req.x, req.y, req.z = float(pose[0]), float(pose[1]), float(pose[2])
-        req.rx, req.ry, req.rz = float(pose[3]), float(pose[4]), float(pose[5])
-        req.user = ''
-        req.tool = ''
-        req.use_joint_near = 'useJointNear =1'
-        req.joint_near = 'jointNear=' + self._fmt_joint_list(seed_joints)
-        self._logger.info(
-            'InverseKin请求: pose=[%.3f %.3f %.3f %.3f %.3f %.3f] near=%s' %
-            (req.x, req.y, req.z, req.rx, req.ry, req.rz, req.joint_near))
-        ok, r = self._call(self.InverseKin, req, timeout=5.0)
-        if not ok or r.res != 0:
-            self._logger.warn(f'InverseKin失败: ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
-            return None
-        vals = self._parse_return_floats(r.robot_return)
-        if vals is None or len(vals) != 6:
-            self._logger.warn(f'InverseKin返回解析失败: {r.robot_return}')
-            return None
-        self._logger.info(
-            'InverseKin成功: joint=[%.3f %.3f %.3f %.3f %.3f %.3f]' %
-            tuple(vals[:6]))
-        return vals
-
-    def check_odd_movj(self, start_joints: list, target_joints: list) -> bool:
-        """CheckOddMovJ只接受两个关节点；返回ResultID=0才表示可达。"""
-        if not self.CheckOddMovJ.wait_for_service(timeout_sec=1.0):
-            self._logger.warn('CheckOddMovJ service不可用')
-            return False
-        req = CheckOddMovJ.Request()
-        (req.point1_j1, req.point1_j2, req.point1_j3,
-         req.point1_j4, req.point1_j5, req.point1_j6) = [float(v) for v in start_joints[:6]]
-        (req.point2_j1, req.point2_j2, req.point2_j3,
-         req.point2_j4, req.point2_j5, req.point2_j6) = [float(v) for v in target_joints[:6]]
-        req.param_value = []
-        self._logger.info(
-            'CheckOddMovJ请求: start=%s target=%s' %
-            (self._fmt_joint_list(start_joints), self._fmt_joint_list(target_joints)))
-        ok, r = self._call(self.CheckOddMovJ, req, timeout=5.0)
-        if not ok or r.res != 0:
-            self._logger.warn(f'CheckOddMovJ调用失败: ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
-            return False
-        vals = self._parse_return_floats(r.robot_return)
-        result_id = int(vals[0]) if vals else 0
-        if result_id != 0:
-            self._logger.warn(f'CheckOddMovJ未通过: ResultID={result_id}')
-            return False
-        self._logger.info('CheckOddMovJ通过')
-        return True
-
     def movj_pose(self, target, label: str = 'MovJ') -> bool:
-        """优先使用控制器笛卡尔MovJ: InverseKin校验 -> CheckOddMovJ -> MovJ(mode=False)."""
+        """直接使用控制器笛卡尔MovJ. 失败或未移动时返回False, 由上层回退Jacobian."""
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
+        pre_move = self.get_tool()
         self._logger.info(
-            f'{label}: 尝试MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
+            f'{label}: 直接发送MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
             f'{pose[3]:.3f} {pose[4]:.3f} {pose[5]:.3f}]')
-        start_j = self.get_joints()
-        if not start_j:
-            self._logger.warn(f'{label}: GetAngle失败, 无法做CheckOddMovJ')
-            return False
-
-        target_j = self.inverse_kin(pose, seed_joints=start_j)
-        if target_j is None:
-            return False
-        if not self.check_odd_movj(start_j, target_j):
-            return False
-
         req = MovJ.Request()
         req.mode = False
         req.a, req.b, req.c = float(pose[0]), float(pose[1]), float(pose[2])
         req.d, req.e, req.f = float(pose[3]), float(pose[4]), float(pose[5])
         req.param_value = []
-        self._logger.info(
-            f'{label}: 发送MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
-            f'{pose[3]:.3f} {pose[4]:.3f} {pose[5]:.3f}]')
         ok, r = self._call(self.MovJ, req, timeout=20.0)
         if not ok or r.res != 0:
             self._logger.warn(f'{label}: MovJ(pose)失败 ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
             return False
         self.wait_tool_stable(timeout=8.0)
+        cur = self.get_tool()
+        if pre_move and cur:
+            d = np.linalg.norm(np.array(cur[:3]) - np.array(pre_move[:3]))
+            if d < 0.5:
+                self._logger.warn(f'{label}: MovJ(pose)返回0但未检测到移动(Δ={d:.1f}mm)')
+                return False
         self._logger.info(f'{label}: MovJ(pose)完成')
         return True
 
