@@ -439,7 +439,7 @@ class VisualServo:
         else:
             mode = '粗调'
             ratio = 1.0
-            step_limit = 30.0
+            step_limit = None
 
         #    T_delta = X @ T_icp_mm @ X⁻¹
         T_delta = self.X @ T_icp_mm @ self.X_inv
@@ -449,9 +449,9 @@ class VisualServo:
         t_full = T_correction[:3, 3]
         R_full = T_correction[:3, :3]
 
-        # 单步限幅: 粗配准≤30mm, 中段精修≤4mm, 末段精修≤2mm
+        # 单步限幅: 粗调不限幅, 中段精修≤4mm, 末段精修≤2mm
         t_norm_corr = np.linalg.norm(t_full)
-        if t_norm_corr > step_limit:
+        if step_limit is not None and t_norm_corr > step_limit:
             t_full *= step_limit / t_norm_corr
 
         t_partial = t_full * ratio
@@ -468,8 +468,9 @@ class VisualServo:
         out['delta_mm'] = [round(v,1) for v in dp]
 
         pre_move = self.robot.get_tool()
+        limit_desc = '不限幅' if step_limit is None else f'限幅{step_limit:.1f}mm'
         print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
-              f'限幅{step_limit:.1f}mm): '
+              f'{limit_desc}): '
               f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
         if self.robot.movj_pose(T_target, label=f'{mode}补偿/MovJ'):
             after = self.robot.get_tool()
