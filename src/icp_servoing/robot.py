@@ -37,6 +37,7 @@ class CR5Robot:
 
         self._tool = None
         self._tool_seq = -1
+        self._cartesian_movj_enabled = True
         def _cb(msg):
             self._tool = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
             self._tool_seq += 1  # 每次新数据递增
@@ -136,11 +137,14 @@ class CR5Robot:
         req.rx, req.ry, req.rz = float(pose[3]), float(pose[4]), float(pose[5])
         req.user = ''
         req.tool = ''
-        req.use_joint_near = 'useJointNear=1'
+        req.use_joint_near = 'useJointNear =1'
         req.joint_near = 'jointNear=' + self._fmt_joint_list(seed_joints)
         ok, r = self._call(self.InverseKin, req, timeout=5.0)
         if not ok or r.res != 0:
             self._logger.warn(f'InverseKin失败: ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
+            if ok and getattr(r, 'res', None) == -10000:
+                self._cartesian_movj_enabled = False
+                self._logger.warn('InverseKin命令格式被控制器拒绝(-10000), 本次运行关闭MovJ(pose)优先路径, 直接回退Jacobian')
             return None
         vals = self._parse_return_floats(r.robot_return)
         if vals is None or len(vals) != 6:
@@ -172,6 +176,8 @@ class CR5Robot:
 
     def movj_pose(self, target, label: str = 'MovJ') -> bool:
         """优先使用控制器笛卡尔MovJ: InverseKin校验 -> CheckOddMovJ -> MovJ(mode=False)."""
+        if not self._cartesian_movj_enabled:
+            return False
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
         start_j = self.get_joints()
         if not start_j:

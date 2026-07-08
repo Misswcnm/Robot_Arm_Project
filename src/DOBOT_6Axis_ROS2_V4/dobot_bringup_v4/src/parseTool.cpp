@@ -222,7 +222,7 @@ namespace parseTool
     }
     std::string parserInverseKinRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::InverseKin::Request> request)
     {
-        // InverseKin(X,Y,Z,Rx,Ry,Rz,useJointNear=1,jointNear={...})
+        // InverseKin(X,Y,Z,Rx,Ry,Rz,useJointNear =1,jointNear={...})
         std::stringstream ss;
         ss << "InverseKin(" << request->x << "," << request->y << "," << request->z << "," << request->rx << "," << request->ry
            << "," << request->rz;
