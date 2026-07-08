@@ -222,11 +222,19 @@ namespace parseTool
     }
     std::string parserInverseKinRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::InverseKin::Request> request)
     {
-        // InverseKin(X,Y,Z,Rx,Ry,Rz,user,tool,useJointNear,jointNear) — 位置参数
+        // InverseKin(X,Y,Z,Rx,Ry,Rz,useJointNear=1,jointNear={...})
         std::stringstream ss;
         ss << "InverseKin(" << request->x << "," << request->y << "," << request->z << "," << request->rx << "," << request->ry
-           << "," << request->rz << "," << request->user << "," << request->tool
-           << "," << request->use_joint_near << "," << request->joint_near << ")";
+           << "," << request->rz;
+        if (request->use_joint_near != "")
+            ss << "," << request->use_joint_near;
+        if (request->joint_near != "")
+            ss << "," << request->joint_near;
+        if (request->user != "")
+            ss << "," << request->user;
+        if (request->tool != "")
+            ss << "," << request->tool;
+        ss << ")";
         return ss.str();
     }
     std::string parserGetAngleRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::GetAngle::Request> request)
@@ -559,8 +567,20 @@ namespace parseTool
         }
         else
         {
-            // CR5 旧固件: 笛卡尔运动用 MovJ（位置参数格式）
+            // 笛卡尔点到点运动按V4格式发送: MovJ(pose={x,y,z,rx,ry,rz})
             stringOrder = "MovJ(";
+            stringOrder = stringOrder + "pose={";
+            stringOrder = stringOrder + cmdCoordinate;
+            stringOrder = stringOrder + "}";
+            if (!(request->param_value.empty() || request->param_value[0].empty()))
+            {
+                for (size_t i = 0; i < request->param_value.size(); i++)
+                {
+                    stringOrder = stringOrder + "," + std::string(request->param_value[i]);
+                }
+            }
+            stringOrder = stringOrder + ")";
+            return stringOrder;
         }
         stringOrder = stringOrder + cmdCoordinate;
 

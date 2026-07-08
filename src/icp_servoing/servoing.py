@@ -467,6 +467,22 @@ class VisualServo:
         dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
         out['delta_mm'] = [round(v,1) for v in dp]
 
+        pre_move = self.robot.get_tool()
+        print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
+              f'限幅{step_limit:.1f}mm): '
+              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
+        if self.robot.movj_pose(T_target, label=f'{mode}补偿/MovJ'):
+            after = self.robot.get_tool()
+            if after and pre_move:
+                dp_real = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
+                Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
+                Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
+                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
+                self._total_dp += dp_real; self._total_dr += dr
+                print(f'  → MovJ {dp_real/10:.1f}cm  {dr:.1f}°')
+            out['ok'] = True; return out
+        print('  ↳ MovJ(pose)不可用/不可达, 回退Jacobian关节补偿')
+
         j_now = self.robot.get_joints()
         if not j_now:
             self.robot.recover()
@@ -479,10 +495,7 @@ class VisualServo:
             self.robot.recover()
             out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
         target_j = [j_now[i]+dtheta[i] for i in range(6)]
-        pre_move = self.robot.get_tool()
-        print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
-              f'限幅{step_limit:.1f}mm): '
-              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
+        print(f'  Jacobian补偿: Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
               f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
               f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
         if self.robot.movj(target_j):

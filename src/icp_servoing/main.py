@@ -47,12 +47,23 @@ def apply_relative_move_once(robot, T_target, label):
         print(f'  ❌ {label}: ToolVectorActual失败')
         return False, None
     T_cur = tool_to_matrix(tool)
+    dp, drot = pose_error(T_cur, T_target)
+    dr_deg = np.degrees(np.linalg.norm(drot))
+    print(f'  {label}: 目标残差 |dp|={np.linalg.norm(dp):.1f}mm |dr|={dr_deg:.2f}°')
+    if np.linalg.norm(dp) < 0.5 and dr_deg < 0.05:
+        print(f'  ✅ {label}: 已在目标附近, 不再补偿')
+        return True, T_cur
+
+    if robot.movj_pose(T_target, label=f'{label}/MovJ'):
+        print(f'  ✅ {label}: MovJ一次到位')
+        return True, T_cur
+    print(f'  ↳ {label}: MovJ不可用/不可达, 回退Jacobian关节补偿')
+
     j_now = robot.get_joints()
     if not j_now:
         print(f'  ❌ {label}: GetAngle失败')
         return False, T_cur
 
-    dp, drot = pose_error(T_cur, T_target)
     # dR = R_target @ R_cur.T 已经是base系旋转误差, 不能再左乘R_cur。
     cart = np.hstack([dp, drot])
     J = _compute_jacobian(j_now)
