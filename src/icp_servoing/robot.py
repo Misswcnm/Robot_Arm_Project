@@ -6,7 +6,7 @@ from rclpy.node import Node
 from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
                                 MovJ, SpeedFactor, GetAngle, GetPose,
-                                SetCollisionLevel, RobotMode)
+                                SetCollisionLevel, RobotMode, StartDrag, StopDrag)
 
 
 class CR5Robot:
@@ -24,6 +24,8 @@ class CR5Robot:
         self.SetCollision = node.create_client(SetCollisionLevel, '/dobot_bringup_ros2/srv/SetCollisionLevel')
         self.RobotMode    = node.create_client(RobotMode,    '/dobot_bringup_ros2/srv/RobotMode')
         self.GetAngle     = node.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
+        self.StartDrag    = node.create_client(StartDrag,    '/dobot_bringup_ros2/srv/StartDrag')
+        self.StopDrag     = node.create_client(StopDrag,     '/dobot_bringup_ros2/srv/StopDrag')
 
         for n, c in [('EnableRobot', self.EnableRobot), ('MovJ', self.MovJ)]:
             while not c.wait_for_service(timeout_sec=1.0):
@@ -149,6 +151,25 @@ class CR5Robot:
             prev_xyz = cur_xyz
             prev_rpy = cur_rpy
         return True  # 超时默认已停
+
+    def start_drag(self) -> bool:
+        ok, r = self._call(self.StartDrag, StartDrag.Request(), timeout=5.0)
+        return ok and r.res == 0
+
+    def stop_drag(self) -> bool:
+        ok, r = self._call(self.StopDrag, StopDrag.Request(), timeout=5.0)
+        return ok and r.res == 0
+
+    def enable(self) -> bool:
+        """退出拖拽后重新使能机器人；EnableRobot 本身是 service client, 不能直接当函数调用。"""
+        ok, r = self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)
+        if not ok:
+            self._logger.error(f'EnableRobot 调用失败: {r}')
+            return False
+        if r.res != 0:
+            self._logger.error(f'EnableRobot 返回异常 res={r.res}')
+            return False
+        return True
 
     def recover(self) -> bool:
         """完整恢复: ClearError→DisableRobot→EnableRobot→SpeedFactor→SetCollisionLevel"""

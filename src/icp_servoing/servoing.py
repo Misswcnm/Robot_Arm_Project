@@ -26,16 +26,26 @@ class VisualServo:
 
         # Template pyramid (pre-built for speed)
         self._ref_pyramid = None
+        self._p2plane_ref = None
         self._T_base_tool_ref = None
         self._T_base_camera_ref = None
         self._last_tool = None
         self._step_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
-        self.final_icp_trans_thresh_mm = 5.0
-        self.final_icp_rot_thresh_deg = 0.5
-        self.point_to_plane_trigger_mm = 5.0
-        self.point_to_plane_dmax = 0.012
+        self.final_icp_trans_thresh_mm = 2.0
+        self.final_icp_rot_thresh_deg = 0.2
+        self.final_stable_frames = 2
+        self._stable_count = 0
+        self.fine_mode_thresh_mm = 8.0
+        self.mid_fine_thresh_mm = 4.0
+        self.fine_step_limit_mm = 2.0
+        self.fine_comp_ratio = 0.5
+        self.mid_fine_step_limit_mm = 4.0
+        self.mid_fine_comp_ratio = 0.7
+        self.point_to_plane_trigger_mm = 10.0
+        self.point_to_plane_dmax = 0.010
         self.point_to_plane_iters = 6
+        self.point_to_plane_max_points = 80000
 
     # ── Quality gate ──
     @staticmethod
@@ -61,8 +71,8 @@ class VisualServo:
 
     @staticmethod
     def converged(T_icp: np.ndarray,
-                  trans_thresh: float = 5.0,
-                  rot_thresh_deg: float = 0.5) -> bool:
+                  trans_thresh: float = 2.0,
+                  rot_thresh_deg: float = 0.2) -> bool:
         """判断视觉剩余校正是否已收敛: T_icp ≈ I"""
         t_norm = np.linalg.norm(T_icp[:3, 3])
         r_angle = np.degrees(
@@ -95,6 +105,14 @@ class VisualServo:
             n = vh[-1]
             normals[i] = n / (np.linalg.norm(n) + 1e-12)
         return normals
+
+    @staticmethod
+    def _stride_sample(pts: np.ndarray, max_points: int) -> np.ndarray:
+        """确定性等步长抽样, 避免point-to-plane处理过多重复点."""
+        if len(pts) <= max_points:
+            return pts
+        idx = np.linspace(0, len(pts) - 1, max_points, dtype=np.int64)
+        return pts[idx]
 
     @staticmethod
     def _point_to_plane_refine(src: np.ndarray, tgt: np.ndarray, tree,
@@ -192,9 +210,15 @@ class VisualServo:
         for vs in [0.020, 0.010, 0.005]:
             pts = voxel_down(ref_5mm if vs < 0.01 else merged, vs)
             tree = cKDTree(pts)
-            normals = self._estimate_normals(pts, tree) if vs <= 0.005 else None
-            self._ref_pyramid.append((pts, tree, vs, normals))
+            self._ref_pyramid.append((pts, tree, vs))
             print(f'  L{len(self._ref_pyramid)-1}: {len(pts)}pts vs={vs*1000:.0f}mm')
+
+        p2_pts = self._stride_sample(ref_5mm, self.point_to_plane_max_points)
+        p2_tree = cKDTree(p2_pts)
+        t_normals = time.perf_counter()
+        p2_normals = self._estimate_normals(p2_pts, p2_tree)
+        self._p2plane_ref = (p2_pts, p2_tree, p2_normals)
+        print(f'  L3(p2plane): {len(p2_pts)}pts normals={((time.perf_counter()-t_normals)*1000):.0f}ms')
 
         self._T_base_tool_ref = self._get_tool_matrix()
         if self._T_base_tool_ref is None:
@@ -202,6 +226,7 @@ class VisualServo:
         self._T_base_camera_ref = self._T_base_tool_ref @ self.X
 
         self._step_count = 0  # reset for new template
+        self._stable_count = 0
         t = self._T_base_tool_ref[:3, 3]
         print(f'✅ 模板OK  xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}]')
         return True
@@ -275,23 +300,22 @@ class VisualServo:
 
         # 2. Pyramid ICP (pre-built cKDTree, no rebuild)
         from scipy.spatial import cKDTree
+        icp_t0 = time.perf_counter()
         T_acc = T_init_icp.copy()
         scales_info = []
         dmax_list = [0.100, 0.050, 0.025]
 
         fine_src_ds = None
-        fine_tgt_pts = fine_tree = fine_normals = None
         for li, level in enumerate(self._ref_pyramid):
-            tgt_pts, tree, vs = level[:3]
-            normals = level[3] if len(level) > 3 else None
+            level_t0 = time.perf_counter()
+            tgt_pts, tree, vs = level
             dmax = dmax_list[li] if li < len(dmax_list) else 0.025
             # Downsample current scan to match this level
             idx_src = np.floor(pnow / vs).astype(np.int64)
             _, u = np.unique(idx_src, axis=0, return_index=True)
             src_ds = pnow[u]
             if li == len(self._ref_pyramid) - 1:
-                fine_src_ds = src_ds
-                fine_tgt_pts, fine_tree, fine_normals = tgt_pts, tree, normals
+                fine_src_ds = self._stride_sample(src_ds, self.point_to_plane_max_points)
 
             # Pre-apply accumulated transform
             src_tf = (T_acc[:3,:3] @ src_ds.T).T + T_acc[:3,3]
@@ -300,7 +324,9 @@ class VisualServo:
             dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
             mask = dist < dmax
             if mask.sum() < 10:
-                scales_info.append({'rmse': float('inf'), 'inliers': 0, 'overlap': 0})
+                scales_info.append({'rmse': float('inf'), 'inliers': 0, 'overlap': 0,
+                                    'scale_vs_mm': vs*1000, 'scale_dmax_mm': dmax*1000,
+                                    'time_ms': (time.perf_counter() - level_t0) * 1000.0})
                 continue
 
             s, d = src_tf[mask], tgt_pts[idx[mask]]
@@ -317,11 +343,14 @@ class VisualServo:
             inl = int(mask.sum())
             scales_info.append({'rmse': float(err), 'inliers': inl,
                                 'overlap': inl/len(src_ds),
-                                'scale_vs_mm': vs*1000, 'scale_dmax_mm': dmax*1000})
+                                'scale_vs_mm': vs*1000, 'scale_dmax_mm': dmax*1000,
+                                'time_ms': (time.perf_counter() - level_t0) * 1000.0})
 
         p2p_t_norm_mm = np.linalg.norm(T_acc[:3, 3]) * 1000.0
-        if (fine_src_ds is not None and fine_normals is not None and
+        if (fine_src_ds is not None and self._p2plane_ref is not None and
                 p2p_t_norm_mm <= self.point_to_plane_trigger_mm):
+            p2l_t0 = time.perf_counter()
+            fine_tgt_pts, fine_tree, fine_normals = self._p2plane_ref
             T_p2l, p2l_info = self._point_to_plane_refine(
                 fine_src_ds, fine_tgt_pts, fine_tree, fine_normals, T_acc,
                 dmax=self.point_to_plane_dmax,
@@ -331,9 +360,11 @@ class VisualServo:
                 p2l_info['scale_vs_mm'] = 5.0
                 p2l_info['scale_dmax_mm'] = self.point_to_plane_dmax * 1000
                 p2l_info['method'] = 'p2plane'
+                p2l_info['time_ms'] = (time.perf_counter() - p2l_t0) * 1000.0
                 scales_info.append(p2l_info)
 
         # Convert back to mm
+        icp_time_ms = (time.perf_counter() - icp_t0) * 1000.0
         T_icp_mm = T_acc.copy()
         T_icp_mm[:3, 3] *= 1000.0
 
@@ -341,11 +372,13 @@ class VisualServo:
         out['rmse'] = scales_info[-1]['rmse'] * 1000 if scales_info else 999
         out['overlap'] = scales_info[-1]['overlap'] if scales_info else 0
         out['inliers'] = scales_info[-1]['inliers'] if scales_info else 0
+        out['icp_time_ms'] = round(icp_time_ms, 1)
 
         for si, s in enumerate(scales_info):
             method = f'({s["method"]})' if s.get('method') else ''
             print(f'    L{si}{method}: {s["scale_vs_mm"]:.0f}mm/{s["scale_dmax_mm"]:.0f}mm '
-                  f'RMSE={s["rmse"]*1000:.1f}mm inl={s["inliers"]} overl={s["overlap"]:.2f}')
+                  f'RMSE={s["rmse"]*1000:.1f}mm inl={s["inliers"]} overl={s["overlap"]:.2f} '
+                  f't={s.get("time_ms", 0):.1f}ms')
 
         if out['inliers'] < 10:
             out['error'] = f'ICP匹配点不足 ({out["inliers"]}) |T_init|={np.linalg.norm(T_init_mm[:3,3]):.0f}mm'
@@ -357,7 +390,8 @@ class VisualServo:
         out['icp_delta_mm'] = round(t_norm, 1)
         out['icp_rot_deg'] = round(r_deg, 2)
         print(f'  ICP: RMSE={out["rmse"]:.1f}mm  overl={out["overlap"]:.2f}  '
-              f'|t|={t_norm:.1f}mm  |r|={r_deg:.2f}°')
+              f'|t|={t_norm:.1f}mm  |r|={r_deg:.2f}°  '
+              f'time={icp_time_ms:.1f}ms')
         print(f'  Tool误差: |T_cur-T_ref|={pose_t_err:.1f}mm  |r|={pose_r_err:.2f}°')
 
         # 3. Quality gate
@@ -368,6 +402,7 @@ class VisualServo:
                             f'overl={info["overlap"]:.2f} '
                             f'|t|={t_norm:.1f}mm |r|={r_deg:.1f}°')
             print(f'  ❌ {out["error"]}')
+            self._stable_count = 0
             return out
 
         # 4. 收敛判断: 只使用ICP估计的剩余校正量。
@@ -377,15 +412,34 @@ class VisualServo:
             self.final_icp_trans_thresh_mm,
             self.final_icp_rot_thresh_deg)
         if icp_converged:
+            self._stable_count += 1
+            if self._stable_count < self.final_stable_frames:
+                out['ok'] = True
+                print(f'  ↳ ICP残差达标, 稳定确认 '
+                      f'{self._stable_count}/{self.final_stable_frames}: '
+                      f'{t_norm:.1f}mm/{r_deg:.2f}°')
+                return out
             out['ok'] = True
             out['converged'] = True
             print(f'  ✅ 已收敛: ICP残差={t_norm:.1f}mm/{r_deg:.2f}°  '
                   f'Tool误差(仅监控)={pose_t_err:.1f}mm/{pose_r_err:.2f}°')
             return out
+        self._stable_count = 0
 
-        # 5. 全量补偿 (单步限幅30mm兜底)
+        # 5. 补偿: 大残差全量, 8mm内分段精修避免末端过冲
         self._step_count += 1
-        ratio = 1.0
+        if t_norm <= self.mid_fine_thresh_mm:
+            mode = '精修'
+            ratio = self.fine_comp_ratio
+            step_limit = self.fine_step_limit_mm
+        elif t_norm <= self.fine_mode_thresh_mm:
+            mode = '中段精修'
+            ratio = self.mid_fine_comp_ratio
+            step_limit = self.mid_fine_step_limit_mm
+        else:
+            mode = '粗调'
+            ratio = 1.0
+            step_limit = 30.0
 
         #    T_delta = X @ T_icp_mm @ X⁻¹
         T_delta = self.X @ T_icp_mm @ self.X_inv
@@ -395,10 +449,10 @@ class VisualServo:
         t_full = T_correction[:3, 3]
         R_full = T_correction[:3, :3]
 
-        # 单步限幅: |t| ≤ 30mm
+        # 单步限幅: 粗配准≤30mm, 中段精修≤4mm, 末段精修≤2mm
         t_norm_corr = np.linalg.norm(t_full)
-        if t_norm_corr > 30:
-            t_full *= 30.0 / t_norm_corr
+        if t_norm_corr > step_limit:
+            t_full *= step_limit / t_norm_corr
 
         t_partial = t_full * ratio
         R_partial = Rot.from_matrix(R_full)
@@ -426,7 +480,8 @@ class VisualServo:
             out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
         target_j = [j_now[i]+dtheta[i] for i in range(6)]
         pre_move = self.robot.get_tool()
-        print(f'  补偿 {ratio*100:.0f}% (step{self._step_count}): '
+        print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
+              f'限幅{step_limit:.1f}mm): '
               f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm '
               f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
               f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
@@ -449,6 +504,7 @@ class VisualServo:
     def align(self, max_iters: int = 15) -> bool:
         print(f'\n{"="*55}\n  闭环对齐 (最多{max_iters}次)\n{"="*55}')
         self._step_count = 0
+        self._stable_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
         i = 0
         while i < max_iters:

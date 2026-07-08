@@ -14,6 +14,7 @@
 """
 
 import json, time, os, math, sys
+from datetime import datetime
 import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation as Rot
@@ -23,7 +24,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
-                                MovJ, SpeedFactor, GetAngle, SetCollisionLevel, RobotMode)
+                                MovJ, SpeedFactor, GetAngle, SetCollisionLevel,
+                                RobotMode, StartDrag, StopDrag)
 
 
 # ═══════════════════════════════════════════════
@@ -42,7 +44,7 @@ TOPIC_IMAGE       = '/camera/camera/color/image_raw'
 TOPIC_INFO        = '/camera/camera/color/camera_info'
 TOPIC_TOOL        = '/dobot_msgs_v4/msg/ToolVectorActual'
 
-OUTPUT_FILE = os.path.expanduser('~/Robot_Arm_Project/scripts/handeye_chessboard_result.json')
+OUTPUT_ROOT = os.path.expanduser('~/Robot_Arm_Project/scripts/handeye_calib_runs')
 
 
 # ═══════════════════════════════════════════════
@@ -151,8 +153,10 @@ class HandEyeCalib(Node):
         self.GetAngle     = self.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
         self.SetCollision = self.create_client(SetCollisionLevel,'/dobot_bringup_ros2/srv/SetCollisionLevel')
         self.RobotMode    = self.create_client(RobotMode,'/dobot_bringup_ros2/srv/RobotMode')
+        self.StartDrag    = self.create_client(StartDrag, '/dobot_bringup_ros2/srv/StartDrag')
+        self.StopDrag     = self.create_client(StopDrag,  '/dobot_bringup_ros2/srv/StopDrag')
 
-        for n,c in [('EnableRobot',self.EnableRobot),('MovJ',self.MovJ)]:
+        for n,c in [('EnableRobot',self.EnableRobot),('StartDrag',self.StartDrag),('StopDrag',self.StopDrag)]:
             while not c.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f'等待 {n}...')
         self.get_logger().info('✅ Robot ready')
@@ -243,21 +247,30 @@ class HandEyeCalib(Node):
             time.sleep(0.15)
         return False
 
+    def start_drag(self):
+        ok, r = self._call(self.StartDrag, StartDrag.Request(), timeout=5.0)
+        return ok and getattr(r, 'res', -1) == 0
+
+    def stop_drag(self):
+        ok, r = self._call(self.StopDrag, StopDrag.Request(), timeout=5.0)
+        return ok and getattr(r, 'res', -1) == 0
+
     def capture_and_detect(self):
         """拍照 + 棋盘格检测 + 质量检查 → (T_board_in_cam, quality_info) 或 None"""
         self._img = None
         for _ in range(20): rclpy.spin_once(self,timeout_sec=0.1)
 
         if self._img is None or self._K is None: return None
+        img = self._img.copy()
 
-        gray = cv2.cvtColor(self._img, cv2.COLOR_BGR2GRAY) if len(self._img.shape)==3 else self._img
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape)==3 else img
         ret, corners = cv2.findChessboardCorners(gray, (CHESS_COLS, CHESS_ROWS),
             flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FAST_CHECK)
         if not ret:
             # 不用 FAST_CHECK 再试一次
             ret, corners = cv2.findChessboardCorners(gray, (CHESS_COLS, CHESS_ROWS),
                 flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if not ret: return None
+        if not ret: return {'error': '未检测到棋盘格', 'image': img}
 
         criteria = (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         corners = cv2.cornerSubPix(gray, corners, (5,5), (-1,-1), criteria)
@@ -267,14 +280,16 @@ class HandEyeCalib(Node):
 
         ok_q, rmse, dist, msg = check_board_quality(objp, corners, self._K, self._D)
         if not ok_q:
-            return {'error': msg, 'reproj_rmse': rmse, 'dist': dist}
+            return {'error': msg, 'reproj_rmse': rmse, 'dist': dist,
+                    'corners': corners, 'image': img}
 
         ok, rvec, tvec = cv2.solvePnP(objp, corners, self._K, self._D, flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok: return {'error': 'solvePnP failed'}
+        if not ok: return {'error': 'solvePnP failed', 'corners': corners, 'image': img}
 
         R,_ = cv2.Rodrigues(rvec)
         T = np.eye(4); T[:3,:3]=R; T[:3,3]=tvec.flatten()
-        return {'T': T, 'reproj_rmse': rmse, 'dist': dist, 'corners': corners}
+        return {'T': T, 'reproj_rmse': rmse, 'dist': dist,
+                'corners': corners, 'image': img}
 
 
 # ═══════════════════════════════════════════════
@@ -304,118 +319,31 @@ def generate_poses(j0, n=16):
 
 
 # ═══════════════════════════════════════════════
-def main():
-    rclpy.init()
-    node = HandEyeCalib()
+def create_session_dir():
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_dir = os.path.join(OUTPUT_ROOT, f'handeye_{stamp}')
+    img_dir = os.path.join(out_dir, 'images')
+    os.makedirs(img_dir, exist_ok=False)
+    return out_dir, img_dir
 
-    print('\n'+'='*60)
-    print('  手眼标定 — 棋盘格法 (ToolVectorActual + 质量过滤)')
-    print(f'  棋盘格: {CHESS_COLS}×{CHESS_ROWS}  格边={SQUARE_MM}mm')
-    print('='*60)
 
-    # Wait camera
-    print('等待相机内参...')
-    for _ in range(50): rclpy.spin_once(node,timeout_sec=0.1)
-    if node._K is None: print('❌ 无CameraInfo'); node.destroy_node(); rclpy.shutdown(); return
-    print(f'📷 K: fx={node._K[0,0]:.0f} fy={node._K[1,1]:.0f}')
+def draw_and_save_sample(img_dir, tag, image, corners=None, ok=True):
+    if image is None:
+        return None
+    vis = image.copy()
+    if corners is not None:
+        cv2.drawChessboardCorners(vis, (CHESS_COLS, CHESS_ROWS), corners, ok)
+    suffix = 'ok' if ok else 'reject'
+    path = os.path.join(img_dir, f'{tag}_{suffix}.jpg')
+    cv2.imwrite(path, vis)
+    return path
 
-    # Init robot
-    node.init_robot()
 
-    # Check ToolVectorActual
-    tool = node.get_tool_pose()
-    if tool is None:
-        print('❌ ToolVectorActual 无数据！确认驱动已启动且连接机械臂WiFi')
-        node.destroy_node(); rclpy.shutdown(); return
-    print(f'📍 ToolVectorActual: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}] '
-          f'rpy=[{tool[3]:.2f} {tool[4]:.2f} {tool[5]:.2f}]')
-
-    # Check board visible
-    res = node.capture_and_detect()
-    if res and 'T' in res:
-        print(f'✅ 棋盘格可见  距离={res["dist"]:.0f}mm  重投影RMS={res["reproj_rmse"]:.3f}px')
-    elif res:
-        print(f'⚠️  棋盘格质量问题: {res["error"]}')
-    else:
-        print('⚠️  未检测到棋盘格')
-
-    # Generate poses
-    j0 = [0]*6
-    # Read current joint angles for reference
-    req=GetAngle.Request()
-    ok,r=node._call(node.GetAngle,req)
-    if ok:
-        try: j0=[float(v) for v in r.robot_return.strip('{}').split(',')]
-        except: pass
-    targets = generate_poses(j0, n=12)
-    print(f'\n{len(targets)} 位姿  按 Enter 开始...')
-    input()
-
-    # ── Collect ──
-    results = []  # [{T_robot, T_cam, tool_pose, quality}]
-    img_dir = os.path.expanduser('~/Robot_Arm_Project/scripts/calib_middle_image')
-    os.makedirs(img_dir, exist_ok=True)
-
-    for idx, tj in enumerate(targets):
-        delta = [tj[i]-j0[i] for i in range(6)]
-        tag = f'{idx+1:02d}'
-        print(f'\n▶ [{tag}/{len(targets)}] ΔJ=[{delta[0]:+.0f} {delta[1]:+.0f} '
-              f'{delta[2]:+.0f} {delta[3]:+.0f} {delta[4]:+.0f} {delta[5]:+.0f}]')
-
-        if idx > 0:
-            if not node.movj(tj): print('  ⚠ 移动失败'); continue
-            # 等待机械臂完全停止
-            print('  ⏳ 等待停止...', end='', flush=True)
-            stopped = node.wait_robot_stop(max_wait=10.0)
-            if stopped:
-                print(' 已停止')
-            else:
-                print(' ⚠ 超时(仍继续)')
-
-        # ── ToolVectorActual (必须) ──
-        tool = node.get_tool_pose()
-        if tool is None:
-            print('  ❌ ToolVectorActual 无数据!')
-            cv2.imwrite(f'{img_dir}/{tag}_reject_notool.jpg', node._img)
-            continue
-        T_robot = pose_to_matrix(tool)
-
-        # ── 棋盘格检测 ──
-        res = node.capture_and_detect()
-        if res is None:
-            print('  ❌ 未检测到棋盘格')
-            if node._img is not None:
-                cv2.imwrite(f'{img_dir}/{tag}_reject_noboard.jpg', node._img)
-            continue
-        if 'T' not in res:
-            print(f'  ❌ 质量不合格: {res["error"]}')
-            if node._img is not None:
-                vis = node._img.copy()
-                cv2.drawChessboardCorners(vis, (CHESS_COLS,CHESS_ROWS), res.get('corners'), True)
-                cv2.imwrite(f'{img_dir}/{tag}_reject_quality.jpg', vis)
-            continue
-
-        quality = {'reproj_rmse': res['reproj_rmse'], 'dist': res['dist']}
-        results.append({'T_robot': T_robot, 'T_cam': res['T'],
-                        'tool_pose': tool, 'quality': quality,
-                        'joint_idx': idx})
-
-        # Save accepted image with detected corners
-        vis = node._img.copy()
-        cv2.drawChessboardCorners(vis, (CHESS_COLS,CHESS_ROWS), res['corners'], True)
-        cv2.imwrite(f'{img_dir}/{tag}_ok.jpg', vis)
-
-        print(f'  ✅ [{len(results)}]  dist={res["dist"]:.0f}mm  '
-              f'reproj={res["reproj_rmse"]:.3f}px  '
-              f'xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
-
-    # Return home
-    node.movj(targets[0])
-
+def compute_and_save(results, out_dir):
     if len(results) < 5:
-        print(f'\n❌ 有效帧不足 ({len(results)})，需≥5'); node.destroy_node(); rclpy.shutdown(); return
+        print(f'\n❌ 有效帧不足 ({len(results)})，需≥5')
+        return False
 
-    # ── Quality report ──
     print(f'\n{"="*60}')
     print(f'📊 数据质量报告 ({len(results)} 帧)')
     print('='*60)
@@ -424,89 +352,225 @@ def main():
     print(f'  重投影误差: min={min(reprojs):.3f} max={max(reprojs):.3f} avg={np.mean(reprojs):.3f}px')
     print(f'  棋盘距离:   min={min(dists):.0f} max={max(dists):.0f} avg={np.mean(dists):.0f}mm')
 
-    # ── Build A,B pairs with motion quality check ──
     print(f'\n{"="*60}')
-    print(f'  构造运动对...')
+    print('  构造运动对...')
     print('='*60)
-
     A_list, B_list = [], []
-    skipped_motion, skipped_total = 0, 0
+    skipped_motion = 0
     for i in range(len(results)):
-        for j in range(i+1, len(results)):
-            skipped_total += 1
-            ok_m, issues = check_motion_quality(
+        for j in range(i + 1, len(results)):
+            ok_m, _ = check_motion_quality(
                 results[i]['T_robot'], results[j]['T_robot'],
                 results[i]['T_cam'], results[j]['T_cam'])
             if not ok_m:
                 skipped_motion += 1
                 continue
 
-            # 推导: G_j⁻¹ @ G_i @ X = X @ C_j @ C_i⁻¹
-            # → A = G_j⁻¹ @ G_i (机器人运动)  B = C_j @ C_i⁻¹ (相机运动)
-            A = inv_se3(results[j]['T_robot']) @ results[i]['T_robot']   # G_j⁻¹ @ G_i
-            B = results[j]['T_cam'] @ inv_se3(results[i]['T_cam'])       # C_j @ C_i⁻¹
+            A = inv_se3(results[j]['T_robot']) @ results[i]['T_robot']
+            B = results[j]['T_cam'] @ inv_se3(results[i]['T_cam'])
             A_list.append(A); B_list.append(B)
 
     print(f'  有效: {len(A_list)}  跳过(运动不足): {skipped_motion}  总计: {len(A_list)+skipped_motion}')
     if len(A_list) < 8:
-        print(f'  ❌ 有效对不足 ({len(A_list)}), 需≥8'); node.destroy_node(); rclpy.shutdown(); return
+        print(f'  ❌ 有效对不足 ({len(A_list)}), 需≥8')
+        return False
 
-    # ── Solve ──
     print(f'\n{"="*60}')
-    print(f'  求解 AX=XB...')
+    print('  求解 AX=XB...')
     print('='*60)
     X = solve_ax_xb(A_list, B_list)
     X_pose = matrix_to_pose(X)
 
-    print(f'\n 【手眼矩阵 X = camera_in_tool】')
+    print('\n 【手眼矩阵 X = camera_in_tool】')
     print(f'  平移(mm):  [{X_pose[0]:.3f} {X_pose[1]:.3f} {X_pose[2]:.3f}]')
     print(f'  旋转(deg): [{X_pose[3]:.4f} {X_pose[4]:.4f} {X_pose[5]:.4f}]')
 
-    # ── Self-check: 标定数据内部一致性 ──
     print(f'\n{"="*60}')
-    print(f'  Self-check: T_board_in_world 一致性')
+    print('  Self-check: T_board_in_world 一致性')
     print('='*60)
     bw_positions = []
     for r in results:
         T_bw = r['T_robot'] @ X @ r['T_cam']
-        bw_positions.append(T_bw[:3,3])
+        bw_positions.append(T_bw[:3, 3])
     bw = np.array(bw_positions)
     bw_mean = bw.mean(axis=0)
     bw_errs = np.linalg.norm(bw - bw_mean, axis=1)
+    bw_rms = float(np.sqrt(np.mean(bw_errs ** 2)))
     print(f'  均值 xyz=[{bw_mean[0]:.0f} {bw_mean[1]:.0f} {bw_mean[2]:.0f}] mm')
     print(f'  σ=[{bw[:,0].std():.1f} {bw[:,1].std():.1f} {bw[:,2].std():.1f}] mm')
-    print(f'  RMS={np.sqrt(np.mean(bw_errs**2)):.1f} mm')
-    if np.sqrt(np.mean(bw_errs**2)) < 10:
-        print(f'  ✅ 内部一致性良好')
+    print(f'  RMS={bw_rms:.1f} mm')
+    if bw_rms < 10:
+        print('  ✅ 内部一致性良好')
     else:
-        print(f'  ⚠️  内部一致性差 → 可能: 移动未停止 / 棋盘格移动 / ToolVectorActual不准')
+        print('  ⚠️  内部一致性差 → 可能: 拖拽后未稳定 / 棋盘格移动 / ToolVectorActual不准')
 
-    # Save (含原始数据, 供后续诊断)
     raw_frames = []
     for r in results:
-        T_cam_list = [[float(r['T_cam'][i,j]) for j in range(4)] for i in range(4)]
+        T_cam_list = [[float(r['T_cam'][i, j]) for j in range(4)] for i in range(4)]
+        T_robot_list = [[float(r['T_robot'][i, j]) for j in range(4)] for i in range(4)]
         raw_frames.append({
+            'index': int(r['index']),
             'tool_xyzrpy': [float(v) for v in r['tool_pose']],
+            'T_robot_4x4': T_robot_list,
             'T_cam_4x4': T_cam_list,
+            'image_path': r.get('image_path'),
             'quality': {'reproj_rmse': float(r['quality']['reproj_rmse']),
                         'dist': float(r['quality']['dist'])},
         })
+
     out = {
-        'method': 'chessboard+ToolVectorActual+quality_filter',
-        'chessboard': {'size':[CHESS_COLS,CHESS_ROWS], 'square_mm':SQUARE_MM},
-        'num_frames': len(results), 'num_pairs': len(A_list),
-        'quality': {'reproj_rmse_stats': [float(min(reprojs)),float(max(reprojs)),float(np.mean(reprojs))],
-                    'dist_stats': [float(min(dists)),float(max(dists)),float(np.mean(dists))]},
+        'method': 'interactive_drag_chessboard+ToolVectorActual+quality_filter',
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+        'output_dir': out_dir,
+        'chessboard': {'size': [CHESS_COLS, CHESS_ROWS], 'square_mm': SQUARE_MM},
+        'topics': {'image': TOPIC_IMAGE, 'camera_info': TOPIC_INFO, 'tool': TOPIC_TOOL},
+        'num_frames': len(results),
+        'num_pairs': len(A_list),
+        'quality': {
+            'reproj_rmse_stats': [float(min(reprojs)), float(max(reprojs)), float(np.mean(reprojs))],
+            'dist_stats': [float(min(dists)), float(max(dists)), float(np.mean(dists))],
+            'board_world_rms_mm': bw_rms,
+        },
         'X_camera_in_tool': {
-            'xyz_mm': [round(v,4) for v in X_pose[:3]],
-            'rpy_deg': [round(v,6) for v in X_pose[3:6]],
+            'xyz_mm': [round(v, 4) for v in X_pose[:3]],
+            'rpy_deg': [round(v, 6) for v in X_pose[3:6]],
             'matrix': X.tolist(),
         },
         'raw_frames': raw_frames,
     }
-    with open(OUTPUT_FILE,'w') as f: json.dump(out,f,indent=2,ensure_ascii=False)
-    print(f'\n📁 {OUTPUT_FILE}')
 
-    node.destroy_node(); rclpy.shutdown()
+    output_file = os.path.join(out_dir, 'handeye_chessboard_result.json')
+    with open(output_file, 'w') as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f'\n📁 标定结果: {output_file}')
+    print('   旧的 scripts/handeye_chessboard_result.json 未覆盖')
+    return True
 
-if __name__=='__main__': main()
+
+def print_interactive_help():
+    print('\n交互命令:')
+    print('  d  进入拖拽模式 StartDrag')
+    print('  e  退出拖拽模式 StopDrag 并重新使能')
+    print('  s  采样当前 ToolVectorActual + 当前图像')
+    print('  u  删除上一条有效采样')
+    print('  c  根据当前采样计算手眼并保存到本次新文件夹')
+    print('  h  显示帮助')
+    print('  q  退出')
+
+
+def main():
+    rclpy.init()
+    node = HandEyeCalib()
+    out_dir, img_dir = create_session_dir()
+
+    print('\n' + '=' * 60)
+    print('  手眼标定 — 拖拽采样棋盘格法')
+    print(f'  棋盘格: {CHESS_COLS}×{CHESS_ROWS}  格边={SQUARE_MM}mm')
+    print(f'  输出目录: {out_dir}')
+    print('=' * 60)
+
+    print('等待相机内参...')
+    for _ in range(50):
+        rclpy.spin_once(node, timeout_sec=0.1)
+    if node._K is None:
+        print('❌ 无CameraInfo')
+        node.destroy_node(); rclpy.shutdown(); return
+    print(f'📷 K: fx={node._K[0,0]:.0f} fy={node._K[1,1]:.0f}')
+
+    node.init_robot()
+    tool = node.get_tool_pose()
+    if tool is None:
+        print('❌ ToolVectorActual 无数据！确认驱动已启动且连接机械臂WiFi')
+        node.destroy_node(); rclpy.shutdown(); return
+    print(f'📍 ToolVectorActual: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}] '
+          f'rpy=[{tool[3]:.2f} {tool[4]:.2f} {tool[5]:.2f}]')
+
+    res = node.capture_and_detect()
+    if res and 'T' in res:
+        print(f'✅ 当前棋盘格可见  距离={res["dist"]:.0f}mm  重投影RMS={res["reproj_rmse"]:.3f}px')
+    elif res:
+        print(f'⚠️  当前棋盘格未通过: {res["error"]}')
+    else:
+        print('⚠️  当前未收到图像')
+
+    results = []
+    rejected_count = 0
+    print_interactive_help()
+
+    try:
+        while rclpy.ok():
+            cmd = input(f'\n[{len(results)}帧] 命令(d/e/s/u/c/h/q)> ').strip().lower()
+            for _ in range(3):
+                rclpy.spin_once(node, timeout_sec=0.02)
+
+            if cmd == 'd':
+                if node.start_drag():
+                    print('🖐 已进入拖拽模式，请拖到一个新姿态后按 s 采样')
+                else:
+                    print('❌ StartDrag 失败')
+
+            elif cmd == 'e':
+                if node.stop_drag():
+                    print('✅ 已退出拖拽')
+                else:
+                    print('⚠ StopDrag 失败或机器人未处于拖拽')
+                node._call(node.EnableRobot, EnableRobot.Request(), timeout=10.0)
+
+            elif cmd == 's':
+                idx = len(results) + 1
+                tag = f'{idx:02d}'
+                tool = node.get_tool_pose()
+                if tool is None:
+                    print('  ❌ ToolVectorActual 无数据，未采样')
+                    continue
+                T_robot = pose_to_matrix(tool)
+                res = node.capture_and_detect()
+                if res is None or 'T' not in res:
+                    rejected_count += 1
+                    reason = res['error'] if res else '无图像'
+                    reject_tag = f'reject_{rejected_count:02d}'
+                    if res and 'image' in res:
+                        draw_and_save_sample(img_dir, reject_tag, res['image'], res.get('corners'), ok=False)
+                    print(f'  ❌ 采样拒绝: {reason}')
+                    continue
+
+                image_path = draw_and_save_sample(img_dir, tag, res['image'], res['corners'], ok=True)
+                quality = {'reproj_rmse': res['reproj_rmse'], 'dist': res['dist']}
+                results.append({
+                    'index': idx,
+                    'T_robot': T_robot,
+                    'T_cam': res['T'],
+                    'tool_pose': tool,
+                    'quality': quality,
+                    'image_path': image_path,
+                })
+                print(f'  ✅ [{len(results)}] dist={res["dist"]:.0f}mm '
+                      f'reproj={res["reproj_rmse"]:.3f}px '
+                      f'xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
+
+            elif cmd == 'u':
+                if not results:
+                    print('  没有可删除的采样')
+                else:
+                    r = results.pop()
+                    print(f'  ↩ 已删除第 {r["index"]} 条有效采样')
+
+            elif cmd == 'c':
+                if compute_and_save(results, out_dir):
+                    print('✅ 计算完成，可以按 q 退出，或继续采样后再次 c 重新计算到同一新文件夹')
+
+            elif cmd == 'h' or cmd == '':
+                print_interactive_help()
+
+            elif cmd == 'q':
+                break
+
+            else:
+                print('未知命令，按 h 查看帮助')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -238,8 +238,9 @@ namespace parseTool
     }
     std::string parserGetPoseRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::GetPose::Request> request)
     {
+        std::ignore = request; // GetPose 的 user/tool 是可选参数；默认不带，避免部分控制器报 -40001
         std::stringstream ss;
-        ss << "GetPose("<<"user=" << request->user << ",tool=" << request->tool<<")";
+        ss << "GetPose()";
         return ss.str();
     }
     std::string parserEmergencyStopRequest2String(const std::shared_ptr<dobot_msgs_v4::srv::EmergencyStop::Request> request)
