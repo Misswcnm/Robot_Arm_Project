@@ -37,7 +37,6 @@ class CR5Robot:
 
         self._tool = None
         self._tool_seq = -1
-        self._cartesian_movj_enabled = True
         def _cb(msg):
             self._tool = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
             self._tool_seq += 1  # 每次新数据递增
@@ -139,17 +138,20 @@ class CR5Robot:
         req.tool = ''
         req.use_joint_near = 'useJointNear =1'
         req.joint_near = 'jointNear=' + self._fmt_joint_list(seed_joints)
+        self._logger.info(
+            'InverseKin请求: pose=[%.3f %.3f %.3f %.3f %.3f %.3f] near=%s' %
+            (req.x, req.y, req.z, req.rx, req.ry, req.rz, req.joint_near))
         ok, r = self._call(self.InverseKin, req, timeout=5.0)
         if not ok or r.res != 0:
             self._logger.warn(f'InverseKin失败: ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
-            if ok and getattr(r, 'res', None) == -10000:
-                self._cartesian_movj_enabled = False
-                self._logger.warn('InverseKin命令格式被控制器拒绝(-10000), 本次运行关闭MovJ(pose)优先路径, 直接回退Jacobian')
             return None
         vals = self._parse_return_floats(r.robot_return)
         if vals is None or len(vals) != 6:
             self._logger.warn(f'InverseKin返回解析失败: {r.robot_return}')
             return None
+        self._logger.info(
+            'InverseKin成功: joint=[%.3f %.3f %.3f %.3f %.3f %.3f]' %
+            tuple(vals[:6]))
         return vals
 
     def check_odd_movj(self, start_joints: list, target_joints: list) -> bool:
@@ -163,6 +165,9 @@ class CR5Robot:
         (req.point2_j1, req.point2_j2, req.point2_j3,
          req.point2_j4, req.point2_j5, req.point2_j6) = [float(v) for v in target_joints[:6]]
         req.param_value = []
+        self._logger.info(
+            'CheckOddMovJ请求: start=%s target=%s' %
+            (self._fmt_joint_list(start_joints), self._fmt_joint_list(target_joints)))
         ok, r = self._call(self.CheckOddMovJ, req, timeout=5.0)
         if not ok or r.res != 0:
             self._logger.warn(f'CheckOddMovJ调用失败: ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
@@ -172,13 +177,15 @@ class CR5Robot:
         if result_id != 0:
             self._logger.warn(f'CheckOddMovJ未通过: ResultID={result_id}')
             return False
+        self._logger.info('CheckOddMovJ通过')
         return True
 
     def movj_pose(self, target, label: str = 'MovJ') -> bool:
         """优先使用控制器笛卡尔MovJ: InverseKin校验 -> CheckOddMovJ -> MovJ(mode=False)."""
-        if not self._cartesian_movj_enabled:
-            return False
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
+        self._logger.info(
+            f'{label}: 尝试MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
+            f'{pose[3]:.3f} {pose[4]:.3f} {pose[5]:.3f}]')
         start_j = self.get_joints()
         if not start_j:
             self._logger.warn(f'{label}: GetAngle失败, 无法做CheckOddMovJ')
@@ -195,11 +202,15 @@ class CR5Robot:
         req.a, req.b, req.c = float(pose[0]), float(pose[1]), float(pose[2])
         req.d, req.e, req.f = float(pose[3]), float(pose[4]), float(pose[5])
         req.param_value = []
+        self._logger.info(
+            f'{label}: 发送MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
+            f'{pose[3]:.3f} {pose[4]:.3f} {pose[5]:.3f}]')
         ok, r = self._call(self.MovJ, req, timeout=20.0)
         if not ok or r.res != 0:
             self._logger.warn(f'{label}: MovJ(pose)失败 ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
             return False
         self.wait_tool_stable(timeout=8.0)
+        self._logger.info(f'{label}: MovJ(pose)完成')
         return True
 
     def movj(self, joints: list) -> bool:
