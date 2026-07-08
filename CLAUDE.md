@@ -14,8 +14,41 @@ ClearError → DisableRobot → EnableRobot → SpeedFactor → SetCollisionLeve
 
 ## CR5 运动指令
 - ✅ JointMovJ (mode=True) — 唯一可靠的运动方式
+- ✅ MovJ 笛卡尔位置参数格式 — `MovJ(x,y,z,rx,ry,rz)` 实测可接收
 - ❌ MovL — CR5 固件不支持 (res=0 但不动, 还会触发 ERROR)
 - ❌ RequestControl — 返回 -10000 (CR5 不支持)
+
+### MovJ TCP格式实测规范 (CR5旧固件)
+
+测试脚本:
+```bash
+python3 scripts/test_movj_tcp_formats.py --host 192.168.1.6 --current --execute
+```
+
+实测结论:
+```text
+✅ MovJ(x,y,z,rx,ry,rz)                         -> 0
+✅ MovJ(x,y,z,rx,ry,rz,0,0,20,20,0)             -> 0
+✅ JointMovJ(j1,j2,j3,j4,j5,j6)                 -> 0
+
+❌ MovJ(pose={x,y,z,rx,ry,rz})                  -> -30001
+❌ MovJ(pose={...},user=0,tool=0,a=20,v=20,cp=0)-> -30001
+❌ MovJ(x,y,z,rx,ry,rz,a=20,v=20,cp=0)          -> -1
+❌ JointMovJ(j1,j2,j3,j4,j5,j6,a=20,v=20,cp=0)  -> -1
+❌ MovJ(joint={j1,j2,j3,j4,j5,j6},...)          -> -30001
+```
+
+因此 `dobot_msgs_v4/srv/MovJ` 的 `mode=False` 必须拼成:
+```text
+MovJ(x,y,z,rx,ry,rz)
+```
+
+不要拼成 V4 文档里的:
+```text
+MovJ(pose={x,y,z,rx,ry,rz},user=0,tool=0,a=20,v=20,cp=0)
+```
+
+这台控制器会对 `pose={...}` 返回 `-30001`，对命名速度参数 `a/v/cp` 返回 `-1`。主流程中 `movj_pose()` 不传 `user/tool/a/v/cp`，速度使用全局 `SpeedFactor` 控制。
 
 ## 旋转约定 (重要!)
 
@@ -53,8 +86,8 @@ G_i @ X @ C_i = G_j @ X @ C_j  (棋盘格不变)
 
 ## 调试中的关键错误
 
-1. `parseTool.cpp` MovJ/MovL 用了 V4 命名参数 (`joint={}`) → CR5 返回 -30001
-   → 修复: 改用位置参数 `MovJ(j1,j2,...)` 和 `JointMovJ(j1,j2,...)`
+1. `parseTool.cpp` MovJ/MovL 用了 V4 命名参数 (`pose={}` / `joint={}`) → CR5 返回 -30001
+   → 修复: 改用位置参数 `MovJ(x,y,z,rx,ry,rz)` 和 `JointMovJ(j1,j2,...)`
 
 2. `cr5_fk()` URDF rpy 参数 roll/yaw 互换 → FK 全错
    → 修复: J2/J5/J6 的 `_urdf_T` rpy 参数修正

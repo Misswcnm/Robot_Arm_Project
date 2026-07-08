@@ -567,20 +567,9 @@ namespace parseTool
         }
         else
         {
-            // 笛卡尔点到点运动按V4格式发送: MovJ(pose={x,y,z,rx,ry,rz})
+            // CR5旧固件实测只接受位置参数: MovJ(x,y,z,rx,ry,rz)
+            // V4命名参数 MovJ(pose={...}) 会返回 -30001.
             stringOrder = "MovJ(";
-            stringOrder = stringOrder + "pose={";
-            stringOrder = stringOrder + cmdCoordinate;
-            stringOrder = stringOrder + "}";
-            if (!(request->param_value.empty() || request->param_value[0].empty()))
-            {
-                for (size_t i = 0; i < request->param_value.size(); i++)
-                {
-                    stringOrder = stringOrder + "," + std::string(request->param_value[i]);
-                }
-            }
-            stringOrder = stringOrder + ")";
-            return stringOrder;
         }
         stringOrder = stringOrder + cmdCoordinate;
 
