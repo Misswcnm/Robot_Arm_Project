@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-手眼标定精度验证 — ToolVectorActual + 质量过滤 + 等待停止
+手眼标定精度验证 — GetPose + 质量过滤 + 等待停止
 ==========================================================
-原理: 棋盘格固定 → N个位姿 → 每帧: ToolVectorActual(T_robot) + solvePnP(T_cam)
+原理: 棋盘格固定 → N个位姿 → 每帧: GetPose(T_robot) + solvePnP(T_cam)
      → T_board_world = T_robot @ X @ T_cam  (应一致)
      → 不一致度 = 标定误差
 
-与 handeye_chessboard.py 完全一致: 全部使用 ToolVectorActual
+与 handeye_chessboard.py 完全一致: 全部使用 GetPose()
 """
 
 import json, time, os, math
@@ -18,9 +18,8 @@ from scipy.spatial.transform import Rotation as Rot
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
-from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
-                                MovJ, SpeedFactor, GetAngle,
+                                MovJ, SpeedFactor, GetAngle, GetPose,
                                 SetCollisionLevel, RobotMode)
 
 
@@ -49,7 +48,7 @@ VAL_DELTAS = [
 
 # ══════════════════════════════════════
 def pose_to_matrix(xyzrpy):
-    """CR5 ToolVectorActual: rx,ry,rz = XYZ intrinsic Euler"""
+    """CR5 GetPose: rx,ry,rz = XYZ intrinsic Euler"""
     x,y,z,rx,ry,rz=xyzrpy
     R=Rot.from_euler('xyz',[rx,ry,rz],degrees=True).as_matrix()
     T=np.eye(4); T[:3,:3]=R; T[:3,3]=[x,y,z]; return T
@@ -89,6 +88,7 @@ class CalibValidator(Node):
         self.SetCollision = self.create_client(SetCollisionLevel,'/dobot_bringup_ros2/srv/SetCollisionLevel')
         self.RobotMode    = self.create_client(RobotMode,    '/dobot_bringup_ros2/srv/RobotMode')
         self.GetAngle     = self.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')  # 仅用于位姿生成偏移
+        self.GetPose      = self.create_client(GetPose,      '/dobot_bringup_ros2/srv/GetPose')
 
         for n,c in [('EnableRobot',self.EnableRobot),('MovJ',self.MovJ)]:
             while not c.wait_for_service(timeout_sec=1.0): pass
@@ -97,12 +97,6 @@ class CalibValidator(Node):
         self._img = None; self._K = None; self._D = None
         self._sub_img = self.create_subscription(Image, '/camera/camera/color/image_raw', self._cb_img, 10)
         self._sub_info = self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self._cb_info, 10)
-        # ★ ToolVectorActual ★
-        self._tool = None
-        self._sub_tool = self.create_subscription(
-            ToolVectorActual, '/dobot_msgs_v4/msg/ToolVectorActual',
-            lambda m: setattr(self,'_tool',[m.x,m.y,m.z,m.rx,m.ry,m.rz]), 10)
-
     def _cb_img(self, msg):
         try:
             h,w=msg.height,msg.width; data=np.frombuffer(msg.data,dtype=np.uint8)
@@ -132,13 +126,16 @@ class CalibValidator(Node):
         c=SetCollisionLevel.Request(); c.level=5; self._call(self.SetCollision,c)
 
     def get_tool_pose(self):
-        """ToolVectorActual 真实TCP (mm, deg)"""
-        for _ in range(30):
-            rclpy.spin_once(self,timeout_sec=0.1)
-            if self._tool is not None:
-                x,y,z=self._tool[:3]
-                if abs(x)>0.5 or abs(y)>0.5 or abs(z)>0.5:
-                    return list(self._tool)
+        """GetPose 真实TCP (mm, deg)."""
+        ok, r = self._call(self.GetPose, GetPose.Request(), timeout=3.0)
+        if ok and getattr(r, 'res', -1) == 0:
+            try:
+                vals = [float(v) for v in r.robot_return.strip('{}').split(',')]
+                if len(vals) == 6 and np.linalg.norm(vals[:3]) > 1.0:
+                    return vals
+                print(f'  ⚠ GetPose返回无效位姿: {vals}')
+            except Exception:
+                pass
         return None
 
     def movj(self,joints):
@@ -210,11 +207,11 @@ def main():
 
     node.init_robot()
 
-    # ★ Check ToolVectorActual ★
+    # ★ Check GetPose ★
     tool=node.get_tool_pose()
     if tool is None:
-        print('❌ ToolVectorActual 无数据！'); node.destroy_node(); rclpy.shutdown(); return
-    print(f'📍 ToolVectorActual: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}]')
+        print('❌ GetPose 无有效位姿！'); node.destroy_node(); rclpy.shutdown(); return
+    print(f'📍 GetPose: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}]')
 
     # Read current joints
     j0=[0]*6
@@ -246,10 +243,10 @@ def main():
             if node.wait_robot_stop(): print(' 已停止')
             else: print(' ⚠ 超时')
 
-        # ★ ToolVectorActual ★
+        # ★ GetPose ★
         tool=node.get_tool_pose()
         if tool is None:
-            print('  ❌ ToolVectorActual 无数据'); continue
+            print('  ❌ GetPose 无有效位姿'); continue
         T_robot=pose_to_matrix(tool)
 
         # ★ 质量过滤 ★

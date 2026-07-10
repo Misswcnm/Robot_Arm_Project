@@ -1,12 +1,11 @@
-"""CR5 robot interface: init, movj, ToolVectorActual, wait_stop."""
+"""CR5 robot interface: init, movj, GetPose, wait_stop."""
 import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as Rot
-from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
-                                MovJ, SpeedFactor, GetAngle, GetPose,
+                                MovJ, SpeedFactor, GetAngle, GetPose, GetErrorID,
                                 SetCollisionLevel, RobotMode, StartDrag, StopDrag)
 
 
@@ -24,7 +23,9 @@ class CR5Robot:
         self.SpeedFactor  = node.create_client(SpeedFactor,  '/dobot_bringup_ros2/srv/SpeedFactor')
         self.SetCollision = node.create_client(SetCollisionLevel, '/dobot_bringup_ros2/srv/SetCollisionLevel')
         self.RobotMode    = node.create_client(RobotMode,    '/dobot_bringup_ros2/srv/RobotMode')
+        self.GetErrorID   = node.create_client(GetErrorID,   '/dobot_bringup_ros2/srv/GetErrorID')
         self.GetAngle     = node.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
+        self.GetPose      = node.create_client(GetPose,      '/dobot_bringup_ros2/srv/GetPose')
         self.StartDrag    = node.create_client(StartDrag,    '/dobot_bringup_ros2/srv/StartDrag')
         self.StopDrag     = node.create_client(StopDrag,     '/dobot_bringup_ros2/srv/StopDrag')
 
@@ -32,12 +33,7 @@ class CR5Robot:
             while not c.wait_for_service(timeout_sec=1.0):
                 self._logger.info(f'等待 {n}...')
 
-        self._tool = None
-        self._tool_seq = -1
-        def _cb(msg):
-            self._tool = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
-            self._tool_seq += 1  # 每次新数据递增
-        node.create_subscription(ToolVectorActual, '/dobot_msgs_v4/msg/ToolVectorActual', _cb, 10)
+        self._last_getpose_warn = 0.0
 
     def _call(self, client, req, timeout=10.0):
         fut = client.call_async(req)
@@ -57,34 +53,62 @@ class CR5Robot:
         self._call(self.DisableRobot, DisableRobot.Request())
         self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)  # ~4s
         rclpy.spin_once(self._node, timeout_sec=0.1)  # 让topic到位
-        s = SpeedFactor.Request(); s.ratio = self._speed; self._call(self.SpeedFactor, s)
-        c = SetCollisionLevel.Request(); c.level = 5; self._call(self.SetCollision, c)
+        self.apply_motion_safety()
         self._logger.info(f'✅ CR5 ready  speed={self._speed}%  collision=Lv.5')
 
-    # ── ToolVectorActual + GetPose fallback ──
-    def get_tool(self) -> list | None:
-        """真实TCP [x,y,z,rx,ry,rz] mm,deg. 优先ToolVectorActual, 回退GetPose"""
-        for _ in range(3):
-            rclpy.spin_once(self._node, timeout_sec=0.02)
-            if self._tool is not None and abs(self._tool[0]) > 0.5:
-                return list(self._tool)
-        # 2. Fallback: GetPose() 不带参数
-        self._logger.warn('ToolVectorActual无数据, GetPose()...')
-        gp = self._node.create_client(GetPose, '/dobot_bringup_ros2/srv/GetPose')
-        if not gp.wait_for_service(timeout_sec=1.0):
+    def apply_motion_safety(self) -> bool:
+        """每次EnableRobot后都重新设置速度和碰撞等级，避免恢复默认高速。"""
+        s = SpeedFactor.Request()
+        s.ratio = self._speed
+        ok_speed, speed_resp = self._call(self.SpeedFactor, s)
+        c = SetCollisionLevel.Request()
+        c.level = 5
+        ok_collision, collision_resp = self._call(self.SetCollision, c)
+        if not ok_speed or getattr(speed_resp, 'res', 0) != 0:
+            self._logger.error(
+                f'SpeedFactor设置失败: ok={ok_speed} '
+                f'res={getattr(speed_resp, "res", None)}')
+            return False
+        if not ok_collision or getattr(collision_resp, 'res', 0) != 0:
+            self._logger.error(
+                f'SetCollisionLevel设置失败: ok={ok_collision} '
+                f'res={getattr(collision_resp, "res", None)}')
+            return False
+        self._logger.info(f'运动安全参数已设置: speed={self._speed}% collision=Lv.5')
+        return True
+
+    # ── GetPose ──
+    @staticmethod
+    def _valid_tool_pose(tool) -> bool:
+        if tool is None or len(tool) < 6:
+            return False
+        vals = np.asarray(tool[:6], dtype=float)
+        if not np.all(np.isfinite(vals)):
+            return False
+        return np.linalg.norm(vals[:3]) > 1.0
+
+    def get_tool(self, warn: bool = True) -> list | None:
+        """真实TCP [x,y,z,rx,ry,rz] mm,deg. 统一使用GetPose()."""
+        now = time.time()
+        if warn and now - self._last_getpose_warn > 2.0:
+            self._logger.info('GetPose()读取当前TCP位姿')
+            self._last_getpose_warn = now
+        if not self.GetPose.wait_for_service(timeout_sec=1.0):
             return None
-        # Try without params first (older CR5 firmware)
-        req = GetPose.Request()
-        fut = gp.call_async(req)
-        t0 = time.time()
-        while not fut.done() and time.time()-t0 < 3.0:
-            rclpy.spin_once(self._node, timeout_sec=0.05)
-        if fut.done() and fut.result().res == 0:
+        ok, response = self._call(self.GetPose, GetPose.Request(), timeout=3.0)
+        if ok and response is not None and response.res == 0:
             try:
-                s = fut.result().robot_return.strip('{}')
+                s = response.robot_return.strip('{}')
                 vals = [float(v) for v in s.split(',')]
-                if len(vals) == 6: return vals
-            except: pass
+                if len(vals) == 6 and self._valid_tool_pose(vals):
+                    return vals
+                if warn:
+                    self._logger.warn(f'GetPose返回无效全零位姿: {vals}')
+            except Exception:
+                pass
+        elif warn:
+            self._logger.warn(
+                f'GetPose调用失败: ok={ok} res={getattr(response, "res", None)}')
         return None
 
     # ── Joint angles ──
@@ -105,7 +129,11 @@ class CR5Robot:
                 float(rpy[0]), float(rpy[1]), float(rpy[2])]
 
     def movj_pose(self, target, label: str = 'MovJ') -> bool:
-        """直接使用控制器笛卡尔MovJ. 失败或未移动时返回False."""
+        """直接使用控制器笛卡尔MovJ，并等待队列真正启动和到位."""
+        return self.movj_pose_status(target, label=label) == 'arrived'
+
+    def movj_pose_status(self, target, label: str = 'MovJ') -> str:
+        """返回 arrived/queued/failed: queued表示已入队但未确认到位."""
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
         pre_move = self.get_tool()
         self._logger.info(
@@ -119,16 +147,85 @@ class CR5Robot:
         ok, r = self._call(self.MovJ, req, timeout=20.0)
         if not ok or r.res != 0:
             self._logger.warn(f'{label}: MovJ(pose)失败 ok={ok} res={getattr(r, "res", None)} ret={getattr(r, "robot_return", r)}')
-            return False
-        self.wait_tool_stable(timeout=8.0)
-        cur = self.get_tool()
-        if pre_move and cur:
-            d = np.linalg.norm(np.array(cur[:3]) - np.array(pre_move[:3]))
-            if d < 0.5:
-                self._logger.warn(f'{label}: MovJ(pose)返回0但未检测到移动(Δ={d:.1f}mm)')
-                return False
-        self._logger.info(f'{label}: MovJ(pose)完成')
-        return True
+            return 'failed'
+        arrived, pos_err, rot_err = self.wait_pose_arrival(
+            pose, start_pose=pre_move, timeout=12.0)
+        if not arrived:
+            self._logger.warn(
+                f'{label}: MovJ已入队但未确认到位, 不抢跑Jacobian '
+                f'(目标残差={pos_err:.1f}mm/{rot_err:.2f}°)')
+            return 'queued'
+        self._logger.info(
+            f'{label}: MovJ(pose)到位 '
+            f'(目标残差={pos_err:.1f}mm/{rot_err:.2f}°)')
+        return 'arrived'
+
+    @staticmethod
+    def _pose_residual(actual, target) -> tuple[float, float]:
+        pos_err = float(np.linalg.norm(
+            np.asarray(actual[:3], dtype=float) -
+            np.asarray(target[:3], dtype=float)))
+        Ra = Rot.from_euler('xyz', actual[3:6], degrees=True)
+        Rt = Rot.from_euler('xyz', target[3:6], degrees=True)
+        rot_err = float(np.degrees((Rt * Ra.inv()).magnitude()))
+        return pos_err, rot_err
+
+    def wait_pose_arrival(self, target, start_pose=None, timeout: float = 12.0,
+                          pos_tol: float = 1.0,
+                          rot_tol: float = 0.15,
+                          feedback_timeout: float = 8.0,
+                          poll_interval: float = 0.5) -> tuple[bool, float, float]:
+        """MovJ返回0仅代表入队；用GetPose轮询目标残差确认到位。"""
+        started = start_pose is None
+        stable_at_target = 0
+        pos_err = float('inf')
+        rot_err = float('inf')
+        t0 = time.time()
+
+        while time.time() - t0 < timeout:
+            current = self.get_tool(warn=False)
+            if current is None:
+                if time.time() - t0 > feedback_timeout:
+                    self._logger.warn('MovJ后GetPose无有效反馈, 快速切换Jacobian')
+                    return False, pos_err, rot_err
+                time.sleep(poll_interval)
+                continue
+
+            if not started:
+                moved_mm, moved_deg = self._pose_residual(current, start_pose)
+                started = moved_mm > 0.2 or moved_deg > 0.03
+
+            pos_err, rot_err = self._pose_residual(current, target)
+            if pos_err <= pos_tol and rot_err <= rot_tol:
+                stable_at_target += 1
+                if stable_at_target >= 3:
+                    return True, pos_err, rot_err
+            else:
+                stable_at_target = 0
+            time.sleep(poll_interval)
+
+        current = self.get_tool(warn=False)
+        if current:
+            pos_err, rot_err = self._pose_residual(current, target)
+        self._logger.warn(f'MovJ等待超时: 是否启动={started}')
+        return False, pos_err, rot_err
+
+    def get_robot_mode(self) -> int | None:
+        ok, response = self._call(
+            self.RobotMode, RobotMode.Request(), timeout=1.0)
+        if not ok or response is None or response.res != 0:
+            return None
+        try:
+            return int(response.robot_return.strip('{}'))
+        except (TypeError, ValueError):
+            return None
+
+    def get_error_id(self) -> str:
+        ok, response = self._call(
+            self.GetErrorID, GetErrorID.Request(), timeout=1.0)
+        if not ok or response is None:
+            return '<查询失败>'
+        return response.robot_return.strip()
 
     def movj(self, joints: list) -> bool:
         pre_move = self.get_tool()
@@ -152,27 +249,25 @@ class CR5Robot:
 
     def wait_tool_stable(self, timeout: float = 5.0,
                           stable_required: int = 5,
-                          min_wait: float = 0.15) -> bool:
-        """
-        ToolVectorActual seq-based 稳定检测.
-        只比较不同seq的新帧, 连续stable_required次满足:
-          xyz变化<0.3mm 且 rpy变化<0.05°
-        """
+                          min_wait: float = 0.15,
+                          feedback_timeout: float = 3.5,
+                          poll_interval: float = 0.25) -> bool:
+        """GetPose稳定检测: 连续stable_required次 xyz<0.3mm 且 rpy<0.05deg."""
         time.sleep(min_wait)  # 确保运动已启动
         prev_xyz = None; prev_rpy = None
-        last_seq = self._tool_seq - 1
         stable = 0
         t0 = time.time()
         while time.time() - t0 < timeout:
-            rclpy.spin_once(self._node, timeout_sec=0.03)
-            if self._tool is None or abs(self._tool[0]) < 0.5:
+            current = self.get_tool(warn=False)
+            if current is None:
+                if time.time() - t0 > feedback_timeout:
+                    self._logger.warn('等待停稳时GetPose无有效反馈')
+                    return False
+                time.sleep(poll_interval)
                 continue
-            if self._tool_seq <= last_seq:
-                continue  # 不是新数据, 跳过
-            last_seq = self._tool_seq
 
-            cur_xyz = np.array(self._tool[:3])
-            cur_rpy = np.array(self._tool[3:6])
+            cur_xyz = np.array(current[:3])
+            cur_rpy = np.array(current[3:6])
             if prev_xyz is not None:
                 d_xyz = np.linalg.norm(cur_xyz - prev_xyz)
                 d_rpy = np.linalg.norm(cur_rpy - prev_rpy)
@@ -184,6 +279,7 @@ class CR5Robot:
                     stable = 0  # 动了, 重置
             prev_xyz = cur_xyz
             prev_rpy = cur_rpy
+            time.sleep(poll_interval)
         return True  # 超时默认已停
 
     def start_drag(self) -> bool:
@@ -195,7 +291,7 @@ class CR5Robot:
         return ok and r.res == 0
 
     def enable(self) -> bool:
-        """退出拖拽后重新使能机器人；EnableRobot 本身是 service client, 不能直接当函数调用。"""
+        """退出拖拽后重新使能机器人，并强制恢复速度/碰撞等级。"""
         ok, r = self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)
         if not ok:
             self._logger.error(f'EnableRobot 调用失败: {r}')
@@ -203,16 +299,19 @@ class CR5Robot:
         if r.res != 0:
             self._logger.error(f'EnableRobot 返回异常 res={r.res}')
             return False
-        return True
+        rclpy.spin_once(self._node, timeout_sec=0.1)
+        return self.apply_motion_safety()
 
     def recover(self) -> bool:
-        """完整恢复: ClearError→DisableRobot→EnableRobot→SpeedFactor→SetCollisionLevel"""
-        self._logger.error('ERROR! 执行完整恢复序列...')
+        """错误恢复: ClearError→EnableRobot→SpeedFactor→SetCollisionLevel."""
+        self._logger.error('ERROR! 执行ClearError+EnableRobot恢复序列...')
         self._call(self.ClearError, ClearError.Request())
-        self._call(self.DisableRobot, DisableRobot.Request())
         ok, _ = self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)
         rclpy.spin_once(self._node, timeout_sec=0.1)
-        s = SpeedFactor.Request(); s.ratio = self._speed; self._call(self.SpeedFactor, s)
-        c = SetCollisionLevel.Request(); c.level = 5; self._call(self.SetCollision, c)
+        if not ok:
+            self._logger.error('EnableRobot恢复失败')
+            return False
+        if not self.apply_motion_safety():
+            return False
         self._logger.info('✅ 恢复完成')
         return True

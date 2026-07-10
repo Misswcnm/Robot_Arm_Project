@@ -21,6 +21,7 @@
 #include <Eigen/Geometry>
 
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -29,264 +30,22 @@
 #include "dobot_msgs_v4/srv/clear_error.hpp"
 #include "dobot_msgs_v4/srv/disable_robot.hpp"
 #include "dobot_msgs_v4/srv/enable_robot.hpp"
-#include "dobot_msgs_v4/srv/get_angle.hpp"
 #include "dobot_msgs_v4/srv/mov_j.hpp"
 #include "dobot_msgs_v4/srv/servo_p.hpp"
 #include "dobot_msgs_v4/srv/set_collision_level.hpp"
 #include "dobot_msgs_v4/srv/speed_factor.hpp"
 #include "dobot_msgs_v4/srv/stop.hpp"
 
+
+
+#include "continuous_icp_servo/geometry.hpp"
+#include "continuous_icp_servo/handeye_loader.hpp"
+#include "continuous_icp_servo/icp_solver.hpp"
+#include "continuous_icp_servo/point_cloud_utils.hpp"
+#include "continuous_icp_servo/spatial_index.hpp"
+
 using namespace std::chrono_literals;
-
-namespace {
-
-using Point = Eigen::Vector3d;
-using Cloud = std::vector<Point>;
-using Mat4 = Eigen::Matrix4d;
-using Mat3 = Eigen::Matrix3d;
-
-int64_t steadyMs()
-{
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-struct ToolPose {
-  double x{0}, y{0}, z{0}, rx{0}, ry{0}, rz{0};
-  rclcpp::Time stamp;
-  bool valid{false};
-};
-
-struct IcpResult {
-  Mat4 T_icp_mm{Mat4::Identity()};
-  double rmse_mm{999.0};
-  double overlap{0.0};
-  int inliers{0};
-  uint64_t seq{0};
-  bool ok{false};
-  rclcpp::Time stamp;
-};
-
-struct JointDelta {
-  double j1{0}, j2{0}, j3{0}, j4{0}, j5{0}, j6{0};
-};
-
-struct Key {
-  int64_t x{0}, y{0}, z{0};
-  bool operator==(const Key & other) const {
-    return x == other.x && y == other.y && z == other.z;
-  }
-};
-
-struct KeyHash {
-  // 体素哈希键的组合哈希，用于点云下采样和简易空间索引。
-  size_t operator()(const Key & k) const {
-    const auto h1 = std::hash<int64_t>{}(k.x * 73856093);
-    const auto h2 = std::hash<int64_t>{}(k.y * 19349663);
-    const auto h3 = std::hash<int64_t>{}(k.z * 83492791);
-    return h1 ^ (h2 << 1) ^ (h3 << 2);
-  }
-};
-
-// 将三维点映射到体素格编号；所有点云降采样和空间桶都复用这个规则。
-Key voxelKey(const Point & p, double voxel)
-{
-  return Key{
-    static_cast<int64_t>(std::floor(p.x() / voxel)),
-    static_cast<int64_t>(std::floor(p.y() / voxel)),
-    static_cast<int64_t>(std::floor(p.z() / voxel))};
-}
-
-// 体素下采样：每个体素保留第一个点，减少 ICP 和回调里的点数压力。
-Cloud voxelDown(const Cloud & src, double voxel)
-{
-  if (src.empty() || voxel <= 0.0) {
-    return src;
-  }
-  std::unordered_map<Key, size_t, KeyHash> seen;
-  seen.reserve(src.size());
-  Cloud out;
-  out.reserve(src.size() / 4 + 1);
-  for (const auto & p : src) {
-    const auto k = voxelKey(p, voxel);
-    if (seen.emplace(k, out.size()).second) {
-      out.push_back(p);
-    }
-  }
-  return out;
-}
-
-// ToolVectorActual 的 RPY 约定：XYZ intrinsic，单位从度转弧度。
-Eigen::Matrix3d rotXyzDeg(double rx, double ry, double rz)
-{
-  const double x = rx * M_PI / 180.0;
-  const double y = ry * M_PI / 180.0;
-  const double z = rz * M_PI / 180.0;
-  return (Eigen::AngleAxisd(x, Point::UnitX()) *
-          Eigen::AngleAxisd(y, Point::UnitY()) *
-          Eigen::AngleAxisd(z, Point::UnitZ())).toRotationMatrix();
-}
-
-// 将旋转矩阵转回 ServoP 需要的 XYZ RPY 角，单位为度。
-Eigen::Vector3d matrixToXyzDeg(const Mat3 & R)
-{
-  const double sy = std::clamp(R(0, 2), -1.0, 1.0);
-  const double y = std::asin(sy);
-  double x = 0.0;
-  double z = 0.0;
-  if (std::abs(std::cos(y)) > 1e-6) {
-    x = std::atan2(-R(1, 2), R(2, 2));
-    z = std::atan2(-R(0, 1), R(0, 0));
-  } else {
-    x = std::atan2(R(2, 1), R(1, 1));
-    z = 0.0;
-  }
-  return {x * 180.0 / M_PI, y * 180.0 / M_PI, z * 180.0 / M_PI};
-}
-
-// ToolVectorActual 直接变成 4x4 齐次矩阵；平移单位保持毫米。
-Mat4 poseToMatrixMm(const ToolPose & p)
-{
-  Mat4 T = Mat4::Identity();
-  T.block<3, 3>(0, 0) = rotXyzDeg(p.rx, p.ry, p.rz);
-  T.block<3, 1>(0, 3) = Point(p.x, p.y, p.z);
-  return T;
-}
-
-// 从 handeye_chessboard_result.json 里读取 X_camera_in_tool 的 4x4 矩阵。
-// 这里用轻量正则避免引入额外 JSON 依赖，文件格式由本项目脚本固定生成。
-bool loadHandeye(const std::string & path, Mat4 & X)
-{
-  std::ifstream in(path);
-  if (!in) {
-    return false;
-  }
-  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  const auto pos = text.find("\"matrix\"");
-  if (pos == std::string::npos) {
-    return false;
-  }
-  const std::string tail = text.substr(pos);
-  const std::regex number_re(R"([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)");
-  std::sregex_iterator it(tail.begin(), tail.end(), number_re);
-  std::sregex_iterator end;
-  std::vector<double> values;
-  for (; it != end && values.size() < 16; ++it) {
-    values.push_back(std::stod(it->str()));
-  }
-  if (values.size() != 16) {
-    return false;
-  }
-  X = Mat4::Identity();
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      X(r, c) = values[r * 4 + c];
-    }
-  }
-  return true;
-}
-
-struct SpatialIndex {
-  Cloud pts;
-  double cell{0.05};
-  std::unordered_map<Key, std::vector<int>, KeyHash> buckets;
-
-  SpatialIndex() = default;
-  SpatialIndex(const Cloud & points, double cell_size) { build(points, cell_size); }
-
-  // 建立哈希桶空间索引；ICP 查询时只查邻近桶，避免全量最近邻搜索。
-  void build(const Cloud & points, double cell_size)
-  {
-    pts = points;
-    cell = cell_size;
-    buckets.clear();
-    buckets.reserve(pts.size());
-    for (int i = 0; i < static_cast<int>(pts.size()); ++i) {
-      buckets[voxelKey(pts[i], cell)].push_back(i);
-    }
-  }
-
-  // 在 max_dist 半径内找最近模板点；找不到就不参与本层 ICP。
-  bool nearest(const Point & q, double max_dist, Point & out, double & best_dist) const
-  {
-    const auto center = voxelKey(q, cell);
-    const int radius = std::max(1, static_cast<int>(std::ceil(max_dist / cell)));
-    double best2 = max_dist * max_dist;
-    bool found = false;
-    for (int dx = -radius; dx <= radius; ++dx) {
-      for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dz = -radius; dz <= radius; ++dz) {
-          const Key k{center.x + dx, center.y + dy, center.z + dz};
-          const auto hit = buckets.find(k);
-          if (hit == buckets.end()) {
-            continue;
-          }
-          for (const int idx : hit->second) {
-            const double d2 = (pts[idx] - q).squaredNorm();
-            if (d2 < best2) {
-              best2 = d2;
-              out = pts[idx];
-              found = true;
-            }
-          }
-        }
-      }
-    }
-    best_dist = std::sqrt(best2);
-    return found;
-  }
-};
-
-struct PyramidLevel {
-  double voxel{0.01};
-  double dmax{0.05};
-  Cloud ref;
-  SpatialIndex index;
-};
-
-// 对已经匹配好的点对做刚体配准，输出 src -> dst 的 R/t 和 RMSE。
-bool kabschStep(
-  const std::vector<Point> & src, const std::vector<Point> & dst,
-  Mat3 & R, Point & t, double & rmse)
-{
-  if (src.size() < 10 || src.size() != dst.size()) {
-    return false;
-  }
-  Point cs = Point::Zero();
-  Point cd = Point::Zero();
-  for (size_t i = 0; i < src.size(); ++i) {
-    cs += src[i];
-    cd += dst[i];
-  }
-  cs /= static_cast<double>(src.size());
-  cd /= static_cast<double>(dst.size());
-
-  Mat3 H = Mat3::Zero();
-  for (size_t i = 0; i < src.size(); ++i) {
-    H += (src[i] - cs) * (dst[i] - cd).transpose();
-  }
-
-  Eigen::JacobiSVD<Mat3> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-  if (svd.info() != Eigen::Success) {
-    return false;
-  }
-  R = svd.matrixV() * svd.matrixU().transpose();
-  if (R.determinant() < 0.0) {
-    Mat3 V = svd.matrixV();
-    V.col(2) *= -1.0;
-    R = V * svd.matrixU().transpose();
-  }
-  t = cd - R * cs;
-
-  double err2 = 0.0;
-  for (size_t i = 0; i < src.size(); ++i) {
-    err2 += (R * src[i] + t - dst[i]).squaredNorm();
-  }
-  rmse = std::sqrt(err2 / static_cast<double>(src.size()));
-  return true;
-}
-
-}  // namespace
+using namespace continuous_icp_servo;
 
 class ContinuousIcpServoNode : public rclcpp::Node
 {
@@ -297,6 +56,7 @@ public:
   {
     pointcloud_topic_ = declare_parameter<std::string>("pointcloud_topic", "/camera/camera/depth/color/points");
     tool_topic_ = declare_parameter<std::string>("tool_topic", "/dobot_msgs_v4/msg/ToolVectorActual");
+    joint_topic_ = declare_parameter<std::string>("joint_topic", "/joint_states_robot");
     command_topic_ = declare_parameter<std::string>("command_topic", "/continuous_icp_servo/command");
     handeye_path_ = declare_parameter<std::string>(
       "handeye_path", "/home/ylx/Robot_Arm_Project/scripts/handeye_chessboard_result.json");
@@ -318,11 +78,14 @@ public:
 
     pc_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     tool_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    joint_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     command_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     rclcpp::SubscriptionOptions pc_options;
     pc_options.callback_group = pc_group_;
     rclcpp::SubscriptionOptions tool_options;
     tool_options.callback_group = tool_group_;
+    rclcpp::SubscriptionOptions joint_options;
+    joint_options.callback_group = joint_group_;
     rclcpp::SubscriptionOptions command_options;
     command_options.callback_group = command_group_;
 
@@ -331,14 +94,14 @@ public:
       std::bind(&ContinuousIcpServoNode::onPointCloud, this, std::placeholders::_1), pc_options);
     tool_sub_ = create_subscription<dobot_msgs_v4::msg::ToolVectorActual>(
       tool_topic_, 10, std::bind(&ContinuousIcpServoNode::onTool, this, std::placeholders::_1), tool_options);
+    joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+      joint_topic_, 10, std::bind(&ContinuousIcpServoNode::onJointState, this, std::placeholders::_1), joint_options);
     command_sub_ = create_subscription<std_msgs::msg::String>(
       command_topic_, 10, [this](const std_msgs::msg::String::SharedPtr msg) {
         handleCommand(msg->data);
       }, command_options);
 
     service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
-    get_angle_ = create_client<dobot_msgs_v4::srv::GetAngle>(
-      "/dobot_bringup_ros2/srv/GetAngle", rmw_qos_profile_services_default, service_group_);
     mov_j_ = create_client<dobot_msgs_v4::srv::MovJ>(
       "/dobot_bringup_ros2/srv/MovJ", rmw_qos_profile_services_default, service_group_);
     servo_p_ = create_client<dobot_msgs_v4::srv::ServoP>(
@@ -416,6 +179,42 @@ private:
       RCLCPP_INFO(
         get_logger(), "收到 ToolVectorActual xyz=[%.1f %.1f %.1f] rpy=[%.1f %.1f %.1f]",
         msg->x, msg->y, msg->z, msg->rx, msg->ry, msg->rz);
+    }
+  }
+
+  // JointState 回调：持续维护最新关节角缓存；驱动发布弧度，MovJ 服务使用角度。
+  void onJointState(const sensor_msgs::msg::JointState::SharedPtr msg)
+  {
+    if (msg->position.size() < 6) {
+      return;
+    }
+    JointPose next;
+    double abs_sum = 0.0;
+    for (size_t i = 0; i < 6; ++i) {
+      if (!std::isfinite(msg->position[i])) {
+        return;
+      }
+      next.q_deg[i] = msg->position[i] * 180.0 / M_PI;
+      abs_sum += std::abs(msg->position[i]);
+    }
+    if (abs_sum < 1e-6) {
+      const int dropped = ++joint_drop_count_;
+      if (dropped == 1 || dropped % 50 == 0) {
+        RCLCPP_WARN(get_logger(), "丢弃疑似未连接的全零 JointState");
+      }
+      return;
+    }
+    next.stamp = now();
+    next.valid = true;
+    {
+      std::lock_guard<std::mutex> lk(joint_mtx_);
+      latest_joint_ = next;
+    }
+    const int count = ++joint_msg_count_;
+    if (count == 1) {
+      RCLCPP_INFO(
+        get_logger(), "收到 JointState deg=[%.1f %.1f %.1f %.1f %.1f %.1f]",
+        next.q_deg[0], next.q_deg[1], next.q_deg[2], next.q_deg[3], next.q_deg[4], next.q_deg[5]);
     }
   }
 
@@ -802,7 +601,6 @@ private:
       waitClient(clear_error_, "ClearError");
       waitClient(disable_robot_, "DisableRobot");
       waitClient(enable_robot_, "EnableRobot");
-      waitClient(get_angle_, "GetAngle");
       waitClient(mov_j_, "MovJ");
       waitClient(speed_factor_, "SpeedFactor");
       waitClient(collision_, "SetCollisionLevel");
@@ -898,26 +696,6 @@ private:
     joint_move_since_ms_.store(0);
   }
 
-  // 解析 GetAngle 返回的 "{j1,j2,j3,j4,j5,j6}" 字符串。
-  bool parseJoints(const std::string & text, std::array<double, 6> & joints)
-  {
-    const std::regex number_re(R"([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)");
-    std::sregex_iterator it(text.begin(), text.end(), number_re);
-    std::sregex_iterator end;
-    std::vector<double> values;
-    for (; it != end && values.size() < 6; ++it) {
-      values.push_back(std::stod(it->str()));
-    }
-    if (values.size() != 6) {
-      RCLCPP_WARN(get_logger(), "GetAngle 解析失败: %s", text.c_str());
-      return false;
-    }
-    for (size_t i = 0; i < 6; ++i) {
-      joints[i] = values[i];
-    }
-    return true;
-  }
-
   // CR5 关键关节限位预检查；控制器仍是最终保护，这里用于提前给出清晰现场日志。
   bool checkJointLimits(const std::array<double, 6> & joints, std::string & reason)
   {
@@ -954,75 +732,65 @@ private:
       RCLCPP_WARN(get_logger(), "%s：MovJ 服务未就绪，不能偏移", label.c_str());
       return;
     }
-    if (!get_angle_->service_is_ready()) {
-      RCLCPP_WARN(get_logger(), "%s：GetAngle 服务未就绪，不能偏移", label.c_str());
-      return;
-    }
     if (jointBusyOrRecover(label)) {
       RCLCPP_WARN(get_logger(), "%s：上一条关节偏移还在处理中，本次跳过", label.c_str());
       return;
     }
 
+    JointPose joint;
+    {
+      std::lock_guard<std::mutex> lk(joint_mtx_);
+      joint = latest_joint_;
+    }
+    const double joint_age_s = joint.stamp.nanoseconds() > 0 ? (now() - joint.stamp).seconds() : 999.0;
+    if (!joint.valid || joint_age_s > 0.5) {
+      RCLCPP_WARN(
+        get_logger(), "%s：JointState %s age=%.2fs，不能偏移；请确认 /joint_states_robot 正在发布",
+        label.c_str(), joint.valid ? "过期" : "无效", joint_age_s);
+      return;
+    }
+
     joint_move_inflight_.store(true);
     joint_move_since_ms_.store(steadyMs());
-    auto req = std::make_shared<dobot_msgs_v4::srv::GetAngle::Request>();
-    RCLCPP_INFO(get_logger(), "%s：已发送 GetAngle，等待当前关节角回调", label.c_str());
-    get_angle_->async_send_request(
-      req,
-      [this, d, label](rclcpp::Client<dobot_msgs_v4::srv::GetAngle>::SharedFuture future) {
-        const auto res = future.get();
-        RCLCPP_INFO(this->get_logger(), "%s：GetAngle 回调 res=%d", label.c_str(), res->res);
-        if (res->res != 0) {
-          RCLCPP_WARN(this->get_logger(), "%s：GetAngle 返回异常 res=%d", label.c_str(), res->res);
-          joint_move_inflight_.store(false);
-          joint_move_since_ms_.store(0);
-          return;
-        }
 
-        std::array<double, 6> joints{};
-        if (!parseJoints(res->robot_return, joints)) {
-          joint_move_inflight_.store(false);
-          joint_move_since_ms_.store(0);
-          return;
-        }
-        joints[0] += d.j1;
-        joints[1] += d.j2;
-        joints[2] += d.j3;
-        joints[3] += d.j4;
-        joints[4] += d.j5;
-        joints[5] += d.j6;
-        std::string limit_reason;
-        if (!checkJointLimits(joints, limit_reason)) {
-          RCLCPP_WARN(this->get_logger(), "%s：目标关节超限，取消偏移：%s", label.c_str(), limit_reason.c_str());
-          joint_move_inflight_.store(false);
-          joint_move_since_ms_.store(0);
-          return;
-        }
+    std::array<double, 6> joints = joint.q_deg;
+    joints[0] += d.j1;
+    joints[1] += d.j2;
+    joints[2] += d.j3;
+    joints[3] += d.j4;
+    joints[4] += d.j5;
+    joints[5] += d.j6;
+    std::string limit_reason;
+    if (!checkJointLimits(joints, limit_reason)) {
+      RCLCPP_WARN(get_logger(), "%s：目标关节超限，取消偏移：%s", label.c_str(), limit_reason.c_str());
+      joint_move_inflight_.store(false);
+      joint_move_since_ms_.store(0);
+      return;
+    }
 
-        auto mov = std::make_shared<dobot_msgs_v4::srv::MovJ::Request>();
-        mov->mode = true;
-        mov->a = joints[0];
-        mov->b = joints[1];
-        mov->c = joints[2];
-        mov->d = joints[3];
-        mov->e = joints[4];
-        mov->f = joints[5];
-        mov->param_value = {"user=0", "tool=0"};
+    auto mov = std::make_shared<dobot_msgs_v4::srv::MovJ::Request>();
+    mov->mode = true;
+    mov->a = joints[0];
+    mov->b = joints[1];
+    mov->c = joints[2];
+    mov->d = joints[3];
+    mov->e = joints[4];
+    mov->f = joints[5];
+    mov->param_value = {"user=0", "tool=0"};
 
-        RCLCPP_WARN(
-          this->get_logger(), "%s：只执行 JointMovJ 偏移，不开启 ICP 伺服。ΔJ=[%.1f %.1f %.1f %.1f %.1f %.1f]deg",
-          label.c_str(), d.j1, d.j2, d.j3, d.j4, d.j5, d.j6);
-        RCLCPP_INFO(
-          this->get_logger(), "%s：已发送 JointMovJ 目标 J=[%.2f %.2f %.2f %.2f %.2f %.2f]deg",
-          label.c_str(), joints[0], joints[1], joints[2], joints[3], joints[4], joints[5]);
-        mov_j_->async_send_request(
-          mov,
-          [this, label](rclcpp::Client<dobot_msgs_v4::srv::MovJ>::SharedFuture mov_future) {
-            const auto mov_res = mov_future.get();
-            RCLCPP_INFO(this->get_logger(), "%s：JointMovJ 返回 res=%d", label.c_str(), mov_res->res);
-            joint_move_inflight_.store(false);
-            joint_move_since_ms_.store(0);
-          });
+    RCLCPP_WARN(
+      get_logger(), "%s：只执行 JointMovJ 偏移，不开启 ICP 伺服。ΔJ=[%.1f %.1f %.1f %.1f %.1f %.1f]deg",
+      label.c_str(), d.j1, d.j2, d.j3, d.j4, d.j5, d.j6);
+    RCLCPP_INFO(
+      get_logger(), "%s：使用缓存 JointState age=%.2fs，已发送 JointMovJ 目标 J=[%.2f %.2f %.2f %.2f %.2f %.2f]deg",
+      label.c_str(), joint_age_s, joints[0], joints[1], joints[2], joints[3], joints[4], joints[5]);
+    mov_j_->async_send_request(
+      mov,
+      [this, label](rclcpp::Client<dobot_msgs_v4::srv::MovJ>::SharedFuture mov_future) {
+        const auto mov_res = mov_future.get();
+        RCLCPP_INFO(this->get_logger(), "%s：JointMovJ 返回 res=%d", label.c_str(), mov_res->res);
+        joint_move_inflight_.store(false);
+        joint_move_since_ms_.store(0);
       });
   }
 
@@ -1197,6 +965,7 @@ private:
 
   std::string pointcloud_topic_;
   std::string tool_topic_;
+  std::string joint_topic_;
   std::string command_topic_;
   std::string handeye_path_;
   double icp_hz_{6.0};
@@ -1215,12 +984,13 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_sub_;
   rclcpp::Subscription<dobot_msgs_v4::msg::ToolVectorActual>::SharedPtr tool_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;
   rclcpp::CallbackGroup::SharedPtr pc_group_;
   rclcpp::CallbackGroup::SharedPtr tool_group_;
+  rclcpp::CallbackGroup::SharedPtr joint_group_;
   rclcpp::CallbackGroup::SharedPtr command_group_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
-  rclcpp::Client<dobot_msgs_v4::srv::GetAngle>::SharedPtr get_angle_;
   rclcpp::Client<dobot_msgs_v4::srv::MovJ>::SharedPtr mov_j_;
   rclcpp::Client<dobot_msgs_v4::srv::ServoP>::SharedPtr servo_p_;
   rclcpp::Client<dobot_msgs_v4::srv::Stop>::SharedPtr stop_;
@@ -1237,6 +1007,9 @@ private:
 
   std::mutex tool_mtx_;
   ToolPose latest_tool_;
+
+  std::mutex joint_mtx_;
+  JointPose latest_joint_;
 
   std::mutex template_mtx_;
   std::vector<PyramidLevel> ref_pyramid_;
@@ -1257,6 +1030,8 @@ private:
   std::atomic<int64_t> joint_move_since_ms_{0};
   std::atomic<int> tool_msg_count_{0};
   std::atomic<int> tool_drop_count_{0};
+  std::atomic<int> joint_msg_count_{0};
+  std::atomic<int> joint_drop_count_{0};
   std::atomic<int> bad_icp_cycles_{0};
   std::atomic<int> missed_servo_cycles_{0};
 

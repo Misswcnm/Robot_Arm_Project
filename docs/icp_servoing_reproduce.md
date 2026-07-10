@@ -237,16 +237,16 @@ ICP 匹配点不足：
 - 若仍失败，检查 CR5 控制柜状态、急停、碰撞状态和网络连接
 - 节点数据不正常需重启驱动(例如:-40001,ToolVectorActual中xyz全0)
 
-## 11. 下一步：夹爪 TCP 标定
+## 11. 夹爪 TCP 标定（已完成）
 
-后续会在末端安装夹爪。安装后，当前 `tool=0` 的默认 TCP 不再等于实际夹爪工作点，需要重新标定夹爪 TCP，再继续做抓取或视觉伺服。
+夹爪安装后，`tool=0` 的默认 TCP 不再等于实际夹爪工作点。本项目已使用固定尖点 pivot calibration 完成夹爪 TCP 标定。
 
-目标：
+标定目标：
 - 得到 `T_flange_tcp_gripper`，即法兰/默认工具坐标系到夹爪实际工作点的位姿
 - 将新的 TCP 写入机器人控制器或在代码中作为工具偏置使用
 - 验证夹爪尖端在多姿态下指向同一个空间点，误差控制在毫米级
 
-建议方案：固定尖点法。
+实际采用固定尖点法。
 
 ```text
 固定一个尖点或小球作为空间参考
@@ -275,12 +275,109 @@ p_base_fixed = R_base_tool_i * p_tool_tcp + t_base_tool_i
 多帧联立最小二乘，求 p_tool_tcp 和 p_base_fixed
 ```
 
+本次标定结果：
+
+| 项目 | 结果 |
+| --- | --- |
+| 样本数 | 10 |
+| `tcp_offset_tool_mm` | `[-18.971, 38.867, 56.246] mm` |
+| 固定点基座坐标 | `[-301.055, 376.630, 269.670] mm` |
+| 平均残差 | `0.712 mm` |
+| 最大残差 | `0.905 mm` |
+| 残差标准差 | `0.134 mm` |
+
+平均残差小于 1 mm，最大残差小于 1 mm，本次标定通过。
+
 验收标准：
 - 用求出的 TCP 回算固定尖点坐标，各帧 RMS 小于 `2-3 mm`
 - 在机器人控制器中启用新 TCP 后，绕 TCP 改变姿态时夹爪尖端应基本不漂移
 - 若误差偏大，重新检查夹爪安装刚性、接触点一致性和 ToolVectorActual 稳定性
 
-计划新增脚本：
-- `scripts/calibrate_gripper_tcp.py`：采集多姿态数据并求解 TCP
-- `scripts/verify_gripper_tcp.py`：读取标定结果，输出固定点 RMS
-- `scripts/gripper_tcp.json`：保存夹爪 TCP 平移和可选姿态偏置
+已实现文件：
+- `scripts/tcp_calibration/tcp_pivot_calibrator.py`：拖拽采集、解算并保存 TCP。
+- `scripts/tcp_calibration/tcp_analyze_json.py`：复算残差、逐样本诊断和剔除样本分析。
+- `scripts/tcp_calibration/tcp_calibration_20260706_150548.json`：本次 10 组样本及最终结果。
+- `scripts/tcp_calibration/README.md`：操作步骤、数学模型和安全说明。
+
+复算命令：
+
+```bash
+python3 scripts/tcp_calibration/tcp_analyze_json.py \
+  scripts/tcp_calibration/tcp_calibration_20260706_150548.json
+```
+
+## 12. 当前开发进度（2026-07-09）
+
+### 12.1 ICP 与收敛控制
+
+- 闭环最大执行次数由 15 次调整为 30 次。
+- ICP 使用 20/10/5 mm 三层 point-to-point 金字塔；剩余校准量进入精修区间后，增加 L3 point-to-plane。
+- 每层及整次 ICP 均输出耗时、RMSE、inliers 和 overlap。
+- 最终收敛只使用 ICP 残差判断。`T_cur-T_ref` 误差仅打印监控，不参与控制判定。
+- 精修采用分段增益和限幅：中段约 70%/4 mm，末段约 50%/2 mm；小于最终阈值后连续确认。
+- 模板 5 帧融合后先生成一次 5 mm 基础点云，再由该结果构建金字塔，避免 L2 重复处理原始大点云。
+
+### 12.2 标定采集
+
+- 手眼标定已改为拖拽机械臂后按键采集位姿和图像，再按键统一计算。
+- 每次标定结果保存到独立运行目录，不覆盖历史标定文件。
+- `GetPose()` 使用无可选参数格式，避免部分旧固件对 `user=0,tool=0` 返回 `-40001`。
+
+### 12.3 CR5 MovJ 兼容结论
+
+当前 CR5 固件使用旧版位置参数格式：
+
+```text
+MovJ(x,y,z,rx,ry,rz)
+```
+
+现场 TCP 测试结果：
+
+| 指令格式 | 结果 |
+| --- | --- |
+| `MovJ(x,y,z,rx,ry,rz)` | `ErrorID=0` |
+| `MovJ(x,y,z,rx,ry,rz,0,0,20,20,0)` | `ErrorID=0` |
+| `MovJ(pose={...})` | `-30001` |
+| 六个位置参数后追加命名 `a/v/cp` | `-1` |
+
+ICP 补偿目前直接发送笛卡尔 `MovJ`，已删除 Jacobian 伪逆和关节运动兜底。`ErrorID=0` 只表示队列接收，不能代表轨迹已经执行完成。
+
+到位判定已修改为：
+
+```text
+发送 MovJ
+  -> 轮询 ToolVectorActual，确认 TCP 已启动
+  -> 连续 3 帧满足目标残差 <= 1.0 mm / 0.15 deg
+  -> 判定到位
+```
+
+运动等待期间每 150 ms 查询 `RobotMode()`。若进入 `9 (ERROR)` 或 `11 (COLLISION)`，立即查询并打印 `GetErrorID()`，且不自动清错，以保留故障现场。
+
+当前待查问题：大位移 ICP 目标虽然收到 `MovJ ErrorID=0`，控制器仍可能在后续规划或逆解阶段进入 Error。下一轮现场日志需要依据 `RobotMode + GetErrorID` 区分目标不可达、关节限位、奇异位姿或碰撞，不能仅根据入队返回值判断。
+
+### 12.4 持续伺服 C++ 模块化
+
+`continuous_icp_servo` 已从单文件拆分为多个职责模块：
+
+- `types`：公共点云、矩阵、位姿和 ICP 结果类型。
+- `geometry`：欧拉角、位姿矩阵和几何变换。
+- `point_cloud_utils`：体素降采样与点云工具。
+- `spatial_index`：空间索引和金字塔层。
+- `icp_solver`：Kabsch/ICP 求解。
+- `handeye_loader`：手眼标定矩阵加载。
+- `continuous_icp_servo_node`：保留 ROS2 编排、状态机和机械臂控制入口。
+
+模块化版本已通过：
+
+```text
+colcon build --packages-select continuous_icp_servo
+Summary: 1 package finished
+```
+
+### 12.5 夹爪 TCP 标定
+
+- 固定尖点 pivot calibration 已完成。
+- 10 组样本全部参与解算。
+- TCP 工具坐标偏移为 `[-18.971, 38.867, 56.246] mm`。
+- 平均/最大残差为 `0.712/0.905 mm`，标定通过。
+- 原始样本、结果和离群点诊断工具均保存在 `scripts/tcp_calibration`。

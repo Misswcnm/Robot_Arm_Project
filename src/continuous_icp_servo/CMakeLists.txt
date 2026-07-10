@@ -16,10 +16,17 @@ find_package(Eigen3 REQUIRED)
 
 add_executable(continuous_icp_servo_node
   src/continuous_icp_servo_node.cpp
+  src/geometry.cpp
+  src/handeye_loader.cpp
+  src/icp_solver.cpp
+  src/point_cloud_utils.cpp
+  src/spatial_index.cpp
+  src/types.cpp
 )
 
 target_compile_features(continuous_icp_servo_node PUBLIC cxx_std_17)
 target_include_directories(continuous_icp_servo_node PRIVATE
+  include
   ${EIGEN3_INCLUDE_DIRS}
 )
 

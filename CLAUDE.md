@@ -105,6 +105,30 @@ G_i @ X @ C_i = G_j @ X @ C_j  (棋盘格不变)
 
 7. ICP 需要 T_init 的平移单位转换: 手眼链路(mm) ÷1000 → ICP内部(m); ICP输出(m) ×1000 → 补偿链路(mm)
 
+8. RobotMode 解析必须保留在 `get_mode()` 内并做回归测试:
+   `robot_return="{5}" → 5`。拖拽状态链为
+   `mode 5 → StartDrag → mode 6 → StopDrag → EnableRobot → mode 5`；
+   仅 mode 5 可发送 MovJ，禁止用高频 RobotMode 轮询替代服务结果检查。
+
+9. 枢轴 TCP 标定只提供针尖平移 `tcp_offset_tool_mm`，不提供针尖姿态。
+   AprilTag 戳点时保持拖拽选定的当前工具姿态；Tag 仅决定接触点位置。
+   预戳/退刀沿标定的“工具原点→针尖”轴线，禁止固定沿基座 Z 运动。
+
+10. AprilTag 一次定位不能强制在短时间内攒满固定帧数。只校验最新帧时效，
+    再对时间窗内已有的至多 N 帧做融合；检测帧率低时也必须允许单帧定位。
+
+11. AprilTag 位姿估计必须喂去畸变后的 `image_rect`，不能直接 remap 到
+    D455 `color/image_raw`。当前 apriltag_ros PnP 使用 `CameraInfo.P` 且
+    distortion 为空，raw 图会产生随画面位置变化的厘米级偏差。
+
+12. 多份手眼文件不能只按“最新/ICP正在用”直接替换。相机未移动时，
+    不同手眼矩阵应接近；若差异达到厘米/数十度，必须先做交叉验证或现场
+    已知点验证。`X_camera_in_tool.matrix` 是权威字段；显示用 `rpy_deg`
+    也必须按 CR5 的 `xyz` 约定导出，避免把 `zyx` 显示误当成标定约定。
+
+13. 眼在手上的相机靠近目标后会丢失/遮挡 AprilTag。物体静止时按 `p`
+    只在运动前定位一次并锁定基座系目标；预戳、接触和退刀不得要求二次识别。
+
 ## 安全
 - `SetCollisionLevel(5)` 必须在 init_robot 中调用 (最高灵敏度碰撞检测)
 - 关节限制: J2/J3 ±160°, J5 ±180°

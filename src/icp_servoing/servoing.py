@@ -7,6 +7,7 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   T_correction = inv(T_delta)             (取消误差的方向)
   T_target = T_cur @ T_correction_partial (70%部分补偿)
   → MovJ(x,y,z,rx,ry,rz)                 (控制器笛卡尔点到点)
+    失败/未到位时 → Jacobian IK → JointMovJ 兜底
 """
 import time, rclpy
 import numpy as np
@@ -46,6 +47,7 @@ class VisualServo:
         self.point_to_plane_dmax = 0.010
         self.point_to_plane_iters = 6
         self.point_to_plane_max_points = 80000
+        self._cartesian_movj_disabled = False
 
     # ── Quality gate ──
     @staticmethod
@@ -222,7 +224,7 @@ class VisualServo:
 
         self._T_base_tool_ref = self._get_tool_matrix()
         if self._T_base_tool_ref is None:
-            print('❌ ToolVectorActual 无数据'); return False
+            print('❌ GetPose 无有效位姿'); return False
         self._T_base_camera_ref = self._T_base_tool_ref @ self.X
 
         self._step_count = 0  # reset for new template
@@ -232,7 +234,7 @@ class VisualServo:
         return True
 
     def _get_tool_matrix(self) -> np.ndarray | None:
-        """ToolVectorActual → 4x4 SE3. 跳变>200mm时拒绝, 用上次有效值."""
+        """GetPose → 4x4 SE3. 跳变>200mm时拒绝, 用上次有效值."""
         tool = self.robot.get_tool()
         if tool is None:
             return None
@@ -241,7 +243,7 @@ class VisualServo:
         if self._last_tool is not None:
             d = np.linalg.norm(np.array([x,y,z]) - np.array(self._last_tool[:3]))
             if d > 200:
-                print(f'  ⚠ ToolVectorActual跳变{d:.0f}mm, 用上次值')
+                print(f'  ⚠ GetPose跳变{d:.0f}mm, 用上次值')
                 x, y, z = self._last_tool[:3]
                 tool = self._last_tool
         self._last_tool = tool
@@ -281,7 +283,7 @@ class VisualServo:
 
         T_cur = self._get_tool_matrix()
         if T_cur is None:
-            out['error'] = 'ToolVectorActual失败'
+            out['error'] = 'GetPose失败'
             return out
 
         T_base_cam_cur = T_cur @ self.X
@@ -470,18 +472,81 @@ class VisualServo:
         limit_desc = '不限幅' if step_limit is None else f'限幅{step_limit:.1f}mm'
         print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
               f'{limit_desc}): '
-              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  MovJ(pose)')
-        if self.robot.movj_pose(T_target, label=f'{mode}补偿/MovJ'):
+              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
+        attempted_cartesian_movj = False
+        if self._cartesian_movj_disabled:
+            print('  ↳ 本次闭环已检测到MovJ(pose)触发控制器ERROR, 直接使用Jacobian兜底')
+        else:
+            attempted_cartesian_movj = True
+
+        if attempted_cartesian_movj:
+            movj_status = self.robot.movj_pose_status(
+                T_target, label=f'{mode}补偿/MovJ')
+            if movj_status == 'arrived':
+                after = self.robot.get_tool()
+                if after and pre_move:
+                    dp_real = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
+                    Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
+                    Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
+                    dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
+                    self._total_dp += dp_real; self._total_dr += dr
+                    print(f'  → MovJ {dp_real/10:.1f}cm  {dr:.1f}°')
+                out['ok'] = True; return out
+            if movj_status == 'queued':
+                print('  ↳ MovJ已入队但未确认完成, 等下一轮ICP重新判断')
+                out['ok'] = True; return out
+
+        if attempted_cartesian_movj:
+            print('  ↳ MovJ(pose)发送失败, 回退Jacobian关节补偿')
+        mode_after_movj = self.robot.get_robot_mode()
+        if mode_after_movj in (9, 11):
+            mode_name = 'ERROR' if mode_after_movj == 9 else 'COLLISION'
+            self._cartesian_movj_disabled = True
+            print(f'  ↳ 控制器处于{mode_name}(mode={mode_after_movj}), '
+                  f'本次闭环后续禁用MovJ(pose), 先恢复安全状态再执行Jacobian兜底')
+            if not self.robot.recover():
+                out['ok'] = False; out['error'] = f'{mode_name}后恢复失败'; return out
+
+        j_now = self.robot.get_joints()
+        if not j_now:
+            self.robot.recover()
+            out['ok'] = False; out['error'] = 'GetAngle失败'; return out
+
+        jac_dp = np.asarray(dp, dtype=float)
+        jac_step_limit = 30.0
+        jac_dp_norm = np.linalg.norm(jac_dp)
+        jac_limit_desc = '不限幅'
+        if jac_dp_norm > jac_step_limit:
+            jac_dp *= jac_step_limit / jac_dp_norm
+            jac_limit_desc = f'限幅{jac_step_limit:.1f}mm'
+
+        drot_base = T_cur[:3, :3] @ rotvec_partial
+        cart = np.hstack([jac_dp, drot_base])
+        J = _compute_jacobian(j_now)
+        try:
+            dtheta = np.degrees(np.linalg.pinv(J, rcond=1e-3) @ cart)
+        except Exception:
+            self.robot.recover()
+            out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
+
+        target_j = [j_now[i] + dtheta[i] for i in range(6)]
+        print(f'  Jacobian补偿({jac_limit_desc}): '
+              f'Δp=[{jac_dp[0]:.1f} {jac_dp[1]:.1f} {jac_dp[2]:.1f}]mm '
+              f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
+              f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
+        if self.robot.movj(target_j):
             after = self.robot.get_tool()
             if after and pre_move:
                 dp_real = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
-                Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
-                Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
-                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
+                Ra = Rot.from_euler('xyz', after[3:6], degrees=True).as_matrix()
+                Rb = Rot.from_euler('xyz', pre_move[3:6], degrees=True).as_matrix()
+                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra @ Rb.T).as_rotvec()))
                 self._total_dp += dp_real; self._total_dr += dr
-                print(f'  → MovJ {dp_real/10:.1f}cm  {dr:.1f}°')
+                print(f'  → JointMovJ {dp_real/10:.1f}cm  {dr:.1f}°')
             out['ok'] = True; return out
-        out['ok'] = False; out['error'] = 'MovJ(pose)失败'
+
+        self.robot.recover()
+        out['ok'] = False; out['error'] = 'MovJ(pose)失败且JointMovJ兜底失败(已恢复)'
         print(f'  ❌ {out["error"]}')
         return out
 
@@ -490,6 +555,7 @@ class VisualServo:
         self._step_count = 0
         self._stable_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
+        self._cartesian_movj_disabled = False
         i = 0
         while i < max_iters:
             i += 1
@@ -509,3 +575,57 @@ class VisualServo:
             print(f'  ↻ 本轮失败后重试 (从当前位姿)')
         print(f'\n⚠ 达最大迭代次数({max_iters})  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
         return False
+
+
+# ── Jacobian (MovJ(pose)失败时的小误差JointMovJ兜底) ──
+def _compute_jacobian(jd, eps=0.0005):
+    import math as _m
+
+    def _rx(a):
+        c, s = _m.cos(a), _m.sin(a)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    def _ry(a):
+        c, s = _m.cos(a), _m.sin(a)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+    def _rz(a):
+        c, s = _m.cos(a), _m.sin(a)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    def _rz4(a):
+        c, s = _m.cos(a), _m.sin(a)
+        return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+
+    def _urdf_T(xyz, rpy):
+        x, y, z = xyz
+        r, p, yw = rpy
+        R = _rz(yw) @ _ry(p) @ _rx(r)
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
+        return T
+
+    def _fk(T_acc, j_rad):
+        T = T_acc.copy()
+        T = T @ _urdf_T([0, 0, 0.147], [0, 0, 0]) @ _rz4(j_rad[0])
+        T = T @ _urdf_T([0, 0, 0], [_m.pi / 2, _m.pi / 2, 0]) @ _rz4(j_rad[1])
+        T = T @ _urdf_T([-0.427, -0.000349, 0], [0, 0, 0]) @ _rz4(j_rad[2])
+        T = T @ _urdf_T([-0.357, 0.000349, 0.141], [0, 0, -_m.pi / 2]) @ _rz4(j_rad[3])
+        T = T @ _urdf_T([0, -0.116, 0], [_m.pi / 2, 0, 0]) @ _rz4(j_rad[4])
+        T = T @ _urdf_T([0, 0.105, 0], [-_m.pi / 2, 0, 0]) @ _rz4(j_rad[5])
+        T[:3, 3] *= 1000
+        return T
+
+    jr = np.radians(jd)
+    T0 = _fk(np.eye(4), jr)
+    p0 = T0[:3, 3]
+    J = np.zeros((6, 6))
+    for i in range(6):
+        jp = jr.copy()
+        jp[i] += eps
+        T1 = _fk(np.eye(4), jp)
+        J[0:3, i] = (T1[:3, 3] - p0) / eps
+        dR = T1[:3, :3] @ T0[:3, :3].T
+        J[3:6, i] = Rot.from_matrix(dR).as_rotvec() / eps
+    return J

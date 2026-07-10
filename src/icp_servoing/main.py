@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ICP Visual Servoing — entry point.
-RobotNode(服务+ToolVectorActual) + ServoNode(点云) 分离, 避免点云阻塞服务调用."""
+RobotNode(服务+GetPose) + ServoNode(点云) 分离, 避免点云阻塞服务调用."""
 import sys, os, json, time
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
@@ -42,7 +42,7 @@ def pose_error(T_cur, T_target):
 def apply_relative_move_once(robot, T_target, label):
     tool = robot.get_tool()
     if not tool:
-        print(f'  ❌ {label}: ToolVectorActual失败')
+        print(f'  ❌ {label}: GetPose失败')
         return False, None
     T_cur = tool_to_matrix(tool)
     dp, drot = pose_error(T_cur, T_target)
@@ -84,7 +84,7 @@ class PointCloudNode(Node):
 def main():
     rclpy.init()
 
-    # RobotNode: 只服务+ToolVectorActual, 不订阅点云 → _call不被点云阻塞
+    # RobotNode: 只服务, 不订阅点云 → _call不被点云阻塞
     robot_node = Node('cr5_robot_control')
     # PCNode: 只订阅点云, 轻量回调
     pc_node = PointCloudNode()
@@ -151,7 +151,7 @@ def main():
                 if not robot.start_drag():
                     print('  ❌ 拖拽模式启动失败')
                     continue
-                print('  拖拽中… 1=记录位姿  2=退出拖拽')
+                print('  拖拽中… 1=记录戳点位姿  2=记录点云模板  3=使能')
                 while True:
                     sub = input('  🖐 ').strip()
                     if sub == '1':
@@ -168,9 +168,21 @@ def main():
                             print(f'     Δ(A→B): {d_mm:.0f}mm  {dr_deg:.1f}°')
                         elif j:
                             drag_joints = j
-                            print(f'  ⚠ 无点A(ToolVectorActual), 仅存关节')
-                        print('  继续拖拽… 1=记录位姿  2=退出拖拽')
+                            print(f'  ⚠ 无点A(GetPose), 仅存关节')
+                        print('  继续拖拽… 1=记录戳点位姿  2=记录点云模板  3=使能')
                     elif sub == '2':
+                        if servo.record_template(n_frames=5):
+                            tool = robot.get_tool()
+                            if tool:
+                                T_tool_A = tool_to_matrix(tool)
+                                delta_A2B = None
+                                print(f'  ✅ 点云模板/点A已记录: xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
+                            else:
+                                print('  ⚠ 模板已记录, 但GetPose读取点A失败')
+                        else:
+                            print('  ❌ 点云模板记录失败')
+                        print('  继续拖拽… 1=记录戳点位姿  2=记录点云模板  3=使能')
+                    elif sub == '3':
                         robot.stop_drag()
                         if robot.enable():
                             print('  已退出拖拽, 已使能')
@@ -178,10 +190,10 @@ def main():
                             print('  ⚠ 已退出拖拽, 但使能失败')
                         break
                     else:
-                        print('  1=记录位姿  2=退出拖拽')
+                        print('  1=记录戳点位姿  2=记录点云模板  3=使能')
             elif c == 'g':
                 if delta_A2B is None:
-                    print('⚠ 未记录点B (先r录模板, 拖拽后按2)')
+                    print('⚠ 未记录戳点位姿 (拖拽中先按2录模板/点A, 再按1录戳点)')
                 else:
                     print('▶ ICP回归模板...')
                     if not servo.align(max_iters=30):

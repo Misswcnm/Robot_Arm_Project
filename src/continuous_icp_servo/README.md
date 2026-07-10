@@ -71,4 +71,5 @@ ros2 topic pub --once /continuous_icp_servo/command std_msgs/msg/String "{data: 
 - 同一帧 ICP 结果只发一次 ServoP，避免低频 ICP 被高频 ServoP 重复积分导致漂移
 - 上一个 `ServoP` 服务调用未返回时跳过当前周期，避免请求堆积
 - `1-6` 偏移键使用 `JointMovJ`，不使用 `ServoP`，避免 ServoP 在当前 CR5 上触发 ERROR
-- 初始化和 `GetAngle -> JointMovJ` 使用 ROS2 response 回调链，不用 `future.wait_for()` 阻塞等待
+- `1-6` 偏移键读取缓存的 `/joint_states_robot`，不在现场控制路径里临时调用 `GetAngle`
+- 点云、ToolVectorActual、JointState、命令和 service 分离 callback group，并使用 `MultiThreadedExecutor`

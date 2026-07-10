@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-手眼标定 — 棋盘格法 (ToolVectorActual + 质量过滤)
+手眼标定 — 棋盘格法 (GetPose + 质量过滤)
 ==================================================
-- 全部使用 ToolVectorActual 真实 TCP 位姿 (不依赖 FK)
+- 全部使用 GetPose() 读取真实 TCP 位姿 (不依赖 FK)
 - 严格棋盘格检测质量检查 (重投影误差/完整性/距离)
 - 标定前数据质量报告
 
@@ -22,9 +22,8 @@ from scipy.spatial.transform import Rotation as Rot
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
-from dobot_msgs_v4.msg import ToolVectorActual
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
-                                MovJ, SpeedFactor, GetAngle, SetCollisionLevel,
+                                MovJ, SpeedFactor, GetAngle, GetPose, SetCollisionLevel,
                                 RobotMode, StartDrag, StopDrag)
 
 
@@ -42,8 +41,6 @@ MAX_BOARD_DIST = 2000   # 棋盘格最远距离 (mm)
 
 TOPIC_IMAGE       = '/camera/camera/color/image_raw'
 TOPIC_INFO        = '/camera/camera/color/camera_info'
-TOPIC_TOOL        = '/dobot_msgs_v4/msg/ToolVectorActual'
-
 OUTPUT_ROOT = os.path.expanduser('~/Robot_Arm_Project/scripts/handeye_calib_runs')
 
 
@@ -51,7 +48,7 @@ OUTPUT_ROOT = os.path.expanduser('~/Robot_Arm_Project/scripts/handeye_calib_runs
 # SE(3)
 # ═══════════════════════════════════════════════
 def pose_to_matrix(xyzrpy):
-    """CR5 ToolVectorActual: rx,ry,rz = XYZ intrinsic Euler"""
+    """CR5 GetPose: rx,ry,rz = XYZ intrinsic Euler"""
     x,y,z,rx,ry,rz=xyzrpy
     R=Rot.from_euler('xyz',[rx,ry,rz],degrees=True).as_matrix()
     T=np.eye(4); T[:3,:3]=R; T[:3,3]=[x,y,z]; return T
@@ -61,8 +58,8 @@ def inv_se3(T):
     return Ti
 
 def matrix_to_pose(T):
-    t=T[:3,3]; r=Rot.from_matrix(T[:3,:3]).as_euler('zyx',degrees=True)
-    return [t[0],t[1],t[2],r[2],r[1],r[0]]
+    t=T[:3,3]; r=Rot.from_matrix(T[:3,:3]).as_euler('xyz',degrees=True)
+    return [t[0],t[1],t[2],r[0],r[1],r[2]]
 
 
 # ═══════════════════════════════════════════════
@@ -151,6 +148,7 @@ class HandEyeCalib(Node):
         self.MovJ         = self.create_client(MovJ,         '/dobot_bringup_ros2/srv/MovJ')
         self.SpeedFactor  = self.create_client(SpeedFactor,  '/dobot_bringup_ros2/srv/SpeedFactor')
         self.GetAngle     = self.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
+        self.GetPose      = self.create_client(GetPose,      '/dobot_bringup_ros2/srv/GetPose')
         self.SetCollision = self.create_client(SetCollisionLevel,'/dobot_bringup_ros2/srv/SetCollisionLevel')
         self.RobotMode    = self.create_client(RobotMode,'/dobot_bringup_ros2/srv/RobotMode')
         self.StartDrag    = self.create_client(StartDrag, '/dobot_bringup_ros2/srv/StartDrag')
@@ -164,11 +162,6 @@ class HandEyeCalib(Node):
         self._img = None; self._K = None; self._D = None
         self._sub_img = self.create_subscription(Image, TOPIC_IMAGE, self._cb_img, 10)
         self._sub_info = self.create_subscription(CameraInfo, TOPIC_INFO, self._cb_info, 10)
-
-        self._tool = None  # [x,y,z,rx,ry,rz] from ToolVectorActual
-        self._sub_tool = self.create_subscription(
-            ToolVectorActual, TOPIC_TOOL,
-            lambda m: setattr(self,'_tool',[m.x,m.y,m.z,m.rx,m.ry,m.rz]), 10)
 
     def _cb_img(self, msg):
         try:
@@ -202,13 +195,16 @@ class HandEyeCalib(Node):
         self.get_logger().info(f'✅ Init done  speed={SPEED}%  collision=Lv.5')
 
     def get_tool_pose(self):
-        """获取 ToolVectorActual 真实 TCP 位姿 [x,y,z,rx,ry,rz] mm,deg"""
-        for _ in range(30):
-            rclpy.spin_once(self,timeout_sec=0.1)
-            if self._tool is not None:
-                x,y,z = self._tool[:3]
-                if abs(x)>0.5 or abs(y)>0.5 or abs(z)>0.5:
-                    return list(self._tool)
+        """获取 GetPose() 真实 TCP 位姿 [x,y,z,rx,ry,rz] mm,deg."""
+        ok, r = self._call(self.GetPose, GetPose.Request(), timeout=3.0)
+        if ok and getattr(r, 'res', -1) == 0:
+            try:
+                vals = [float(v) for v in r.robot_return.strip('{}').split(',')]
+                if len(vals) == 6 and np.linalg.norm(vals[:3]) > 1.0:
+                    return vals
+                print(f'  ⚠ GetPose返回无效位姿: {vals}')
+            except Exception:
+                pass
         return None
 
     def movj(self, joints):
@@ -402,7 +398,7 @@ def compute_and_save(results, out_dir):
     if bw_rms < 10:
         print('  ✅ 内部一致性良好')
     else:
-        print('  ⚠️  内部一致性差 → 可能: 拖拽后未稳定 / 棋盘格移动 / ToolVectorActual不准')
+        print('  ⚠️  内部一致性差 → 可能: 拖拽后未稳定 / 棋盘格移动 / GetPose不准')
 
     raw_frames = []
     for r in results:
@@ -419,7 +415,7 @@ def compute_and_save(results, out_dir):
         })
 
     out = {
-        'method': 'interactive_drag_chessboard+ToolVectorActual+quality_filter',
+        'method': 'interactive_drag_chessboard+GetPose+quality_filter',
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'output_dir': out_dir,
         'chessboard': {'size': [CHESS_COLS, CHESS_ROWS], 'square_mm': SQUARE_MM},
@@ -451,7 +447,7 @@ def print_interactive_help():
     print('\n交互命令:')
     print('  d  进入拖拽模式 StartDrag')
     print('  e  退出拖拽模式 StopDrag 并重新使能')
-    print('  s  采样当前 ToolVectorActual + 当前图像')
+    print('  s  采样当前 GetPose + 当前图像')
     print('  u  删除上一条有效采样')
     print('  c  根据当前采样计算手眼并保存到本次新文件夹')
     print('  h  显示帮助')
@@ -480,9 +476,9 @@ def main():
     node.init_robot()
     tool = node.get_tool_pose()
     if tool is None:
-        print('❌ ToolVectorActual 无数据！确认驱动已启动且连接机械臂WiFi')
+        print('❌ GetPose 无有效位姿！确认驱动已启动且连接机械臂WiFi')
         node.destroy_node(); rclpy.shutdown(); return
-    print(f'📍 ToolVectorActual: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}] '
+    print(f'📍 GetPose: xyz=[{tool[0]:.1f} {tool[1]:.1f} {tool[2]:.1f}] '
           f'rpy=[{tool[3]:.2f} {tool[4]:.2f} {tool[5]:.2f}]')
 
     res = node.capture_and_detect()
@@ -521,7 +517,7 @@ def main():
                 tag = f'{idx:02d}'
                 tool = node.get_tool_pose()
                 if tool is None:
-                    print('  ❌ ToolVectorActual 无数据，未采样')
+                    print('  ❌ GetPose 无有效位姿，未采样')
                     continue
                 T_robot = pose_to_matrix(tool)
                 res = node.capture_and_detect()
