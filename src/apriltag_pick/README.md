@@ -51,7 +51,11 @@ ros2 run apriltag_pick interactive
 ros2 run image_proc rectify_node --ros-args \
   -r image:=/camera/camera/color/image_raw \
   -r camera_info:=/camera/camera/color/camera_info \
-  -r image_rect:=/camera/camera/color/image_rect
+  -r image_rect:=/camera/camera/color/image_rect \
+  -p qos_overrides./camera/camera/color/image_raw.subscription.reliability:=best_effort \
+  -p qos_overrides./camera/camera/color/image_raw.subscription.durability:=volatile \
+  -p qos_overrides./camera/camera/color/camera_info.subscription.reliability:=best_effort \
+  -p qos_overrides./camera/camera/color/camera_info.subscription.durability:=volatile
 
 # 终端 4：只启动 AprilTag 检测
 ros2 run apriltag_ros apriltag_node --ros-args \

@@ -17,6 +17,12 @@ def generate_launch_description():
                 ('camera_info', 'camera_info'),
                 ('image_rect', 'image_rect'),
             ],
+            parameters=[{
+                'qos_overrides./camera/camera/color/image_raw.subscription.reliability': 'best_effort',
+                'qos_overrides./camera/camera/color/image_raw.subscription.durability': 'volatile',
+                'qos_overrides./camera/camera/color/camera_info.subscription.reliability': 'best_effort',
+                'qos_overrides./camera/camera/color/camera_info.subscription.durability': 'volatile',
+            }],
             output='screen',
         ),
         Node(

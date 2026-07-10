@@ -14,6 +14,10 @@ def main():
         '-r', 'image:=image_raw',
         '-r', 'camera_info:=camera_info',
         '-r', 'image_rect:=image_rect',
+        '-p', 'qos_overrides./camera/camera/color/image_raw.subscription.reliability:=best_effort',
+        '-p', 'qos_overrides./camera/camera/color/image_raw.subscription.durability:=volatile',
+        '-p', 'qos_overrides./camera/camera/color/camera_info.subscription.reliability:=best_effort',
+        '-p', 'qos_overrides./camera/camera/color/camera_info.subscription.durability:=volatile',
     ])
     detector = subprocess.Popen([
         'ros2', 'run', 'apriltag_ros', 'apriltag_node', '--ros-args',
