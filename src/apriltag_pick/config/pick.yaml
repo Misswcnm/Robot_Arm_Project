@@ -1,7 +1,7 @@
 apriltag_pick:
   ros__parameters:
     tag_frame: "tag36h11:0"
-    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/handeye_chessboard_result.json"
+    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/handeye_calib_runs/handeye_20260707_174738/handeye_chessboard_result.json"
     tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260706_150548.json"
     robot_speed: 15
 
