@@ -66,7 +66,11 @@ source install/setup.bash
 python3 scripts/tcp_calibration/tcp_pivot_calibrator.py
 ```
 
-4. 输入 `d` 尝试进入拖拽模式。
+脚本会在进入拖拽和每次 `r` 记录前强制调用控制器的 `User(0)` 与
+`Tool(0)`。任一调用失败时不会采样或进入拖拽；保存的 JSON 也会写明
+`coordinate_frames.user_index=0` 和 `tool_index=0`。
+
+4. 输入 `d` 进入拖拽模式（此时会先锁定 User(0)/Tool(0)）。
 5. 拖动机械臂，让夹爪尖端轻触固定尖点。
 6. 保持接触不动，输入 `r` 记录一组姿态。
 7. 换一个姿态继续轻触同一点，再输入 `r`。
@@ -124,12 +128,12 @@ python3 scripts/tcp_calibration/tcp_analyze_json.py scripts/tcp_calibration/tcp_
 python3 scripts/tcp_calibration/tcp_analyze_json.py scripts/tcp_calibration/tcp_calibration_xxx.json --drop 3 7
 ```
 
-## 和机械臂工具坐标的关系
+## 和机械臂法兰坐标的关系
 
-脚本输出的是工具坐标系下 TCP 偏移：
+脚本使用 `GetPose()` 的法兰位姿，输出法兰坐标系下的 TCP 偏移：
 
 ```text
-tcp_offset_tool_mm = [x, y, z]
+tcp_offset_flange_mm = [x, y, z]
 ```
 
 如果 Dobot 工具坐标设置需要：
@@ -141,9 +145,9 @@ X, Y, Z, Rx, Ry, Rz
 则先填：
 
 ```text
-X = tcp_offset_tool_mm.x
-Y = tcp_offset_tool_mm.y
-Z = tcp_offset_tool_mm.z
+X = tcp_offset_flange_mm.x
+Y = tcp_offset_flange_mm.y
+Z = tcp_offset_flange_mm.z
 Rx = 0
 Ry = 0
 Rz = 0

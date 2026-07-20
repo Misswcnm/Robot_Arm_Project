@@ -91,7 +91,7 @@ def main():
 
     X = load_X()
     robot = CR5Robot(robot_node, speed=15)
-    servo = VisualServo(robot, X, compensation_ratio=0.7)
+    servo = VisualServo(robot, X)
     servo._pc_node = pc_node  # 让 servo 能读到点云
 
     print('\n' + '=' * 55)

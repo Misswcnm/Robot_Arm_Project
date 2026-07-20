@@ -42,6 +42,12 @@ cd ~/Robot_Arm_Project
 source install/setup.bash
 bash scripts/run_icp_servo.sh
 ```
+ros2 run  step_motor motor_node 
+
+ros2 topic pub --once /motor_control step_motor/msg/Motor "{id: 1,speed:
+200,dir: 0,mode: 2,angle: 30000,state: 0,sub_divide: 32}"
+
+ros2 run apriltag_pick interactive
 
 程序启动后，命令行交互键位如下：
 

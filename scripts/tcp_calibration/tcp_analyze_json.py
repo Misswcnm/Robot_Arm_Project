@@ -61,7 +61,7 @@ def main() -> None:
 
     tcp, fixed, residuals, _ = solve(samples)
     print(f"samples used: {len(samples)} / {len(samples_all)}  dropped: {args.drop}")
-    print("tcp_offset_tool_mm = [%.3f, %.3f, %.3f]" % tuple(tcp))
+    print("tcp_offset_flange_mm = [%.3f, %.3f, %.3f]" % tuple(tcp))
     print("fixed_point_base_mm = [%.3f, %.3f, %.3f]" % tuple(fixed))
     print(
         "residual mean/max/std = %.3f / %.3f / %.3f mm"

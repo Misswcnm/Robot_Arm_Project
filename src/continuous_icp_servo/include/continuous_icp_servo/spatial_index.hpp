@@ -14,7 +14,10 @@ public:
   SpatialIndex(const Cloud & points, double cell_size);
 
   void build(const Cloud & points, double cell_size);
-  bool nearest(const Point & q, double max_dist, Point & out, double & best_dist) const;
+  bool nearest(
+    const Point & q, double max_dist, Point & out, double & best_dist,
+    int * out_index = nullptr) const;
+  std::vector<int> nearby(const Point & q, double radius) const;
 
 private:
   Cloud pts_;

@@ -24,7 +24,9 @@ void SpatialIndex::build(const Cloud & points, double cell_size)
   }
 }
 
-bool SpatialIndex::nearest(const Point & q, double max_dist, Point & out, double & best_dist) const
+bool SpatialIndex::nearest(
+  const Point & q, double max_dist, Point & out, double & best_dist,
+  int * out_index) const
 {
   const auto center = voxelKey(q, cell_);
   const int radius = std::max(1, static_cast<int>(std::ceil(max_dist / cell_)));
@@ -43,6 +45,9 @@ bool SpatialIndex::nearest(const Point & q, double max_dist, Point & out, double
           if (d2 < best2) {
             best2 = d2;
             out = pts_[idx];
+            if (out_index) {
+              *out_index = idx;
+            }
             found = true;
           }
         }
@@ -51,6 +56,31 @@ bool SpatialIndex::nearest(const Point & q, double max_dist, Point & out, double
   }
   best_dist = std::sqrt(best2);
   return found;
+}
+
+std::vector<int> SpatialIndex::nearby(const Point & q, double radius) const
+{
+  std::vector<int> result;
+  const auto center = voxelKey(q, cell_);
+  const int cell_radius = std::max(1, static_cast<int>(std::ceil(radius / cell_)));
+  const double radius2 = radius * radius;
+  for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
+    for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
+      for (int dz = -cell_radius; dz <= cell_radius; ++dz) {
+        const Key k{center.x + dx, center.y + dy, center.z + dz};
+        const auto hit = buckets_.find(k);
+        if (hit == buckets_.end()) {
+          continue;
+        }
+        for (const int idx : hit->second) {
+          if ((pts_[idx] - q).squaredNorm() <= radius2) {
+            result.push_back(idx);
+          }
+        }
+      }
+    }
+  }
+  return result;
 }
 
 }  // namespace continuous_icp_servo

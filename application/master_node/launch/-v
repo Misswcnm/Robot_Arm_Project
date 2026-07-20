@@ -1,0 +1,5 @@
+<html><title>500: Internal Server Error</title><body>500: Internal Server Error</body></html>--_curl_--"name":"test"
+--_curl_--"taskName":"test"
+--_curl_--"cronString":"0 18 * * *"
+--_curl_--"repeat":1
+--_curl_--"force":1

@@ -16,29 +16,58 @@ def pose_matrix(xyz, quat_xyzw=None, rpy_deg=None):
     return transform
 
 
+def load_handeye_document(path):
+    """Resolve the active-handeye pointer and return (result_path, JSON)."""
+    current = Path(path).expanduser()
+    if not current.is_absolute():
+        current = current.resolve()
+    visited = set()
+    for _ in range(4):
+        current = current.resolve()
+        if current in visited:
+            raise ValueError(f'手眼标定指针循环引用: {current}')
+        visited.add(current)
+        with current.open(encoding='utf-8') as stream:
+            data = json.load(stream)
+        if isinstance(data, str):
+            target = Path(data).expanduser()
+            current = target if target.is_absolute() else current.parent / target
+            continue
+        if not isinstance(data, dict):
+            raise ValueError(f'无效手眼标定入口: {current}')
+        return current, data
+    raise ValueError(f'手眼标定指针层级过深: {path}')
+
+
 def load_handeye(path):
-    path = Path(path).expanduser()
-    with path.open(encoding='utf-8') as stream:
-        data = json.load(stream)
-    transform = np.asarray(data['X_camera_in_tool']['matrix'], dtype=float)
+    path, data = load_handeye_document(path)
+    record = data.get('T_flange_camera', data.get('X_camera_in_tool'))
+    if record is None:
+        raise ValueError(f'缺少 T_flange_camera: {path}')
+    transform = np.asarray(record['matrix'], dtype=float)
     if transform.shape != (4, 4) or not np.isfinite(transform).all():
-        raise ValueError(f'无效手眼矩阵: {path}')
+        raise ValueError(f'无效 T_flange_camera: {path}')
     return transform
 
 
 def load_tcp_offset(path):
-    """Load tool-origin to physical-tip translation in tool coordinates."""
+    """Load flange-origin to physical-tip translation in flange coordinates."""
     path = Path(path).expanduser()
     with path.open(encoding='utf-8') as stream:
         data = json.load(stream)
-    offset = np.asarray(data['result']['tcp_offset_tool_mm'], dtype=float)
+    result = data['result']
+    record = result.get(
+        'tcp_offset_flange_mm', result.get('tcp_offset_tool_mm'))
+    if record is None:
+        raise ValueError(f'缺少 tcp_offset_flange_mm: {path}')
+    offset = np.asarray(record, dtype=float)
     if offset.shape != (3,) or not np.isfinite(offset).all():
         raise ValueError(f'无效TCP标定: {path}')
     return offset
 
 
 def tool_pose_matrix(pose):
-    """CR5 TCP pose: mm + XYZ intrinsic Euler degrees."""
+    """CR5 GetPose in User0, i.e. T_base_flange: mm + XYZ Euler deg."""
     return pose_matrix(pose[:3], rpy_deg=pose[3:6])
 
 

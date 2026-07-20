@@ -6,7 +6,8 @@ from rclpy.node import Node
 from scipy.spatial.transform import Rotation as Rot
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
                                 MovJ, SpeedFactor, GetAngle, GetPose, GetErrorID,
-                                SetCollisionLevel, RobotMode, StartDrag, StopDrag)
+                                SetCollisionLevel, RobotMode, StartDrag, StopDrag,
+                                Tool, User)
 
 
 class CR5Robot:
@@ -28,6 +29,8 @@ class CR5Robot:
         self.GetPose      = node.create_client(GetPose,      '/dobot_bringup_ros2/srv/GetPose')
         self.StartDrag    = node.create_client(StartDrag,    '/dobot_bringup_ros2/srv/StartDrag')
         self.StopDrag     = node.create_client(StopDrag,     '/dobot_bringup_ros2/srv/StopDrag')
+        self.User         = node.create_client(User,         '/dobot_bringup_ros2/srv/User')
+        self.Tool         = node.create_client(Tool,         '/dobot_bringup_ros2/srv/Tool')
 
         for n, c in [('EnableRobot', self.EnableRobot), ('MovJ', self.MovJ)]:
             while not c.wait_for_service(timeout_sec=1.0):
@@ -54,7 +57,24 @@ class CR5Robot:
         self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)  # ~4s
         rclpy.spin_once(self._node, timeout_sec=0.1)  # 让topic到位
         self.apply_motion_safety()
+        if not self.use_base_tool0():
+            raise RuntimeError('User(0)/Tool(0) 坐标系设置失败')
         self._logger.info(f'✅ CR5 ready  speed={self._speed}%  collision=Lv.5')
+
+    def use_base_tool0(self) -> bool:
+        """Select User0/Tool0 so GetPose represents T_base_flange."""
+        user = User.Request(); user.index = 0
+        tool = Tool.Request(); tool.index = 0
+        ok_user, user_response = self._call(self.User, user, timeout=3.0)
+        ok_tool, tool_response = self._call(self.Tool, tool, timeout=3.0)
+        ok = (ok_user and getattr(user_response, 'res', -1) == 0 and
+              ok_tool and getattr(tool_response, 'res', -1) == 0)
+        if not ok:
+            self._logger.error(
+                'User(0)/Tool(0)设置失败: user_res=%s tool_res=%s' % (
+                    getattr(user_response, 'res', None),
+                    getattr(tool_response, 'res', None)))
+        return ok
 
     def apply_motion_safety(self) -> bool:
         """每次EnableRobot后都重新设置速度和碰撞等级，避免恢复默认高速。"""
@@ -88,10 +108,10 @@ class CR5Robot:
         return np.linalg.norm(vals[:3]) > 1.0
 
     def get_tool(self, warn: bool = True) -> list | None:
-        """真实TCP [x,y,z,rx,ry,rz] mm,deg. 统一使用GetPose()."""
+        """T_base_flange [x,y,z,rx,ry,rz] mm,deg (User0/Tool0)."""
         now = time.time()
         if warn and now - self._last_getpose_warn > 2.0:
-            self._logger.info('GetPose()读取当前TCP位姿')
+            self._logger.info('GetPose()读取当前法兰位姿（以当前User原点表达）')
             self._last_getpose_warn = now
         if not self.GetPose.wait_for_service(timeout_sec=1.0):
             return None
@@ -300,7 +320,7 @@ class CR5Robot:
             self._logger.error(f'EnableRobot 返回异常 res={r.res}')
             return False
         rclpy.spin_once(self._node, timeout_sec=0.1)
-        return self.apply_motion_safety()
+        return self.apply_motion_safety() and self.use_base_tool0()
 
     def recover(self) -> bool:
         """错误恢复: ClearError→EnableRobot→SpeedFactor→SetCollisionLevel."""
@@ -312,6 +332,8 @@ class CR5Robot:
             self._logger.error('EnableRobot恢复失败')
             return False
         if not self.apply_motion_safety():
+            return False
+        if not self.use_base_tool0():
             return False
         self._logger.info('✅ 恢复完成')
         return True

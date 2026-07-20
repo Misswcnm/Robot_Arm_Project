@@ -2,6 +2,8 @@
 
 本文目标不是把 SLAM 全部搬到机械臂上，而是借鉴 Cartographer 的几个关键工程模式，解决当前 ICP 伺服最危险的问题：ICP 算完时，机器人状态已经变了，控制命令却还按旧状态下发。
 
+> 当前工程说明（2026-07-20）：`continuous_icp_servo` 已改为“低频 ICP 覆盖基座系绝对目标、高频 ServoP 重复该目标”。笛卡尔反馈只使用 `GetPose()`，不使用 `ToolVectorActual`。由于控制量是绝对目标而不是重复积分的相对误差，当前模式不做状态外推，也不做文中建议的 ICP 小步拆分；本文对应内容仅保留为相对误差伺服方案的理论参考。
+
 ## 1. 从 Cartographer 借鉴什么
 
 ### 1.1 传感器消息先按时间排队
@@ -48,7 +50,7 @@ Servo timer 20~50Hz ────────────────────
 线程划分：
 
 - `MultiThreadedExecutor`：至少 4 个线程。
-- 独立 callback group：点云、`ToolVectorActual`、`JointState`、命令、服务、servo timer。
+- 独立 callback group：点云、`ToolVectorActual`、`JointState`、命令、服务、servo timer。ssh
 - 独立 ICP worker：低优先级后台线程，永远不直接发控制命令。
 - ServoP timer：只做状态读取、目标生成、限幅和异步发送。
 

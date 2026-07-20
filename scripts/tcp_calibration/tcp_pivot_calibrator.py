@@ -22,7 +22,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
-from dobot_msgs_v4.srv import GetPose, StartDrag, StopDrag
+from dobot_msgs_v4.srv import GetPose, StartDrag, StopDrag, Tool, User
 
 
 @dataclass
@@ -106,8 +106,17 @@ class TcpPivotCalibrator(Node):
         self.stop_drag_client = self.create_client(
             StopDrag, self.get_parameter("stop_drag_service").value
         )
+        self.user_client = self.create_client(
+            User, "/dobot_bringup_ros2/srv/User"
+        )
+        self.tool_client = self.create_client(
+            Tool, "/dobot_bringup_ros2/srv/Tool"
+        )
 
         self.get_logger().info(f"使用 GetPose: {self.get_pose_service}")
+        self.get_logger().info(
+            "TCP 标定坐标系固定为 User(0)/Tool(0)；拖拽和每次记录前都会重新锁定"
+        )
         self.print_help()
 
     def call(self, client, request, timeout: float = 3.0):
@@ -137,6 +146,30 @@ class TcpPivotCalibrator(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         return PoseSample(now, *vals)
 
+    def use_base_tool0(self) -> bool:
+        """Select the only coordinate frame permitted for TCP samples."""
+        if not self.user_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().error("User 服务不可用，拒绝 TCP 标定")
+            return False
+        if not self.tool_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().error("Tool 服务不可用，拒绝 TCP 标定")
+            return False
+        user = User.Request()
+        user.index = 0
+        tool = Tool.Request()
+        tool.index = 0
+        user_response = self.call(self.user_client, user, timeout=3.0)
+        tool_response = self.call(self.tool_client, tool, timeout=3.0)
+        ok = (user_response is not None and user_response.res == 0 and
+              tool_response is not None and tool_response.res == 0)
+        if not ok:
+            self.get_logger().error(
+                "User(0)/Tool(0) 设置失败，拒绝记录 TCP 标定姿态"
+            )
+        else:
+            self.get_logger().info("已锁定 TCP 标定坐标系：User(0)/Tool(0)")
+        return ok
+
     def print_help(self) -> None:
         print("")
         print("TCP pivot 标定交互命令：")
@@ -152,6 +185,8 @@ class TcpPivotCalibrator(Node):
         print("")
 
     def stable_pose(self) -> Tuple[Optional[PoseSample], str]:
+        if not self.use_base_tool0():
+            return None, "无法锁定 User(0)/Tool(0)"
         window = []
         for _ in range(self.stable_window):
             sample = self.get_pose_sample()
@@ -203,13 +238,13 @@ class TcpPivotCalibrator(Node):
 
     def solve(self) -> None:
         try:
-            tcp_tool, fixed_base, residuals = solve_pivot(self.samples)
+            tcp_flange, fixed_base, residuals = solve_pivot(self.samples)
         except ValueError as exc:
             self.get_logger().warn(str(exc))
             return
 
         self.last_solution = {
-            "tcp_offset_tool_mm": tcp_tool.tolist(),
+            "tcp_offset_flange_mm": tcp_flange.tolist(),
             "fixed_point_base_mm": fixed_base.tolist(),
             "residual_mean_mm": float(np.mean(residuals)),
             "residual_max_mm": float(np.max(residuals)),
@@ -220,8 +255,8 @@ class TcpPivotCalibrator(Node):
         print("")
         print("TCP 标定结果：")
         print(
-            "  tcp_offset_tool_mm = [%.3f, %.3f, %.3f]"
-            % tuple(self.last_solution["tcp_offset_tool_mm"])
+            "  tcp_offset_flange_mm = [%.3f, %.3f, %.3f]"
+            % tuple(self.last_solution["tcp_offset_flange_mm"])
         )
         print(
             "  fixed_point_base_mm = [%.3f, %.3f, %.3f]"
@@ -249,6 +284,11 @@ class TcpPivotCalibrator(Node):
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "pose_source": "GetPose()",
+            "coordinate_frames": {
+                "user_index": 0,
+                "robot_pose": "T_base_flange_from_GetPose_in_user0",
+                "tcp_offset": "translation_from_flange_origin_to_physical_tip",
+            },
             "method": "pivot_calibration",
             "pose_convention": "xyz mm, rx/ry/rz deg, rotation matrix R = Rz * Ry * Rx",
             "samples": [asdict(s) for s in self.samples],
@@ -274,7 +314,8 @@ class TcpPivotCalibrator(Node):
         if not cmd:
             return True
         if cmd == "d":
-            self.call_empty_service("StartDrag", self.start_drag_client, StartDrag)
+            if self.use_base_tool0():
+                self.call_empty_service("StartDrag", self.start_drag_client, StartDrag)
         elif cmd == "e":
             self.call_empty_service("StopDrag", self.stop_drag_client, StopDrag)
         elif cmd == "r":

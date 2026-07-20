@@ -29,9 +29,11 @@ struct JointPose {
 
 struct IcpResult {
   Mat4 T_icp_mm{Mat4::Identity()};
+  Mat4 T_target_base{Mat4::Identity()};
   double rmse_mm{999.0};
   double overlap{0.0};
   int inliers{0};
+  double compute_ms{0.0};
   uint64_t seq{0};
   bool ok{false};
   rclcpp::Time stamp;

@@ -5,7 +5,7 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   T_cam = pyramid_icp(src, ref, T_init)  (current→template, camera frame)
   T_delta = X @ T_cam @ X⁻¹              (camera→tool frame)
   T_correction = inv(T_delta)             (取消误差的方向)
-  T_target = T_cur @ T_correction_partial (70%部分补偿)
+  T_target = T_cur @ T_correction         (100%全量补偿)
   → MovJ(x,y,z,rx,ry,rz)                 (控制器笛卡尔点到点)
     失败/未到位时 → Jacobian IK → JointMovJ 兜底
 """
@@ -19,11 +19,10 @@ from icp_servoing.pointcloud import voxel_down
 
 class VisualServo:
     def __init__(self, robot: CR5Robot, X: np.ndarray,
-                 speed: int = 15, compensation_ratio: float = 0.7):
+                 speed: int = 15):
         self.robot = robot
         self.X = X
         self.X_inv = np.linalg.inv(X)
-        self.comp_ratio = compensation_ratio
 
         # Template pyramid (pre-built for speed)
         self._ref_pyramid = None
@@ -37,12 +36,6 @@ class VisualServo:
         self.final_icp_rot_thresh_deg = 0.2
         self.final_stable_frames = 2
         self._stable_count = 0
-        self.fine_mode_thresh_mm = 8.0
-        self.mid_fine_thresh_mm = 4.0
-        self.fine_step_limit_mm = 2.0
-        self.fine_comp_ratio = 0.5
-        self.mid_fine_step_limit_mm = 4.0
-        self.mid_fine_comp_ratio = 0.7
         self.point_to_plane_trigger_mm = 10.0
         self.point_to_plane_dmax = 0.010
         self.point_to_plane_iters = 6
@@ -428,50 +421,21 @@ class VisualServo:
             return out
         self._stable_count = 0
 
-        # 5. 补偿: 大残差全量, 8mm内分段精修避免末端过冲
+        # 5. 100% 全量补偿，不做末端比例缩放或单步限幅
         self._step_count += 1
-        if t_norm <= self.mid_fine_thresh_mm:
-            mode = '精修'
-            ratio = self.fine_comp_ratio
-            step_limit = self.fine_step_limit_mm
-        elif t_norm <= self.fine_mode_thresh_mm:
-            mode = '中段精修'
-            ratio = self.mid_fine_comp_ratio
-            step_limit = self.mid_fine_step_limit_mm
-        else:
-            mode = '粗调'
-            ratio = 1.0
-            step_limit = None
+        mode = '全量'
 
         #    T_delta = X @ T_icp_mm @ X⁻¹
         T_delta = self.X @ T_icp_mm @ self.X_inv
         T_correction = np.linalg.inv(T_delta)
 
-        # 提取完整修正量 (平移+旋转)
-        t_full = T_correction[:3, 3]
-        R_full = T_correction[:3, :3]
-
-        # 单步限幅: 粗调不限幅, 中段精修≤4mm, 末段精修≤2mm
-        t_norm_corr = np.linalg.norm(t_full)
-        if step_limit is not None and t_norm_corr > step_limit:
-            t_full *= step_limit / t_norm_corr
-
-        t_partial = t_full * ratio
-        R_partial = Rot.from_matrix(R_full)
-        rotvec_partial = R_partial.as_rotvec() * ratio
-        R_partial = Rot.from_rotvec(rotvec_partial).as_matrix()
-
-        T_corr_p = np.eye(4)
-        T_corr_p[:3,:3] = R_partial
-        T_corr_p[:3,3] = t_partial
-        T_target = T_cur @ T_corr_p
+        rotvec_full = Rot.from_matrix(T_correction[:3, :3]).as_rotvec()
+        T_target = T_cur @ T_correction
         dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
         out['delta_mm'] = [round(v,1) for v in dp]
 
         pre_move = self.robot.get_tool()
-        limit_desc = '不限幅' if step_limit is None else f'限幅{step_limit:.1f}mm'
-        print(f'  {mode}补偿 {ratio*100:.0f}% (step{self._step_count}, '
-              f'{limit_desc}): '
+        print(f'  {mode}补偿 100% (step{self._step_count}, 不限幅): '
               f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
         attempted_cartesian_movj = False
         if self._cartesian_movj_disabled:
@@ -513,14 +477,7 @@ class VisualServo:
             out['ok'] = False; out['error'] = 'GetAngle失败'; return out
 
         jac_dp = np.asarray(dp, dtype=float)
-        jac_step_limit = 30.0
-        jac_dp_norm = np.linalg.norm(jac_dp)
-        jac_limit_desc = '不限幅'
-        if jac_dp_norm > jac_step_limit:
-            jac_dp *= jac_step_limit / jac_dp_norm
-            jac_limit_desc = f'限幅{jac_step_limit:.1f}mm'
-
-        drot_base = T_cur[:3, :3] @ rotvec_partial
+        drot_base = T_cur[:3, :3] @ rotvec_full
         cart = np.hstack([jac_dp, drot_base])
         J = _compute_jacobian(j_now)
         try:
@@ -530,7 +487,7 @@ class VisualServo:
             out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
 
         target_j = [j_now[i] + dtheta[i] for i in range(6)]
-        print(f'  Jacobian补偿({jac_limit_desc}): '
+        print('  Jacobian补偿(100%, 不限幅): '
               f'Δp=[{jac_dp[0]:.1f} {jac_dp[1]:.1f} {jac_dp[2]:.1f}]mm '
               f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
               f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')

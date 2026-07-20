@@ -7,7 +7,7 @@ import rclpy
 from dobot_msgs_v4.srv import (
     ClearError, DisableRobot, EnableRobot, GetErrorID, GetPose, MovJ,
     RobotMode, SetCollisionLevel, SpeedFactor, StartDrag, StopDrag,
-    ToolDOInstant)
+    Tool, ToolDOInstant, User)
 
 from .transforms import matrix_to_tool_pose
 
@@ -45,6 +45,8 @@ class CR5Robot:
         self.tool_do = node.create_client(
             ToolDOInstant, f'{self.PREFIX}/ToolDOInstant')
         self.get_pose_client = node.create_client(GetPose, f'{self.PREFIX}/GetPose')
+        self.user_frame = node.create_client(User, f'{self.PREFIX}/User')
+        self.tool_frame = node.create_client(Tool, f'{self.PREFIX}/Tool')
 
     @staticmethod
     def valid_tool_pose(tool):
@@ -73,10 +75,39 @@ class CR5Robot:
             raise RuntimeError('EnableRobot 失败')
         if not self.apply_motion_safety():
             raise RuntimeError('速度/碰撞等级设置失败')
+        if not self.use_base_tool0():
+            raise RuntimeError('User(0)/Tool(0) 坐标系设置失败')
         if not self.wait_mode(self.MODE_ENABLED, timeout=5.0):
             raise RuntimeError(f'初始化后状态异常: RobotMode={self.get_mode()}，期望5')
         self.dragging = False
         self.log.info(f'CR5 ready: speed={self.speed}%, collision=5')
+
+    def use_base_tool0(self):
+        """Select User0/Tool0 for commands whose target is a flange pose."""
+        user = User.Request()
+        user.index = 0
+        tool = Tool.Request()
+        tool.index = 0
+        user_response = self.call(self.user_frame, user, 3.0)
+        tool_response = self.call(self.tool_frame, tool, 3.0)
+        ok = (user_response is not None and user_response.res == 0 and
+              tool_response is not None and tool_response.res == 0)
+        if not ok:
+            self.log.error(
+                'User(0)/Tool(0)设置失败: user_res=%s tool_res=%s' % (
+                    getattr(user_response, 'res', None),
+                    getattr(tool_response, 'res', None)))
+        return ok
+
+    def use_base_frame(self):
+        """Select User0 only; GetPose itself measures the flange, not a TCP."""
+        user = User.Request()
+        user.index = 0
+        response = self.call(self.user_frame, user, 3.0)
+        ok = response is not None and response.res == 0
+        if not ok:
+            self.log.error('User(0)设置失败: res=%s' % getattr(response, 'res', None))
+        return ok
 
     def apply_motion_safety(self):
         """Every EnableRobot must be followed by speed/collision settings."""
@@ -100,7 +131,7 @@ class CR5Robot:
     def get_tool(self, warn=True):
         now = time.monotonic()
         if warn and now - self.last_getpose_warn > 2.0:
-            self.log.info('GetPose()读取当前TCP位姿')
+            self.log.info('GetPose()读取当前法兰位姿（以当前User原点表达）')
             self.last_getpose_warn = now
         response = self.call(self.get_pose_client, GetPose.Request(), 3.0)
         if response is not None and response.res == 0:
@@ -230,6 +261,8 @@ class CR5Robot:
                 f'退出拖拽后EnableRobot失败: res={getattr(enabled, "res", None)}')
             return False
         if not self.apply_motion_safety():
+            return False
+        if not self.use_base_tool0():
             return False
         if not self.wait_mode(self.MODE_ENABLED, timeout=5.0):
             self.log.error(

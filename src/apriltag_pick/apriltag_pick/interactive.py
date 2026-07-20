@@ -8,20 +8,9 @@ from .pick_node import main as pick_main
 
 def main():
     share = get_package_share_directory('apriltag_pick')
-    rectifier = subprocess.Popen([
-        'ros2', 'run', 'image_proc', 'rectify_node', '--ros-args',
-        '-r', '__ns:=/camera/camera/color',
-        '-r', 'image:=image_raw',
-        '-r', 'camera_info:=camera_info',
-        '-r', 'image_rect:=image_rect',
-        '-p', 'qos_overrides./camera/camera/color/image_raw.subscription.reliability:=best_effort',
-        '-p', 'qos_overrides./camera/camera/color/image_raw.subscription.durability:=volatile',
-        '-p', 'qos_overrides./camera/camera/color/camera_info.subscription.reliability:=best_effort',
-        '-p', 'qos_overrides./camera/camera/color/camera_info.subscription.durability:=volatile',
-    ])
     detector = subprocess.Popen([
         'ros2', 'run', 'apriltag_ros', 'apriltag_node', '--ros-args',
-        '-r', 'image_rect:=/camera/camera/color/image_rect',
+        '-r', 'image_rect:=/camera/camera/color/image_raw',
         '-r', 'camera_info:=/camera/camera/color/camera_info',
         '--params-file', f'{share}/config/tags.yaml',
     ])
@@ -30,12 +19,7 @@ def main():
             '--ros-args', '--params-file', f'{share}/config/pick.yaml'])
     finally:
         detector.terminate()
-        rectifier.terminate()
         try:
             detector.wait(timeout=3)
         except subprocess.TimeoutExpired:
             detector.kill()
-        try:
-            rectifier.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            rectifier.kill()

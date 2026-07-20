@@ -4,11 +4,15 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <limits>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -26,15 +30,19 @@
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/string.hpp"
 
-#include "dobot_msgs_v4/msg/tool_vector_actual.hpp"
 #include "dobot_msgs_v4/srv/clear_error.hpp"
 #include "dobot_msgs_v4/srv/disable_robot.hpp"
 #include "dobot_msgs_v4/srv/enable_robot.hpp"
+#include "dobot_msgs_v4/srv/get_pose.hpp"
+#include "dobot_msgs_v4/srv/get_error_id.hpp"
 #include "dobot_msgs_v4/srv/mov_j.hpp"
+#include "dobot_msgs_v4/srv/robot_mode.hpp"
 #include "dobot_msgs_v4/srv/servo_p.hpp"
 #include "dobot_msgs_v4/srv/set_collision_level.hpp"
 #include "dobot_msgs_v4/srv/speed_factor.hpp"
 #include "dobot_msgs_v4/srv/stop.hpp"
+#include "dobot_msgs_v4/srv/tool.hpp"
+#include "dobot_msgs_v4/srv/user.hpp"
 
 
 
@@ -50,25 +58,32 @@ using namespace continuous_icp_servo;
 class ContinuousIcpServoNode : public rclcpp::Node
 {
 public:
-  // 节点启动：加载参数/手眼矩阵，订阅点云和 TCP，启动 ICP 线程与 ServoP 定时器。
+  // 节点启动：低频 ICP 只覆盖最新绝对目标，高频 ServoP 重复跟随该目标。
   ContinuousIcpServoNode()
   : Node("continuous_icp_servo")
   {
     pointcloud_topic_ = declare_parameter<std::string>("pointcloud_topic", "/camera/camera/depth/color/points");
-    tool_topic_ = declare_parameter<std::string>("tool_topic", "/dobot_msgs_v4/msg/ToolVectorActual");
     joint_topic_ = declare_parameter<std::string>("joint_topic", "/joint_states_robot");
     command_topic_ = declare_parameter<std::string>("command_topic", "/continuous_icp_servo/command");
     handeye_path_ = declare_parameter<std::string>(
-      "handeye_path", "/home/ylx/Robot_Arm_Project/scripts/handeye_chessboard_result.json");
+      "handeye_path",
+      "/home/ylx/Robot_Arm_Project/scripts/active_handeye_calibration.json");
     icp_hz_ = declare_parameter<double>("icp_hz", 6.0);
     servo_hz_ = declare_parameter<double>("servo_hz", 20.0);
-    max_step_mm_ = declare_parameter<double>("max_step_mm", 1.0);
-    max_step_deg_ = declare_parameter<double>("max_step_deg", 0.15);
-    max_icp_age_s_ = declare_parameter<double>("max_icp_age_s", 2.0);
-    min_icp_overlap_ = declare_parameter<double>("min_icp_overlap", 0.12);
-    max_icp_rmse_mm_ = declare_parameter<double>("max_icp_rmse_mm", 25.0);
-    max_icp_trans_mm_ = declare_parameter<double>("max_icp_trans_mm", 120.0);
-    max_icp_rot_deg_ = declare_parameter<double>("max_icp_rot_deg", 10.0);
+    getpose_hz_ = declare_parameter<double>("getpose_hz", 30.0);
+    pose_sync_tolerance_s_ = declare_parameter<double>("pose_sync_tolerance_s", 0.10);
+    max_pose_age_s_ = declare_parameter<double>("max_pose_age_s", 0.25);
+    max_icp_age_s_ = declare_parameter<double>("max_icp_age_s", 1.0);
+    min_icp_inliers_ = declare_parameter<int>("min_icp_inliers", 500);
+    min_icp_overlap_ = declare_parameter<double>("min_icp_overlap", 0.03);
+    max_icp_rmse_mm_ = declare_parameter<double>("max_icp_rmse_mm", 60.0);
+    max_icp_trans_mm_ = declare_parameter<double>("max_icp_trans_mm", 500.0);
+    max_icp_rot_deg_ = declare_parameter<double>("max_icp_rot_deg", 60.0);
+    point_to_plane_trigger_mm_ = declare_parameter<double>("point_to_plane_trigger_mm", 10.0);
+    point_to_plane_dmax_m_ = declare_parameter<double>("point_to_plane_dmax_m", 0.010);
+    point_to_plane_iterations_ = declare_parameter<int>("point_to_plane_iterations", 6);
+    point_to_plane_max_points_ = static_cast<size_t>(std::max<int64_t>(
+      1000, declare_parameter<int64_t>("point_to_plane_max_points", 80000)));
     speed_percent_ = declare_parameter<int>("speed_percent", 10);
 
     if (!loadHandeye(handeye_path_, X_)) {
@@ -77,13 +92,10 @@ public:
     X_inv_ = X_.inverse();
 
     pc_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    tool_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     joint_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     command_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     rclcpp::SubscriptionOptions pc_options;
     pc_options.callback_group = pc_group_;
-    rclcpp::SubscriptionOptions tool_options;
-    tool_options.callback_group = tool_group_;
     rclcpp::SubscriptionOptions joint_options;
     joint_options.callback_group = joint_group_;
     rclcpp::SubscriptionOptions command_options;
@@ -92,8 +104,6 @@ public:
     pc_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       pointcloud_topic_, rclcpp::SensorDataQoS(),
       std::bind(&ContinuousIcpServoNode::onPointCloud, this, std::placeholders::_1), pc_options);
-    tool_sub_ = create_subscription<dobot_msgs_v4::msg::ToolVectorActual>(
-      tool_topic_, 10, std::bind(&ContinuousIcpServoNode::onTool, this, std::placeholders::_1), tool_options);
     joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
       joint_topic_, 10, std::bind(&ContinuousIcpServoNode::onJointState, this, std::placeholders::_1), joint_options);
     command_sub_ = create_subscription<std_msgs::msg::String>(
@@ -104,6 +114,12 @@ public:
     service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     mov_j_ = create_client<dobot_msgs_v4::srv::MovJ>(
       "/dobot_bringup_ros2/srv/MovJ", rmw_qos_profile_services_default, service_group_);
+    get_pose_ = create_client<dobot_msgs_v4::srv::GetPose>(
+      "/dobot_bringup_ros2/srv/GetPose", rmw_qos_profile_services_default, service_group_);
+    robot_mode_ = create_client<dobot_msgs_v4::srv::RobotMode>(
+      "/dobot_bringup_ros2/srv/RobotMode", rmw_qos_profile_services_default, service_group_);
+    get_error_id_ = create_client<dobot_msgs_v4::srv::GetErrorID>(
+      "/dobot_bringup_ros2/srv/GetErrorID", rmw_qos_profile_services_default, service_group_);
     servo_p_ = create_client<dobot_msgs_v4::srv::ServoP>(
       "/dobot_bringup_ros2/srv/ServoP", rmw_qos_profile_services_default, service_group_);
     stop_ = create_client<dobot_msgs_v4::srv::Stop>(
@@ -118,18 +134,28 @@ public:
       "/dobot_bringup_ros2/srv/SpeedFactor", rmw_qos_profile_services_default, service_group_);
     collision_ = create_client<dobot_msgs_v4::srv::SetCollisionLevel>(
       "/dobot_bringup_ros2/srv/SetCollisionLevel", rmw_qos_profile_services_default, service_group_);
+    user_ = create_client<dobot_msgs_v4::srv::User>(
+      "/dobot_bringup_ros2/srv/User", rmw_qos_profile_services_default, service_group_);
+    tool_ = create_client<dobot_msgs_v4::srv::Tool>(
+      "/dobot_bringup_ros2/srv/Tool", rmw_qos_profile_services_default, service_group_);
 
     initRobotAsync();
 
     const auto servo_period = std::chrono::duration<double>(1.0 / std::max(1.0, servo_hz_));
     servo_timer_ = create_wall_timer(
-      std::chrono::duration_cast<std::chrono::milliseconds>(servo_period),
+      std::chrono::duration_cast<std::chrono::nanoseconds>(servo_period),
       std::bind(&ContinuousIcpServoNode::servoTick, this));
+    const auto pose_period = std::chrono::duration<double>(1.0 / std::max(1.0, getpose_hz_));
+    pose_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(pose_period),
+      std::bind(&ContinuousIcpServoNode::pollGetPose, this));
 
     icp_thread_ = std::thread([this]() { icpLoop(); });
     keyboard_thread_ = std::thread([this]() { keyboardLoop(); });
 
-    RCLCPP_INFO(get_logger(), "连续 ICP ServoP 节点已启动");
+    RCLCPP_INFO(
+      get_logger(), "连续 ICP ServoP 节点已启动：ICP=%.1fHz ServoP=%.1fHz GetPose=%.1fHz",
+      icp_hz_, servo_hz_, getpose_hz_);
     printMenu();
   }
 
@@ -148,38 +174,154 @@ public:
   }
 
 private:
-  // ToolVectorActual 回调：保存最新 TCP 位姿，供 ICP 初值和 ServoP 当前位姿使用。
-  void onTool(const dobot_msgs_v4::msg::ToolVectorActual::SharedPtr msg)
+  struct TemplateModel {
+    std::vector<PyramidLevel> pyramid;
+    Cloud point_to_plane_ref;
+    Cloud point_to_plane_normals;
+    SpatialIndex point_to_plane_index;
+    Mat4 T_base_tool_ref{Mat4::Identity()};
+    Mat4 T_base_camera_ref{Mat4::Identity()};
+  };
+
+  static bool parseGetPose(const std::string & text, ToolPose & pose)
   {
-    const bool finite =
-      std::isfinite(msg->x) && std::isfinite(msg->y) && std::isfinite(msg->z) &&
-      std::isfinite(msg->rx) && std::isfinite(msg->ry) && std::isfinite(msg->rz);
-    const double pos_norm = std::sqrt(msg->x * msg->x + msg->y * msg->y + msg->z * msg->z);
-    if (!finite || pos_norm < 1.0) {
-      const int dropped = ++tool_drop_count_;
-      if (dropped == 1 || dropped % 50 == 0) {
-        RCLCPP_WARN(
-          get_logger(), "丢弃异常 ToolVectorActual xyz=[%.3f %.3f %.3f] rpy=[%.3f %.3f %.3f]",
-          msg->x, msg->y, msg->z, msg->rx, msg->ry, msg->rz);
+    std::string cleaned = text;
+    for (char & c : cleaned) {
+      if (c == '{' || c == '}' || c == ',') {
+        c = ' ';
       }
+    }
+    std::istringstream input(cleaned);
+    if (!(input >> pose.x >> pose.y >> pose.z >> pose.rx >> pose.ry >> pose.rz)) {
+      return false;
+    }
+    const bool finite =
+      std::isfinite(pose.x) && std::isfinite(pose.y) && std::isfinite(pose.z) &&
+      std::isfinite(pose.rx) && std::isfinite(pose.ry) && std::isfinite(pose.rz);
+    return finite && std::sqrt(pose.x * pose.x + pose.y * pose.y + pose.z * pose.z) > 1.0;
+  }
+
+  // dobot_bringup_v4的所有Dashboard服务共用同一个29999 socket，驱动内部没有命令互斥。
+  // 节点侧保证任意时刻最多一个GetPose/ServoP/MovJ/Stop请求在途。
+  bool tryAcquireDashboard()
+  {
+    bool expected = false;
+    return dashboard_inflight_.compare_exchange_strong(expected, true);
+  }
+
+  void finishDashboardRequest()
+  {
+    dashboard_inflight_.store(false);
+    if (stop_pending_.exchange(false)) {
+      sendStop();
+    } else if (diagnostics_pending_.exchange(false)) {
+      requestRobotDiagnostics();
+    }
+  }
+
+  void requestRobotDiagnostics()
+  {
+    if (!robot_mode_->service_is_ready() || !get_error_id_->service_is_ready() ||
+      !tryAcquireDashboard())
+    {
       return;
     }
+    auto mode_req = std::make_shared<dobot_msgs_v4::srv::RobotMode::Request>();
+    robot_mode_->async_send_request(
+      mode_req, [this](rclcpp::Client<dobot_msgs_v4::srv::RobotMode>::SharedFuture mode_future) {
+        try {
+          const auto mode = mode_future.get();
+          RCLCPP_ERROR(
+            this->get_logger(), "ServoP故障诊断：RobotMode res=%d mode=%s",
+            mode->res, mode->robot_return.c_str());
+        } catch (const std::exception & e) {
+          RCLCPP_ERROR(this->get_logger(), "RobotMode诊断失败：%s", e.what());
+          finishDashboardRequest();
+          return;
+        }
+        auto error_req = std::make_shared<dobot_msgs_v4::srv::GetErrorID::Request>();
+        get_error_id_->async_send_request(
+          error_req,
+          [this](rclcpp::Client<dobot_msgs_v4::srv::GetErrorID>::SharedFuture error_future) {
+            try {
+              const auto error = error_future.get();
+              RCLCPP_ERROR(
+                this->get_logger(), "ServoP故障诊断：GetErrorID res=%d errors=%s",
+                error->res, error->robot_return.c_str());
+            } catch (const std::exception & e) {
+              RCLCPP_ERROR(this->get_logger(), "GetErrorID诊断失败：%s", e.what());
+            }
+            finishDashboardRequest();
+          });
+      });
+  }
 
-    std::lock_guard<std::mutex> lk(tool_mtx_);
-    latest_tool_.x = msg->x;
-    latest_tool_.y = msg->y;
-    latest_tool_.z = msg->z;
-    latest_tool_.rx = msg->rx;
-    latest_tool_.ry = msg->ry;
-    latest_tool_.rz = msg->rz;
-    latest_tool_.stamp = now();
-    latest_tool_.valid = true;
-    const int count = ++tool_msg_count_;
-    if (count == 1) {
-      RCLCPP_INFO(
-        get_logger(), "收到 ToolVectorActual xyz=[%.1f %.1f %.1f] rpy=[%.1f %.1f %.1f]",
-        msg->x, msg->y, msg->z, msg->rx, msg->ry, msg->rz);
+  // 唯一的笛卡尔反馈来源：固定频率调用 GetPose()，并保留短历史用于点云时间对齐。
+  void pollGetPose()
+  {
+    if (!robot_initialized_.load() || !get_pose_->service_is_ready() ||
+      getpose_inflight_.exchange(true))
+    {
+      return;
     }
+    if (!tryAcquireDashboard()) {
+      getpose_inflight_.store(false);
+      return;
+    }
+    auto req = std::make_shared<dobot_msgs_v4::srv::GetPose::Request>();
+    req->user = 0;
+    req->tool = 0;
+    get_pose_->async_send_request(
+      req, [this](rclcpp::Client<dobot_msgs_v4::srv::GetPose>::SharedFuture future) {
+        getpose_inflight_.store(false);
+        ToolPose next;
+        try {
+          const auto response = future.get();
+          if (response->res != 0 || !parseGetPose(response->robot_return, next)) {
+            const int dropped = ++getpose_drop_count_;
+            if (dropped == 1 || dropped % 20 == 0) {
+              RCLCPP_WARN(
+                this->get_logger(), "GetPose无效 res=%d return=%s",
+                response->res, response->robot_return.c_str());
+            }
+            finishDashboardRequest();
+            return;
+          }
+        } catch (const std::exception & e) {
+          RCLCPP_WARN(this->get_logger(), "GetPose调用异常：%s", e.what());
+          finishDashboardRequest();
+          return;
+        }
+        next.stamp = this->now();
+        next.valid = true;
+        {
+          std::lock_guard<std::mutex> lk(tool_mtx_);
+          if (latest_tool_.valid) {
+            const Point previous(latest_tool_.x, latest_tool_.y, latest_tool_.z);
+            const Point current(next.x, next.y, next.z);
+            if ((current - previous).norm() > 200.0) {
+              const int dropped = ++getpose_drop_count_;
+              if (dropped == 1 || dropped % 20 == 0) {
+                RCLCPP_WARN(this->get_logger(), "拒绝GetPose跳变：%.1fmm", (current - previous).norm());
+              }
+              finishDashboardRequest();
+              return;
+            }
+          }
+          latest_tool_ = next;
+          pose_history_.push_back(next);
+          while (pose_history_.size() > 100) {
+            pose_history_.pop_front();
+          }
+        }
+        const int count = ++getpose_count_;
+        if (count == 1) {
+          RCLCPP_INFO(
+            this->get_logger(), "GetPose反馈 xyz=[%.1f %.1f %.1f] rpy=[%.1f %.1f %.1f]",
+            next.x, next.y, next.z, next.rx, next.ry, next.rz);
+        }
+        finishDashboardRequest();
+      });
   }
 
   // JointState 回调：持续维护最新关节角缓存；驱动发布弧度，MovJ 服务使用角度。
@@ -240,8 +382,10 @@ private:
     latest_pc_stamp_ = now();
   }
 
-  // 原子式取当前点云和 TCP 快照；返回失败时给出具体原因，便于现场排查 topic/pose。
-  bool snapshot(Cloud & pc, ToolPose & tool, std::string * reason = nullptr)
+  // 取最新点云，并从 GetPose 历史中选择时间最近的一帧，降低 eye-in-hand 运动同步误差。
+  bool snapshot(
+    Cloud & pc, ToolPose & tool, rclcpp::Time * source_stamp = nullptr,
+    std::string * reason = nullptr)
   {
     rclcpp::Time pc_stamp;
     {
@@ -251,26 +395,40 @@ private:
     }
     {
       std::lock_guard<std::mutex> lk(tool_mtx_);
-      tool = latest_tool_;
+      double best_dt = std::numeric_limits<double>::infinity();
+      for (const auto & candidate : pose_history_) {
+        const double dt = std::abs((candidate.stamp - pc_stamp).seconds());
+        if (dt < best_dt) {
+          best_dt = dt;
+          tool = candidate;
+        }
+      }
     }
     const bool has_pc_stamp = pc_stamp.nanoseconds() > 0;
     const bool has_tool_stamp = tool.stamp.nanoseconds() > 0;
     const double pc_age = has_pc_stamp ? (now() - pc_stamp).seconds() : 999.0;
     const double tool_age = has_tool_stamp ? (now() - tool.stamp).seconds() : 999.0;
+    const double sync_dt = has_tool_stamp && has_pc_stamp ?
+      std::abs((tool.stamp - pc_stamp).seconds()) : 999.0;
     const bool pc_ok = pc.size() > 500 && has_pc_stamp && pc_age < 2.0;
-    const bool tool_ok = tool.valid && has_tool_stamp && tool_age < 2.0;
+    const bool tool_ok =
+      tool.valid && has_tool_stamp && tool_age < 2.0 && sync_dt <= pose_sync_tolerance_s_;
+    if (source_stamp) {
+      *source_stamp = pc_stamp;
+    }
     if (reason && (!pc_ok || !tool_ok)) {
       *reason =
         "pc_pts=" + std::to_string(pc.size()) +
         " pc_age=" + std::to_string(pc_age) + "s" +
         " tool_valid=" + std::string(tool.valid ? "true" : "false") +
         " tool_age=" + std::to_string(tool_age) + "s" +
+        " sync_dt=" + std::to_string(sync_dt) + "s" +
         " tool_xyz=[" + std::to_string(tool.x) + "," + std::to_string(tool.y) + "," + std::to_string(tool.z) + "]";
     }
     return pc_ok && tool_ok;
   }
 
-  // 录制参考帧：融合 5 帧点云，建立 20/10/5mm 三层模板金字塔和空间索引。
+  // 录制参考帧：建立不可变模板；ICP线程只复制shared_ptr，不再复制整套点云索引。
   void recordTemplate()
   {
     RCLCPP_INFO(get_logger(), "recording template: need 5 frames, wait up to 6s");
@@ -282,7 +440,7 @@ private:
       Cloud pc;
       ToolPose tool;
       std::string reason;
-      if (snapshot(pc, tool, &reason)) {
+      if (snapshot(pc, tool, nullptr, &reason)) {
         frames.push_back(pc);
         ref_tool = tool;
         RCLCPP_INFO(get_logger(), "  frame %zu: %zu pts", frames.size(), pc.size());
@@ -305,7 +463,7 @@ private:
     }
     const Cloud ref_5mm = voxelDown(merged, 0.005);
 
-    std::vector<PyramidLevel> pyr;
+    auto model = std::make_shared<TemplateModel>();
     for (const auto & cfg : std::vector<std::pair<double, double>>{{0.020, 0.100}, {0.010, 0.050}, {0.005, 0.025}}) {
       PyramidLevel level;
       level.voxel = cfg.first;
@@ -314,15 +472,33 @@ private:
       level.index.build(level.ref, level.dmax);
       RCLCPP_INFO(
         get_logger(), "  L%zu: %zu pts voxel=%.0fmm dmax=%.0fmm",
-        pyr.size(), level.ref.size(), level.voxel * 1000.0, level.dmax * 1000.0);
-      pyr.push_back(std::move(level));
+        model->pyramid.size(), level.ref.size(), level.voxel * 1000.0, level.dmax * 1000.0);
+      model->pyramid.push_back(std::move(level));
     }
+
+    const auto normals_t0 = std::chrono::steady_clock::now();
+    const size_t p2_stride = std::max<size_t>(
+      1, (ref_5mm.size() + point_to_plane_max_points_ - 1) / point_to_plane_max_points_);
+    model->point_to_plane_ref.reserve(
+      std::min(ref_5mm.size(), point_to_plane_max_points_));
+    for (size_t i = 0; i < ref_5mm.size(); i += p2_stride) {
+      model->point_to_plane_ref.push_back(ref_5mm[i]);
+    }
+    model->point_to_plane_index.build(model->point_to_plane_ref, point_to_plane_dmax_m_);
+    model->point_to_plane_normals = estimateNormals(
+      model->point_to_plane_ref, model->point_to_plane_index, 0.015, 40);
+    const double normals_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - normals_t0).count();
+    RCLCPP_INFO(
+      get_logger(), "  L3(point-to-plane): %zu pts normals=%.0fms",
+      model->point_to_plane_ref.size(), normals_ms);
+
+    model->T_base_tool_ref = poseToMatrixMm(ref_tool);
+    model->T_base_camera_ref = model->T_base_tool_ref * X_;
 
     {
       std::lock_guard<std::mutex> lk(template_mtx_);
-      ref_pyramid_ = std::move(pyr);
-      T_base_tool_ref_ = poseToMatrixMm(ref_tool);
-      T_base_camera_ref_ = T_base_tool_ref_ * X_;
+      ref_model_ = std::move(model);
       template_ready_ = true;
     }
     RCLCPP_INFO(
@@ -351,32 +527,40 @@ private:
   // 执行一次金字塔 ICP：用机器人当前位姿给初值，再由粗到精修正 current -> ref。
   void computeIcpOnce()
   {
+    const auto compute_t0 = std::chrono::steady_clock::now();
     Cloud pc;
     ToolPose tool;
-    if (!snapshot(pc, tool)) {
+    rclcpp::Time source_stamp;
+    if (!snapshot(pc, tool, &source_stamp)) {
       return;
     }
 
-    std::vector<PyramidLevel> pyr;
-    Mat4 T_base_camera_ref;
+    std::shared_ptr<const TemplateModel> model;
     {
       std::lock_guard<std::mutex> lk(template_mtx_);
-      pyr = ref_pyramid_;
-      T_base_camera_ref = T_base_camera_ref_;
+      model = ref_model_;
+    }
+    if (!model) {
+      return;
     }
 
     Mat4 T_base_tool_cur = poseToMatrixMm(tool);
     Mat4 T_base_camera_cur = T_base_tool_cur * X_;
-    Mat4 T_init_mm = T_base_camera_ref.inverse() * T_base_camera_cur;
+    Mat4 T_init_mm = model->T_base_camera_ref.inverse() * T_base_camera_cur;
     Mat4 T_acc = T_init_mm;
     T_acc.block<3, 1>(0, 3) /= 1000.0;
 
     double final_rmse = 999.0;
     int final_inliers = 0;
     double final_overlap = 0.0;
+    Cloud fine_src;
 
-    for (const auto & level : pyr) {
+    for (size_t level_id = 0; level_id < model->pyramid.size(); ++level_id) {
+      const auto & level = model->pyramid[level_id];
       Cloud src_ds = voxelDown(pc, level.voxel);
+      if (level_id + 1 == model->pyramid.size()) {
+        fine_src = src_ds;
+      }
       std::vector<Point> matched_src;
       std::vector<Point> matched_dst;
       matched_src.reserve(src_ds.size());
@@ -411,6 +595,29 @@ private:
       final_rmse = rmse;
     }
 
+    const double p2p_translation_mm = T_acc.block<3, 1>(0, 3).norm() * 1000.0;
+    if (
+      p2p_translation_mm <= point_to_plane_trigger_mm_ && !fine_src.empty() &&
+      !model->point_to_plane_ref.empty())
+    {
+      Mat4 refined;
+      double p2l_rmse = 999.0;
+      int p2l_inliers = 0;
+      double p2l_overlap = 0.0;
+      if (pointToPlaneRefine(
+          fine_src, model->point_to_plane_ref, model->point_to_plane_index,
+          model->point_to_plane_normals, T_acc, refined,
+          p2l_rmse, p2l_inliers, p2l_overlap,
+          point_to_plane_dmax_m_, point_to_plane_iterations_,
+          point_to_plane_max_points_))
+      {
+        T_acc = refined;
+        final_rmse = p2l_rmse;
+        final_inliers = p2l_inliers;
+        final_overlap = p2l_overlap;
+      }
+    }
+
     Mat4 T_icp_mm = T_acc;
     T_icp_mm.block<3, 1>(0, 3) *= 1000.0;
     const double trans_mm = T_icp_mm.block<3, 1>(0, 3).norm();
@@ -418,17 +625,22 @@ private:
 
     IcpResult result;
     result.T_icp_mm = T_icp_mm;
+    const Mat4 T_delta = X_ * T_icp_mm * X_inv_;
+    result.T_target_base = T_base_tool_cur * T_delta.inverse();
     result.rmse_mm = final_rmse * 1000.0;
     result.overlap = final_overlap;
     result.inliers = final_inliers;
     result.seq = ++icp_seq_counter_;
+    result.compute_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - compute_t0).count();
     result.ok =
-      final_inliers >= 500 &&
+      final_inliers >= min_icp_inliers_ &&
       result.overlap >= min_icp_overlap_ &&
       result.rmse_mm <= max_icp_rmse_mm_ &&
       trans_mm <= max_icp_trans_mm_ &&
       rot_deg <= max_icp_rot_deg_;
-    result.stamp = now();
+    // 使用点云采集时刻而不是计算完成时刻，让Servo watchdog能识别慢ICP造成的陈旧目标。
+    result.stamp = source_stamp;
 
     {
       std::lock_guard<std::mutex> lk(icp_mtx_);
@@ -439,13 +651,13 @@ private:
     const bool should_log = servo_enabled_.load() && ((log_skip++ % 10) == 0 || !result.ok);
     if (should_log) {
       RCLCPP_INFO(
-        get_logger(), "伺服中 ICP %s  RMSE=%.1fmm  匹配点=%d  overlap=%.2f  |t|=%.1fmm  |r|=%.2fdeg",
-        result.ok ? "正常" : "异常", result.rmse_mm, result.inliers, result.overlap, trans_mm, rot_deg);
+        get_logger(), "伺服中 ICP %s RMSE=%.1fmm inliers=%d overlap=%.2f |t|=%.1fmm |r|=%.2fdeg time=%.0fms",
+        result.ok ? "正常" : "异常", result.rmse_mm, result.inliers, result.overlap,
+        trans_mm, rot_deg, result.compute_ms);
     }
   }
 
-  // 高频 ServoP 定时器：读取最新 ICP 结果，限幅后发送一个很近的笛卡尔目标。
-  // 若上一条 ServoP 还没返回，本周期跳过，避免服务请求和队列目标堆积。
+  // 高频ServoP重复发送低频ICP缓存的最新绝对目标；新ICP只覆盖缓存，不直接发运动命令。
   void servoTick()
   {
     if (!servo_enabled_.load() || !template_ready_.load()) {
@@ -487,51 +699,40 @@ private:
       return;
     }
     bad_icp_cycles_.store(0);
-    if (icp.seq == last_consumed_icp_seq_.load()) {
-      return;
-    }
 
     ToolPose tool;
     {
       std::lock_guard<std::mutex> lk(tool_mtx_);
       tool = latest_tool_;
     }
-    if (!tool.valid || (now() - tool.stamp).seconds() > 0.25) {
+    const double pose_age_s = tool.stamp.nanoseconds() > 0 ?
+      (now() - tool.stamp).seconds() : 999.0;
+    if (!tool.valid || pose_age_s > max_pose_age_s_) {
+      const int bad_cycles = bad_pose_cycles_.fetch_add(1) + 1;
       static int bad_tool_log_skip = 0;
       if ((bad_tool_log_skip++ % 20) == 0) {
         RCLCPP_WARN(
-          get_logger(), "连续伺服等待：ToolVectorActual %s age=%.2fs",
-          tool.valid ? "过期" : "无效", (now() - tool.stamp).seconds());
+          get_logger(), "连续伺服等待：GetPose %s age=%.2fs",
+          tool.valid ? "过期" : "无效", pose_age_s);
+      }
+      if (bad_cycles > static_cast<int>(std::max(1.0, servo_hz_) * 0.5)) {
+        servo_enabled_.store(false);
+        sendStop();
+        RCLCPP_WARN(get_logger(), "连续伺服已停止：GetPose反馈连续0.5s无效");
       }
       return;
     }
+    bad_pose_cycles_.store(0);
 
     const Mat4 T_cur = poseToMatrixMm(tool);
-    // T_delta = T_ref_tool^-1 * T_cur_tool；右乘到当前位姿时要取逆才能得到 T_cur^-1 * T_ref。
-    const Mat4 T_delta = X_ * icp.T_icp_mm * X_inv_;
-    const Mat4 T_corr = T_delta.inverse();
-
-    Point step_t = T_corr.block<3, 1>(0, 3);
-    const double t_norm = step_t.norm();
-    if (t_norm > max_step_mm_) {
-      step_t *= max_step_mm_ / t_norm;
-    }
-
-    Eigen::AngleAxisd aa(T_corr.block<3, 3>(0, 0));
-    double angle = aa.angle();
-    const double max_angle = max_step_deg_ * M_PI / 180.0;
-    if (std::abs(angle) > max_angle) {
-      angle = std::copysign(max_angle, angle);
-    }
-    Mat4 T_step = Mat4::Identity();
-    if (std::abs(angle) > 1e-6 && std::isfinite(aa.axis().x()) && std::isfinite(aa.axis().y()) && std::isfinite(aa.axis().z())) {
-      T_step.block<3, 3>(0, 0) = Eigen::AngleAxisd(angle, aa.axis()).toRotationMatrix();
-    }
-    T_step.block<3, 1>(0, 3) = step_t;
-
-    const Mat4 T_target = T_cur * T_step;
+    const Mat4 & T_target = icp.T_target_base;
     const Point xyz = T_target.block<3, 1>(0, 3);
     const Point rpy = matrixToXyzDeg(T_target.block<3, 3>(0, 0));
+    const double position_error =
+      (T_target.block<3, 1>(0, 3) - T_cur.block<3, 1>(0, 3)).norm();
+    const double rotation_error = Eigen::AngleAxisd(
+      T_target.block<3, 3>(0, 0) * T_cur.block<3, 3>(0, 0).transpose()).angle() *
+      180.0 / M_PI;
 
     auto req = std::make_shared<dobot_msgs_v4::srv::ServoP::Request>();
     req->a = xyz.x();
@@ -542,9 +743,8 @@ private:
     req->f = rpy.z();
     req->param_value.clear();
 
-    uint64_t expected_seq = last_consumed_icp_seq_.load();
-    if (expected_seq == icp.seq ||
-        !last_consumed_icp_seq_.compare_exchange_strong(expected_seq, icp.seq)) {
+    if (!tryAcquireDashboard()) {
+      missed_servo_cycles_.fetch_add(1);
       return;
     }
     servo_inflight_.store(true);
@@ -552,45 +752,32 @@ private:
     static int servo_send_log_skip = 0;
     if ((servo_send_log_skip++ % 20) == 0) {
       RCLCPP_INFO(
-        get_logger(), "连续伺服已发送 ServoP xyz=[%.1f %.1f %.1f] rpy=[%.1f %.1f %.1f] step=[%.2f %.2f %.2f]mm",
-        xyz.x(), xyz.y(), xyz.z(), rpy.x(), rpy.y(), rpy.z(), step_t.x(), step_t.y(), step_t.z());
+        get_logger(), "ServoP latest-only seq=%lu target=[%.1f %.1f %.1f] err=%.2fmm/%.2fdeg age=%.2fs",
+        static_cast<unsigned long>(icp.seq), xyz.x(), xyz.y(), xyz.z(),
+        position_error, rotation_error, icp_age_s);
     }
     servo_p_->async_send_request(
       req,
       [this](rclcpp::Client<dobot_msgs_v4::srv::ServoP>::SharedFuture future) {
-        const auto res = future.get();
-        if (res->res != 0) {
-          RCLCPP_WARN(this->get_logger(), "连续伺服 ServoP 返回异常 res=%d", res->res);
+        try {
+          const auto res = future.get();
+          if (res->res != 0) {
+            servo_enabled_.store(false);
+            diagnostics_pending_.store(true);
+            RCLCPP_ERROR(
+              this->get_logger(), "ServoP失败 res=%d：立即关闭连续伺服并发送Stop；若仍为-1请查看驱动原始TCP反馈",
+              res->res);
+            sendStop();
+          }
+        } catch (const std::exception & e) {
+          servo_enabled_.store(false);
+          diagnostics_pending_.store(true);
+          RCLCPP_ERROR(this->get_logger(), "ServoP调用异常：%s；立即Stop", e.what());
+          sendStop();
         }
         servo_inflight_.store(false);
         servo_inflight_since_ms_.store(0);
-      });
-  }
-
-  // 只负责下发、不关心返回；用于 Stop/ClearError 等低风险控制命令。
-  template<class ClientT, class RequestT>
-  void fireAndForget(const typename ClientT::SharedPtr & client, const std::shared_ptr<RequestT> & req)
-  {
-    if (client->service_is_ready()) {
-      client->async_send_request(req);
-    }
-  }
-
-  // 下发并打印返回码；用于启动时确认限速和碰撞等级是否真正被控制器接收。
-  template<class ClientT, class RequestT>
-  void sendAndLog(
-    const typename ClientT::SharedPtr & client,
-    const std::shared_ptr<RequestT> & req,
-    const char * name)
-  {
-    if (!client->service_is_ready()) {
-      RCLCPP_WARN(get_logger(), "%s service not ready; command skipped", name);
-      return;
-    }
-    client->async_send_request(
-      req,
-      [this, name](typename ClientT::SharedFuture future) {
-        RCLCPP_INFO(this->get_logger(), "%s res=%d", name, future.get()->res);
+        finishDashboardRequest();
       });
   }
 
@@ -602,9 +789,14 @@ private:
       waitClient(disable_robot_, "DisableRobot");
       waitClient(enable_robot_, "EnableRobot");
       waitClient(mov_j_, "MovJ");
+      waitClient(get_pose_, "GetPose");
+      waitClient(robot_mode_, "RobotMode");
+      waitClient(get_error_id_, "GetErrorID");
+      waitClient(user_, "User");
+      waitClient(tool_, "Tool");
       waitClient(speed_factor_, "SpeedFactor");
       waitClient(collision_, "SetCollisionLevel");
-      RCLCPP_INFO(get_logger(), "初始化序列：ClearError -> DisableRobot -> EnableRobot -> SpeedFactor -> SetCollisionLevel");
+      RCLCPP_INFO(get_logger(), "初始化序列：ClearError -> DisableRobot -> EnableRobot -> User0 -> Tool0 -> SpeedFactor -> Collision");
       initClearError();
     }).detach();
   }
@@ -633,7 +825,7 @@ private:
       });
   }
 
-  // 初始化第3步：重新使能。Enable 返回后再设置速度和碰撞等级。
+  // 初始化第3步：重新使能，随后强制统一User0/Tool0。
   void initEnableRobot()
   {
     auto req = std::make_shared<dobot_msgs_v4::srv::EnableRobot::Request>();
@@ -641,11 +833,33 @@ private:
       req,
       [this](rclcpp::Client<dobot_msgs_v4::srv::EnableRobot>::SharedFuture future) {
         RCLCPP_INFO(this->get_logger(), "EnableRobot res=%d", future.get()->res);
+        initUser0();
+      });
+  }
+
+  void initUser0()
+  {
+    auto req = std::make_shared<dobot_msgs_v4::srv::User::Request>();
+    req->index = 0;
+    user_->async_send_request(
+      req, [this](rclcpp::Client<dobot_msgs_v4::srv::User>::SharedFuture future) {
+        RCLCPP_INFO(this->get_logger(), "User(0) res=%d", future.get()->res);
+        initTool0();
+      });
+  }
+
+  void initTool0()
+  {
+    auto req = std::make_shared<dobot_msgs_v4::srv::Tool::Request>();
+    req->index = 0;
+    tool_->async_send_request(
+      req, [this](rclcpp::Client<dobot_msgs_v4::srv::Tool>::SharedFuture future) {
+        RCLCPP_INFO(this->get_logger(), "Tool(0) res=%d", future.get()->res);
         initSpeedFactor();
       });
   }
 
-  // 初始化第4步：全局限速。
+  // 全局限速。
   void initSpeedFactor()
   {
     auto req = std::make_shared<dobot_msgs_v4::srv::SpeedFactor::Request>();
@@ -667,6 +881,7 @@ private:
       req,
       [this](rclcpp::Client<dobot_msgs_v4::srv::SetCollisionLevel>::SharedFuture future) {
         RCLCPP_INFO(this->get_logger(), "SetCollisionLevel res=%d", future.get()->res);
+        robot_initialized_.store(true);
         RCLCPP_INFO(this->get_logger(), "初始化完成：speed=%d collision=5", speed_percent_);
       });
   }
@@ -688,12 +903,28 @@ private:
   // 统一停止入口；键盘停止、异常停止、析构时都会调用。
   void sendStop()
   {
-    auto req = std::make_shared<dobot_msgs_v4::srv::Stop::Request>();
-    fireAndForget<rclcpp::Client<dobot_msgs_v4::srv::Stop>, dobot_msgs_v4::srv::Stop::Request>(stop_, req);
     servo_inflight_.store(false);
     servo_inflight_since_ms_.store(0);
     joint_move_inflight_.store(false);
     joint_move_since_ms_.store(0);
+    stop_pending_.store(true);
+    if (!stop_->service_is_ready() || !tryAcquireDashboard()) {
+      return;
+    }
+    stop_pending_.store(false);
+    auto req = std::make_shared<dobot_msgs_v4::srv::Stop::Request>();
+    stop_->async_send_request(
+      req, [this](rclcpp::Client<dobot_msgs_v4::srv::Stop>::SharedFuture future) {
+        try {
+          const auto response = future.get();
+          if (response->res != 0) {
+            RCLCPP_WARN(this->get_logger(), "Stop返回异常 res=%d", response->res);
+          }
+        } catch (const std::exception & e) {
+          RCLCPP_WARN(this->get_logger(), "Stop调用异常：%s", e.what());
+        }
+        finishDashboardRequest();
+      });
   }
 
   // CR5 关键关节限位预检查；控制器仍是最终保护，这里用于提前给出清晰现场日志。
@@ -724,6 +955,10 @@ private:
   void perturbJoints(const JointDelta & d, const std::string & label)
   {
     servo_enabled_.store(false);
+    if (!robot_initialized_.load()) {
+      RCLCPP_WARN(get_logger(), "%s：机械臂初始化尚未完成", label.c_str());
+      return;
+    }
     if (!template_ready_.load()) {
       RCLCPP_WARN(get_logger(), "%s：请先输入 r 录制 ref 模板，再用 1-6 偏移离开 ref。", label.c_str());
       return;
@@ -784,6 +1019,12 @@ private:
     RCLCPP_INFO(
       get_logger(), "%s：使用缓存 JointState age=%.2fs，已发送 JointMovJ 目标 J=[%.2f %.2f %.2f %.2f %.2f %.2f]deg",
       label.c_str(), joint_age_s, joints[0], joints[1], joints[2], joints[3], joints[4], joints[5]);
+    if (!tryAcquireDashboard()) {
+      joint_move_inflight_.store(false);
+      joint_move_since_ms_.store(0);
+      RCLCPP_WARN(get_logger(), "%s：Dashboard正忙，本次偏移未发送，请重试", label.c_str());
+      return;
+    }
     mov_j_->async_send_request(
       mov,
       [this, label](rclcpp::Client<dobot_msgs_v4::srv::MovJ>::SharedFuture mov_future) {
@@ -791,6 +1032,7 @@ private:
         RCLCPP_INFO(this->get_logger(), "%s：JointMovJ 返回 res=%d", label.c_str(), mov_res->res);
         joint_move_inflight_.store(false);
         joint_move_since_ms_.store(0);
+        finishDashboardRequest();
       });
   }
 
@@ -840,44 +1082,6 @@ private:
       "========================================");
   }
 
-  // 发送一个绝对 ServoP 目标；偏移测试和连续伺服都复用这个打包逻辑。
-  void sendServoPTarget(const Mat4 & T_target, const std::string & label)
-  {
-    if (!servo_p_->service_is_ready()) {
-      RCLCPP_WARN(get_logger(), "%s：ServoP 服务未就绪，未下发目标", label.c_str());
-      return;
-    }
-    if (servoBusyOrRecover(label)) {
-      RCLCPP_WARN(get_logger(), "%s：上一条 ServoP 还未返回，本次跳过", label.c_str());
-      return;
-    }
-
-    const Point xyz = T_target.block<3, 1>(0, 3);
-    const Point rpy = matrixToXyzDeg(T_target.block<3, 3>(0, 0));
-    auto req = std::make_shared<dobot_msgs_v4::srv::ServoP::Request>();
-    req->a = xyz.x();
-    req->b = xyz.y();
-    req->c = xyz.z();
-    req->d = rpy.x();
-    req->e = rpy.y();
-    req->f = rpy.z();
-    req->param_value.clear();
-
-    servo_inflight_.store(true);
-    servo_inflight_since_ms_.store(steadyMs());
-    RCLCPP_INFO(
-      get_logger(), "%s：已下发 6 参数 ServoP 目标 xyz=[%.1f %.1f %.1f] rpy=[%.1f %.1f %.1f]",
-      label.c_str(), xyz.x(), xyz.y(), xyz.z(), rpy.x(), rpy.y(), rpy.z());
-    servo_p_->async_send_request(
-      req,
-      [this, label](rclcpp::Client<dobot_msgs_v4::srv::ServoP>::SharedFuture future) {
-        const auto res = future.get();
-        RCLCPP_INFO(this->get_logger(), "%s：ServoP 返回 res=%d", label.c_str(), res->res);
-        servo_inflight_.store(false);
-        servo_inflight_since_ms_.store(0);
-      });
-  }
-
   // 统一处理键盘和 topic 命令；topic 可用: ros2 topic pub /continuous_icp_servo/command std_msgs/msg/String "{data: r}"。
   void handleCommand(std::string cmd)
   {
@@ -900,14 +1104,14 @@ private:
       servo_enabled_.store(next);
       if (next) {
         bad_icp_cycles_.store(0);
+        bad_pose_cycles_.store(0);
         missed_servo_cycles_.store(0);
         servo_inflight_.store(false);
         servo_inflight_since_ms_.store(0);
-        last_consumed_icp_seq_.store(0);
         RCLCPP_INFO(
-          get_logger(), "连续伺服准备：ServoP服务=%s ICP阈值 age=%.2fs rmse<=%.1fmm overlap>=%.2f rot<=%.1fdeg",
+          get_logger(), "连续伺服准备：最新绝对目标重复发送；ServoP=%s ICP age<=%.2fs inliers>=%d rmse<=%.1fmm overlap>=%.2f",
           servo_p_->service_is_ready() ? "ready" : "not ready",
-          max_icp_age_s_, max_icp_rmse_mm_, min_icp_overlap_, max_icp_rot_deg_);
+          max_icp_age_s_, min_icp_inliers_, max_icp_rmse_mm_, min_icp_overlap_);
       }
       RCLCPP_WARN(get_logger(), "连续 ICP 伺服：%s", next ? "开启" : "关闭");
       if (!next) {
@@ -964,34 +1168,40 @@ private:
   }
 
   std::string pointcloud_topic_;
-  std::string tool_topic_;
   std::string joint_topic_;
   std::string command_topic_;
   std::string handeye_path_;
   double icp_hz_{6.0};
   double servo_hz_{20.0};
-  double max_step_mm_{1.0};
-  double max_step_deg_{0.15};
-  double max_icp_age_s_{2.0};
-  double min_icp_overlap_{0.12};
-  double max_icp_rmse_mm_{25.0};
-  double max_icp_trans_mm_{120.0};
-  double max_icp_rot_deg_{10.0};
+  double getpose_hz_{30.0};
+  double pose_sync_tolerance_s_{0.10};
+  double max_pose_age_s_{0.25};
+  double max_icp_age_s_{1.0};
+  int min_icp_inliers_{500};
+  double min_icp_overlap_{0.03};
+  double max_icp_rmse_mm_{60.0};
+  double max_icp_trans_mm_{500.0};
+  double max_icp_rot_deg_{60.0};
+  double point_to_plane_trigger_mm_{10.0};
+  double point_to_plane_dmax_m_{0.010};
+  int point_to_plane_iterations_{6};
+  size_t point_to_plane_max_points_{80000};
   int speed_percent_{10};
 
   Mat4 X_{Mat4::Identity()};
   Mat4 X_inv_{Mat4::Identity()};
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pc_sub_;
-  rclcpp::Subscription<dobot_msgs_v4::msg::ToolVectorActual>::SharedPtr tool_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;
   rclcpp::CallbackGroup::SharedPtr pc_group_;
-  rclcpp::CallbackGroup::SharedPtr tool_group_;
   rclcpp::CallbackGroup::SharedPtr joint_group_;
   rclcpp::CallbackGroup::SharedPtr command_group_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
   rclcpp::Client<dobot_msgs_v4::srv::MovJ>::SharedPtr mov_j_;
+  rclcpp::Client<dobot_msgs_v4::srv::GetPose>::SharedPtr get_pose_;
+  rclcpp::Client<dobot_msgs_v4::srv::RobotMode>::SharedPtr robot_mode_;
+  rclcpp::Client<dobot_msgs_v4::srv::GetErrorID>::SharedPtr get_error_id_;
   rclcpp::Client<dobot_msgs_v4::srv::ServoP>::SharedPtr servo_p_;
   rclcpp::Client<dobot_msgs_v4::srv::Stop>::SharedPtr stop_;
   rclcpp::Client<dobot_msgs_v4::srv::ClearError>::SharedPtr clear_error_;
@@ -999,7 +1209,10 @@ private:
   rclcpp::Client<dobot_msgs_v4::srv::EnableRobot>::SharedPtr enable_robot_;
   rclcpp::Client<dobot_msgs_v4::srv::SpeedFactor>::SharedPtr speed_factor_;
   rclcpp::Client<dobot_msgs_v4::srv::SetCollisionLevel>::SharedPtr collision_;
+  rclcpp::Client<dobot_msgs_v4::srv::User>::SharedPtr user_;
+  rclcpp::Client<dobot_msgs_v4::srv::Tool>::SharedPtr tool_;
   rclcpp::TimerBase::SharedPtr servo_timer_;
+  rclcpp::TimerBase::SharedPtr pose_timer_;
 
   std::mutex pc_mtx_;
   Cloud latest_pc_;
@@ -1007,32 +1220,36 @@ private:
 
   std::mutex tool_mtx_;
   ToolPose latest_tool_;
+  std::deque<ToolPose> pose_history_;
 
   std::mutex joint_mtx_;
   JointPose latest_joint_;
 
   std::mutex template_mtx_;
-  std::vector<PyramidLevel> ref_pyramid_;
-  Mat4 T_base_tool_ref_{Mat4::Identity()};
-  Mat4 T_base_camera_ref_{Mat4::Identity()};
+  std::shared_ptr<const TemplateModel> ref_model_;
   std::atomic_bool template_ready_{false};
 
   std::mutex icp_mtx_;
   IcpResult latest_icp_;
   uint64_t icp_seq_counter_{0};
-  std::atomic<uint64_t> last_consumed_icp_seq_{0};
 
   std::atomic_bool running_{true};
+  std::atomic_bool robot_initialized_{false};
   std::atomic_bool servo_enabled_{false};
   std::atomic_bool servo_inflight_{false};
+  std::atomic_bool getpose_inflight_{false};
+  std::atomic_bool dashboard_inflight_{false};
+  std::atomic_bool stop_pending_{false};
+  std::atomic_bool diagnostics_pending_{false};
   std::atomic_bool joint_move_inflight_{false};
   std::atomic<int64_t> servo_inflight_since_ms_{0};
   std::atomic<int64_t> joint_move_since_ms_{0};
-  std::atomic<int> tool_msg_count_{0};
-  std::atomic<int> tool_drop_count_{0};
+  std::atomic<int> getpose_count_{0};
+  std::atomic<int> getpose_drop_count_{0};
   std::atomic<int> joint_msg_count_{0};
   std::atomic<int> joint_drop_count_{0};
   std::atomic<int> bad_icp_cycles_{0};
+  std::atomic<int> bad_pose_cycles_{0};
   std::atomic<int> missed_servo_cycles_{0};
 
   std::thread icp_thread_;
@@ -1044,7 +1261,7 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<ContinuousIcpServoNode>();
-  rclcpp::executors::MultiThreadedExecutor exec;
+  rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions(), 4);
   exec.add_node(node);
   exec.spin();
   rclcpp::shutdown();

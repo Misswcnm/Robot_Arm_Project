@@ -1,8 +1,11 @@
 apriltag_pick:
   ros__parameters:
     tag_frame: "tag36h11:0"
-    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/handeye_calib_runs/handeye_20260707_174738/handeye_chessboard_result.json"
-    tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260706_150548.json"
+    # 必须与 tags.yaml 的 AprilTag 黑色外框边长一致。
+    tag_size_m: 0.152
+    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/active_handeye_calibration.json"
+    tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260714_095024.json"
+    debug_output_dir: "/home/ylx/Robot_Arm_Project/scripts/apriltag_validation_runs"
     robot_speed: 15
 
     # 首次必须保持 false，只做 l 定位验证；确认坐标后再改 true。
@@ -14,7 +17,6 @@ apriltag_pick:
     min_base_z_mm: 20.0
     max_base_radius_mm: 850.0
     pregrasp_height_mm: 80.0
-    lift_height_mm: 100.0
 
     # Tag 到真实针尖的接触点偏移。
     # 工具姿态保持拖拽结束时的当前姿态，避免被 Tag 旋转带跑。
