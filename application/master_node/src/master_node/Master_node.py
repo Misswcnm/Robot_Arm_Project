@@ -274,6 +274,19 @@ class MasterNode:
         self.service_lookup_table['mechanical_arm/send_enable'] = self.send_mechanical_arm_enable
         self.service_lookup_table['mechanical_arm/send_disable'] = self.send_mechanical_arm_disable
         self.service_lookup_table['mechanical_arm/check_connection'] = self.check_mechanical_arm_connection
+        # ROS2 visual executor endpoints. They return accepted/task status and never wait for motion.
+        self.service_lookup_table['mechanical_arm/vision/request'] = self.vision_arm_request
+        self.service_lookup_table['mechanical_arm/vision/status'] = self.vision_arm_status
+        self.service_lookup_table['mechanical_arm/vision/cancel'] = self.vision_arm_cancel
+        self.service_lookup_table['mechanical_arm/vision/enable'] = self.vision_arm_enable
+        self.service_lookup_table['mechanical_arm/vision/disable'] = self.vision_arm_disable
+        self.service_lookup_table['mechanical_arm/vision/icp/record_a'] = lambda client: self.vision_arm_request_action(client, 'vision_icp_record_a')
+        self.service_lookup_table['mechanical_arm/vision/icp/record_b'] = lambda client: self.vision_arm_request_action(client, 'vision_icp_record_b')
+        self.service_lookup_table['mechanical_arm/vision/icp/align'] = lambda client: self.vision_arm_request_action(client, 'vision_icp_align')
+        self.service_lookup_table['mechanical_arm/vision/icp/align_move_b'] = lambda client: self.vision_arm_request_action(client, 'vision_icp_align_and_move_b')
+        self.service_lookup_table['mechanical_arm/vision/apriltag/locate'] = lambda client: self.vision_arm_request_action(client, 'apriltag_locate')
+        self.service_lookup_table['mechanical_arm/vision/apriltag/validate'] = lambda client: self.vision_arm_request_action(client, 'apriltag_validate')
+        self.service_lookup_table['mechanical_arm/vision/apriltag/pick'] = lambda client: self.vision_arm_request_action(client, 'apriltag_pick')
 
         self.service_lookup_table['param/update_param']=self.update_param
         self.service_lookup_table['param/get_param']=self.get_param
@@ -6951,6 +6964,73 @@ class MasterNode:
             print("[机械臂控制] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
                 
+    def vision_arm_request(self, client):
+        """Asynchronously submit a vision action to the local ROS2 executor."""
+        try:
+            request = json.loads(client.request.body.decode('utf-8'))
+            action = request.get('action')
+            if not action:
+                client.write(MasterNodeErrorCode.ErrorData('缺少vision action'))
+                return
+            controller = self.master_node_subscriber.mechanical_arm_controller
+            result = controller.execute_vision_action(
+                action, request.get('params', {}), request.get('request_id'),
+                request.get('timeout_sec', 120), request.get('dry_run', False))
+            if result.get('status') == 'failed':
+                client.write(MasterNodeErrorCode.ErrorData(result.get('message', 'vision request failed')))
+            else:
+                client.write(MasterNodeErrorCode.SuccessedData(result))
+        except Exception as e:
+            client.write(MasterNodeErrorCode.ErrorData('vision请求异常: {}'.format(str(e))))
+
+    def vision_arm_request_action(self, client, action):
+        """Convenience endpoint; body still controls params/request_id/dry_run."""
+        try:
+            request = json.loads(client.request.body.decode('utf-8')) if client.request.body else {}
+            request['action'] = action
+            # Inline submission avoids mutating Tornado's immutable request body.
+            result = self.master_node_subscriber.mechanical_arm_controller.execute_vision_action(
+                action, request.get('params', {}), request.get('request_id'),
+                request.get('timeout_sec', 120), request.get('dry_run', False))
+            if result.get('status') == 'failed':
+                client.write(MasterNodeErrorCode.ErrorData(result.get('message', 'vision request failed')))
+            else:
+                client.write(MasterNodeErrorCode.SuccessedData(result))
+        except Exception as e:
+            client.write(MasterNodeErrorCode.ErrorData('vision请求异常: {}'.format(str(e))))
+
+    def vision_arm_status(self, client):
+        try:
+            request = json.loads(client.request.body.decode('utf-8')) if client.request.body else {}
+            controller = self.master_node_subscriber.mechanical_arm_controller
+            request_id = request.get('request_id')
+            result = controller.get_vision_action_status(request_id) if request_id else controller.execute_vision_action('arm_status')
+            result['resource_lock'] = controller.get_resource_lock_status()
+            client.write(MasterNodeErrorCode.SuccessedData(result))
+        except Exception as e:
+            client.write(MasterNodeErrorCode.ErrorData('vision状态查询异常: {}'.format(str(e))))
+
+    def vision_arm_cancel(self, client):
+        try:
+            request = json.loads(client.request.body.decode('utf-8'))
+            request_id = request.get('request_id')
+            if not request_id:
+                client.write(MasterNodeErrorCode.ErrorData('缺少request_id'))
+                return
+            result = self.master_node_subscriber.mechanical_arm_controller.execute_vision_action(
+                'task_cancel', {'request_id':request_id}, 'cancel-'+str(request_id))
+            client.write(MasterNodeErrorCode.SuccessedData(result))
+        except Exception as e:
+            client.write(MasterNodeErrorCode.ErrorData('vision取消异常: {}'.format(str(e))))
+
+    def vision_arm_enable(self, client):
+        result = self.master_node_subscriber.mechanical_arm_controller.execute_vision_action('execution_enable')
+        client.write(MasterNodeErrorCode.SuccessedData(result))
+
+    def vision_arm_disable(self, client):
+        result = self.master_node_subscriber.mechanical_arm_controller.execute_vision_action('execution_disable')
+        client.write(MasterNodeErrorCode.SuccessedData(result))
+
     def check_mechanical_arm_connection(self, client):
         """
         检查机械臂TCP连接状态

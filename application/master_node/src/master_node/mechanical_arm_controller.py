@@ -23,6 +23,7 @@ import threading
 import time
 import struct
 from datetime import datetime
+from master_node.vision_arm_rpc import VisionArmRpcClient, MechanicalArmResourceLock
 # from typing import Optional, Dict, Any  # 注释掉类型注解导入以兼容低版本Python
 
 class MechanicalArmController:
@@ -70,6 +71,11 @@ class MechanicalArmController:
         # 点位数据缓存（用于批量写入）
         self.points_cache = []
         self.cache_lock = threading.Lock()
+        # NX and ROS2 vision actions share this process-local resource owner.
+        self.arm_resource_lock = MechanicalArmResourceLock()
+        self.vision_rpc = VisionArmRpcClient(
+            host=os.environ.get('VISION_ARM_RPC_HOST', '127.0.0.1'),
+            port=int(os.environ.get('VISION_ARM_RPC_PORT', '17881')))
         
         # 启动TCP连接
         self._start_tcp_connection()
@@ -1739,6 +1745,10 @@ class MechanicalArmController:
         Returns:
             bool: 是否成功触发机械臂动作
         """
+        request_lock_id = 'nx:{}:{}'.format(map_id, point_id)
+        if not self.arm_resource_lock.acquire('nx', request_lock_id):
+            print('[ERROR] 机械臂资源忙，当前owner: {}'.format(self.arm_resource_lock.status()))
+            return False
         try:
             # 添加详细的机械臂动作执行日志
             print("=== 机械臂动作执行开始 ===")
@@ -1829,10 +1839,37 @@ class MechanicalArmController:
             print("=== 机械臂动作执行异常 ===")
             return False
         finally:
+            self.arm_resource_lock.release(request_lock_id)
             with self.status_lock:
                 self.is_mechanical_arm_running = False
                 print("机械臂状态: 重置为空闲")
                 print("=== 机械臂动作执行结束 ===")
+
+    def execute_vision_action(self, action, params=None, request_id=None, timeout=120, dry_run=False):
+        """Submit a ROS2 vision action. Accepted is intentionally not success."""
+        request_id = request_id or 'vision-{}-{}'.format(action, int(time.time() * 1000))
+        motion = action not in ('health', 'arm_status', 'task_status', 'apriltag_locate')
+        if motion and not self.arm_resource_lock.acquire('vision', request_id):
+            return {'request_id':request_id, 'action':action, 'backend':'vision', 'status':'failed',
+                    'error_code':'busy', 'message':'NX or another vision task owns the mechanical arm'}
+        try:
+            result = self.vision_rpc.call(action, params or {}, request_id, timeout, dry_run)
+            # An accepted task keeps ownership until terminal state is later observed.
+            if result.get('status') in ('succeeded','failed','timeout','cancelled'):
+                self.arm_resource_lock.release(request_id)
+            return result
+        except Exception as e:
+            self.arm_resource_lock.release(request_id)
+            return {'request_id':request_id, 'action':action, 'backend':'vision', 'status':'failed', 'error_code':'rpc_error', 'message':safe_str(e)}
+
+    def get_vision_action_status(self, request_id):
+        result = self.vision_rpc.call('task_status', {'request_id':request_id}, request_id='query-'+str(request_id))
+        if result.get('status') in ('succeeded','failed','timeout','cancelled'):
+            self.arm_resource_lock.release(request_id)
+        return result
+
+    def get_resource_lock_status(self):
+        return self.arm_resource_lock.status()
     
     def _wait_for_completion(self, timeout=200):
         """

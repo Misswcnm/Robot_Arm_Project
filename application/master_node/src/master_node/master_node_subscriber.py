@@ -1497,6 +1497,29 @@ class MasterNodeSubscriber():
         try:
             print("=== 机械臂动作请求 ===")
             print("原始消息: {}".format(msg.data))
+            # New explicit JSON contract. Keep the legacy "map_id|point_id" route below unchanged.
+            if msg.data.strip().startswith('{'):
+                request = safe_json_loads(msg.data)
+                if not request:
+                    rospy.logerr('机械臂JSON请求解析失败')
+                    return
+                backend = request.get('backend', 'nx')
+                if backend == 'vision':
+                    action = request.get('action')
+                    if not action:
+                        rospy.logerr('vision机械臂请求缺少action')
+                        return
+                    result = self.mechanical_arm_controller.execute_vision_action(
+                        action=action, params=request.get('params', {}),
+                        request_id=request.get('request_id'), timeout=request.get('timeout_sec', 120),
+                        dry_run=request.get('dry_run', False))
+                    rospy.loginfo('vision机械臂请求结果: %s', result)
+                    return
+                if backend != 'nx':
+                    rospy.logerr('未知机械臂backend: %s', backend)
+                    return
+                # NX JSON remains explicitly routed to the old map/pose protocol.
+                msg.data = '{}|{}'.format(request.get('map_id', ''), request.get('point_id', ''))
             
             # 解析消息格式: "map_id|point_id"
             if "|" in msg.data:
