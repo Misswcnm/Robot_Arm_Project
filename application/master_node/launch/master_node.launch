@@ -11,7 +11,10 @@
         <!-- 可以在这里添加其他参数 -->
     </node>
     
-    <!-- MechanicalArmController is constructed by MasterNodeSubscriber.
-         Do not launch mechanical_arm_controller.py separately: it is a library
-         module, not an executable ROS node. -->
+    <!-- 启动机械臂控制器 -->
+    <node pkg="master_node" type="mechanical_arm_controller.py" respawn="false" name="mechanical_arm_controller" output="screen">
+        <!-- 机械臂控制器参数 -->
+        <param name="nx_host" value="192.168.2.103" />
+        <param name="nx_port" value="8888" />
+    </node>
 </launch>
