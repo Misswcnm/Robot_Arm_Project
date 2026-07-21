@@ -36,7 +36,8 @@ For a wired request, every message also carries the configured token:
 
 Responses use `accepted`, `running`, `succeeded`, `failed`, `timeout`, or `cancelled`.
 `accepted` only means the task entered the queue. Query it with `task_status` and the original
-request id. Run `execution_enable` explicitly before a non-dry-run movement action.
+request id. Each TCP connection handles one request and then closes; long-task polling opens a
+new connection. Run `execution_enable` explicitly before a non-dry-run movement action.
 
 Runtime records are atomically saved under `data/vision_arm` by default. ICP A stores a versioned
 compressed point-cloud template; B binds to that exact A record, template checksum and hand-eye

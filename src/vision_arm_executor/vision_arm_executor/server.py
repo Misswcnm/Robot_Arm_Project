@@ -80,6 +80,14 @@ class JsonLineServer:
                     request = decode_line(line, self.max_bytes)
                     self._authenticate(request)
                     client.sendall(encode_line(self.handler(request)))
+                    # One request per connection keeps the ROS1/Python2 client
+                    # and command-line nc workflow deterministic. Long tasks
+                    # return accepted and are queried through task_status on a
+                    # new connection.
+                    return
+        except socket.timeout:
+            # Idle connection expiry is a transport close, not a task failure.
+            return
         except Exception as error:
             try:
                 client.sendall(encode_line({
