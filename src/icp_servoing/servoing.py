@@ -9,7 +9,11 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   → MovJ(x,y,z,rx,ry,rz)                 (控制器笛卡尔点到点)
     失败/未到位时 → Jacobian IK → JointMovJ 兜底
 """
-import time, rclpy
+import os
+import tempfile
+import time
+
+import rclpy
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
@@ -41,6 +45,7 @@ class VisualServo:
         self.point_to_plane_iters = 6
         self.point_to_plane_max_points = 80000
         self._cartesian_movj_disabled = False
+        self.last_align_result = {}
 
     # ── Quality gate ──
     @staticmethod
@@ -226,6 +231,56 @@ class VisualServo:
         print(f'✅ 模板OK  xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}]')
         return True
 
+    def save_template(self, path: str) -> str:
+        """原子保存ICP模板，使执行器重启后仍能回归点A。"""
+        if not self._ref_pyramid or self._T_base_tool_ref is None:
+            raise RuntimeError('ICP模板尚未录制')
+        folder = os.path.dirname(os.path.abspath(path))
+        os.makedirs(folder, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix='.icp-template-', suffix='.npz', dir=folder)
+        os.close(fd)
+        try:
+            np.savez_compressed(
+                temporary,
+                ref_0=self._ref_pyramid[0][0],
+                ref_1=self._ref_pyramid[1][0],
+                ref_2=self._ref_pyramid[2][0],
+                p2_points=self._p2plane_ref[0],
+                p2_normals=self._p2plane_ref[2],
+                T_base_tool_ref=self._T_base_tool_ref,
+                T_base_camera_ref=self._T_base_camera_ref,
+                voxel_sizes=np.asarray(
+                    [level[2] for level in self._ref_pyramid], dtype=float))
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return path
+
+    def load_template(self, path: str) -> bool:
+        """加载 save_template 保存的模板并重建KDTree。"""
+        from scipy.spatial import cKDTree
+
+        with np.load(path, allow_pickle=False) as saved:
+            voxel_sizes = saved['voxel_sizes']
+            self._ref_pyramid = []
+            for index, voxel_size in enumerate(voxel_sizes):
+                points = np.asarray(saved[f'ref_{index}'], dtype=float)
+                self._ref_pyramid.append(
+                    (points, cKDTree(points), float(voxel_size)))
+            p2_points = np.asarray(saved['p2_points'], dtype=float)
+            p2_normals = np.asarray(saved['p2_normals'], dtype=float)
+            self._p2plane_ref = (
+                p2_points, cKDTree(p2_points), p2_normals)
+            self._T_base_tool_ref = np.asarray(
+                saved['T_base_tool_ref'], dtype=float)
+            self._T_base_camera_ref = np.asarray(
+                saved['T_base_camera_ref'], dtype=float)
+        self._last_tool = None
+        self._stable_count = 0
+        return True
+
     def _get_tool_matrix(self) -> np.ndarray | None:
         """GetPose → 4x4 SE3. 跳变>200mm时拒绝, 用上次有效值."""
         tool = self.robot.get_tool()
@@ -256,12 +311,17 @@ class VisualServo:
         return None
 
     # ── One iteration of ICP + compensation ──
-    def step(self) -> dict:
+    def step(self, should_stop=None) -> dict:
         """
         一次闭环: 采点云 → ICP → 质量门控 → 补偿移动.
         返回: {'ok', 'T_icp', 'rmse', 'overlap', 'delta_tool_mm', 'converged'}
         """
         out = {'ok': False, 'converged': False}
+
+        if should_stop is not None and should_stop():
+            out['error'] = '任务已取消或超时'
+            out['cancelled'] = True
+            return out
 
         if self._ref_pyramid is None:
             out['error'] = '未录制模板 (按 r)'
@@ -421,6 +481,12 @@ class VisualServo:
             return out
         self._stable_count = 0
 
+        # ICP计算与真实运动之间的安全取消点。
+        if should_stop is not None and should_stop():
+            out['error'] = '任务已取消或超时，未发送本轮运动'
+            out['cancelled'] = True
+            return out
+
         # 5. 100% 全量补偿，不做末端比例缩放或单步限幅
         self._step_count += 1
         mode = '全量'
@@ -433,6 +499,16 @@ class VisualServo:
         T_target = T_cur @ T_correction
         dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
         out['delta_mm'] = [round(v,1) for v in dp]
+
+        # 上层执行器在每次真实运动前检查取消、超时、工作空间和位姿增量。
+        motion_guard = getattr(self, 'motion_guard', None)
+        if motion_guard is not None:
+            try:
+                motion_guard(T_target)
+            except Exception as exc:
+                out['error'] = f'运动安全检查拒绝: {exc}'
+                print(f'  ❌ {out["error"]}')
+                return out
 
         pre_move = self.robot.get_tool()
         print(f'  {mode}补偿 100% (step{self._step_count}, 不限幅): '
@@ -507,17 +583,28 @@ class VisualServo:
         print(f'  ❌ {out["error"]}')
         return out
 
-    def align(self, max_iters: int = 15) -> bool:
+    def align(self, max_iters: int = 15, should_stop=None,
+              progress_callback=None) -> bool:
         print(f'\n{"="*55}\n  闭环对齐 (最多{max_iters}次)\n{"="*55}')
         self._step_count = 0
         self._stable_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
         self._cartesian_movj_disabled = False
+        self.last_align_result = {
+            'converged': False, 'iterations': 0, 'reason': ''}
         i = 0
         while i < max_iters:
+            if should_stop is not None and should_stop():
+                self.last_align_result.update(
+                    iterations=i, reason='cancelled_or_timeout')
+                return False
             i += 1
             print(f'\n  [{i}/{max_iters}]')
-            result = self.step()
+            result = self.step(should_stop=should_stop)
+            self.last_align_result = dict(result)
+            self.last_align_result['iterations'] = i
+            if progress_callback is not None:
+                progress_callback(i, max_iters, result)
             if result.get('converged'):
                 pose_msg = ''
                 if 'pose_error_mm' in result:
@@ -525,12 +612,24 @@ class VisualServo:
                                 f'  {result.get("pose_error_deg", 0):.2f}°')
                 print(f'\n✅ 闭环收敛 ({i}次)  共补偿 {self._total_dp/10:.1f}cm  '
                       f'{self._total_dr:.1f}°{pose_msg}')
+                self.last_align_result.update(
+                    converged=True, reason='icp_residual_converged',
+                    total_translation_mm=float(self._total_dp),
+                    total_rotation_deg=float(self._total_dr))
                 return True
+            if result.get('cancelled'):
+                self.last_align_result['reason'] = 'cancelled_or_timeout'
+                return False
             if result['ok']:
                 continue  # 成功, 下一轮
             # 失败: 直接重试(从当前位姿重新ICP)
             print(f'  ↻ 本轮失败后重试 (从当前位姿)')
         print(f'\n⚠ 达最大迭代次数({max_iters})  共补偿 {self._total_dp/10:.1f}cm  {self._total_dr:.1f}°')
+        self.last_align_result.update(
+            converged=False, iterations=max_iters,
+            reason='max_iterations',
+            total_translation_mm=float(self._total_dp),
+            total_rotation_deg=float(self._total_dr))
         return False
 
 

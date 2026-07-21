@@ -2,6 +2,10 @@ vision_arm_executor:
   ros__parameters:
     rpc_host: "127.0.0.1"
     rpc_port: 17881
+    # 小车跨机调用时改为本机有线网卡IP，并只放行小车IP/32。
+    rpc_allowed_clients: ["127.0.0.1/32"]
+    # 监听非回环地址时必须通过启动参数覆盖为强随机值。
+    rpc_auth_token: ""
     data_dir: "~/Robot_Arm_Project/data/vision_arm"
     handeye_path: "~/Robot_Arm_Project/scripts/active_handeye_calibration.json"
     tcp_calibration_path: "~/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260714_095024.json"
@@ -10,9 +14,36 @@ vision_arm_executor:
     socket_timeout_sec: 5.0
     task_ttl_sec: 3600.0
     apriltag_cache_ttl_sec: 60.0
+    apriltag_max_robot_drift_mm: 10.0
+    apriltag_max_robot_drift_deg: 3.0
     max_move_translation_mm: 300.0
     max_move_rotation_deg: 45.0
     workspace_min_xyz_mm: [-850.0, -850.0, 20.0]
     workspace_max_xyz_mm: [850.0, 850.0, 1200.0]
     icp_frames: 5
     icp_max_iters: 30
+
+# AprilTagPickNode is hosted inside the executor process but remains a separate
+# ROS2 node, so its parameters must be present in the same parameter file.
+apriltag_pick:
+  ros__parameters:
+    tag_frame: "tag36h11:0"
+    tag_size_m: 0.152
+    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/active_handeye_calibration.json"
+    tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260714_095024.json"
+    debug_output_dir: "/home/ylx/Robot_Arm_Project/scripts/apriltag_validation_runs"
+    robot_speed: 15
+    # Only vision_arm_executor.execution_enable may temporarily enable pick.
+    execute_enabled: false
+    samples: 10
+    sample_window_sec: 2.0
+    max_detection_age_sec: 1.0
+    max_sample_spread_mm: 8.0
+    min_base_z_mm: 20.0
+    max_base_radius_mm: 850.0
+    pregrasp_height_mm: 80.0
+    tag_to_tcp.xyz_mm: [0.0, 0.0, 0.0]
+    tag_to_tcp.rpy_deg: [180.0, 0.0, 0.0]
+    gripper.enabled: false
+    gripper.index: 1
+    gripper.active_high: true

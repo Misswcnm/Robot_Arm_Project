@@ -849,7 +849,7 @@ class AprilTagPickNode(Node):
         retracted[:3, 3] -= axis_base * float(distance_mm)
         return retracted
 
-    def pick(self):
+    def pick(self, safety_check=None):
         if self.last_localization is None:
             raise RuntimeError('没有缓存目标；请先按 l 定位')
         target = self.last_localization['base_flange_target'].copy()
@@ -858,6 +858,8 @@ class AprilTagPickNode(Node):
         print(f'[p#{self.last_localization["index"]}] 使用缓存目标 '
               f'{target[:3, 3].round(2).tolist()}mm')
         pregrasp = self.retract_pose(target, self.pregrasp_height)
+        if safety_check is not None:
+            safety_check('before_pregrasp', pregrasp)
         if self.gripper_enabled and not self.robot.set_gripper(
                 False, self.gripper_index, self.gripper_active_high):
             raise RuntimeError('夹爪打开失败')
@@ -866,6 +868,8 @@ class AprilTagPickNode(Node):
         # The base-frame target is locked from the first observation. An
         # eye-in-hand camera commonly loses/occludes the tag near contact, so
         # the contact move must not depend on a second detection.
+        if safety_check is not None:
+            safety_check('before_contact', target)
         if not self.robot.move_pose(target):
             raise RuntimeError('抓取位姿失败')
         if self.gripper_enabled and not self.robot.set_gripper(

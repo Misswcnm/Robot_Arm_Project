@@ -31,7 +31,10 @@ case "$ACTION" in
     ros2 run vision_arm_executor vision_arm_executor --ros-args \
       --params-file "$ROOT_DIR/src/vision_arm_executor/config/executor.yaml"
     ;;
+  all)
+    exec "$ROOT_DIR/scripts/start_local_robot_arm_stack.sh" "${@:2}"
+    ;;
   *)
-    echo "usage: $0 {check|build|vision}" >&2; exit 2
+    echo "usage: $0 {check|build|vision|all}" >&2; exit 2
     ;;
 esac

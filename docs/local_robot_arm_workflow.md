@@ -43,8 +43,23 @@ cp config/local_robot_arm.env.example config/local_robot_arm.env
 按原项目方式分别启动 CR5 驱动、D455 相机和 AprilTag 检测，然后启动执行器：
 
 ```bash
-./scripts/local_robot_arm.sh vision
+# 先打印即将执行的命令，不启动任何节点
+./scripts/local_robot_arm.sh all --dry-run
+
+# 现场确认急停、机械臂工作区和IP后，一键启动全部本地栈
+./scripts/local_robot_arm.sh all
 ```
+
+一键脚本启动 CR5 ROS2 驱动、RealSense 点云、步进电机、AprilTag
+检测器和 `vision_arm_executor`。如果只需要用户指定的三个硬件命令：
+
+```bash
+./scripts/local_robot_arm.sh all --hardware-only
+```
+
+小车与本机分开运行时，将 `VISION_RPC_HOST` 设为本机有线网卡 IP，
+`VEHICLE_IP` 设为小车 IP，并配置强随机 `VISION_RPC_AUTH_TOKEN`。RPC 只放行
+`VEHICLE_IP/32`；不建议监听无限制的公共网卡。
 
 执行器启动后仍是 `execution_enabled=false`。先做健康检查与 dry-run；只有完成 ICP/AprilTag
 质量验证、工作空间确认和现场安全确认后，才可以显式请求 `execution_enable`。

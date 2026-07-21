@@ -10,7 +10,7 @@ class FakeRobot(object):
  def get_tool(self,**kw): return [0,0,100,0,0,0]
 class ExecutorTests(unittest.TestCase):
  def make(self):
-  cfg={'data_dir':tempfile.mkdtemp(),'robot_speed':15,'workspace_min_xyz_mm':[-1e3]*3,'workspace_max_xyz_mm':[1e3]*3,'max_move_translation_mm':300,'max_move_rotation_deg':45,'icp_frames':2,'icp_max_iters':1,'apriltag_cache_ttl_sec':1,'handeye_path':'/dev/null'}
+  cfg={'data_dir':tempfile.mkdtemp(),'robot_speed':15,'workspace_min_xyz_mm':[-1e3]*3,'workspace_max_xyz_mm':[1e3]*3,'max_move_translation_mm':300,'max_move_rotation_deg':45,'icp_frames':2,'icp_max_iters':1,'apriltag_cache_ttl_sec':1,'apriltag_max_robot_drift_mm':10,'apriltag_max_robot_drift_deg':3,'handeye_path':'/dev/null','tcp_calibration_path':'/dev/null'}
   return VisionExecutor(None,cfg,robot_factory=lambda *a:FakeRobot())
  def test_enable_does_not_survive_new_executor(self):
   e=self.make(); self.assertFalse(e.execution_enabled); self.assertEqual('succeeded',e.submit({'request_id':'x','action':'execution_enable','params':{},'timeout_sec':1,'dry_run':False})['status']); self.assertTrue(e.execution_enabled); self.assertFalse(self.make().execution_enabled)
@@ -22,3 +22,14 @@ class ExecutorTests(unittest.TestCase):
   e=self.make(); r=e.submit({'request_id':'b','action':'vision_icp_record_a','params':{},'timeout_sec':1,'dry_run':False});
   # The asynchronous worker must fail closed before it can operate the CR5.
   import time; time.sleep(.02); self.assertEqual('failed',e.tasks['b']['status'])
+ def test_busy_request_is_idempotently_recorded(self):
+  e=self.make(); e.owner='running'
+  req={'request_id':'busy','action':'apriltag_locate','params':{},'timeout_sec':1,'dry_run':False}
+  first=e.submit(req); second=e.submit(req)
+  self.assertEqual('busy',first['error_code']); self.assertEqual(first,second)
+ def test_dry_run_record_does_not_replace_active_a(self):
+  e=self.make(); req={'request_id':'dry','action':'vision_icp_record_a','params':{},'timeout_sec':1,'dry_run':True}
+  e.submit(req)
+  import time; time.sleep(.02)
+  self.assertEqual('succeeded',e.tasks['dry']['status'])
+  self.assertFalse(__import__('os').path.exists(__import__('os').path.join(e.root,'icp_a.json')))
