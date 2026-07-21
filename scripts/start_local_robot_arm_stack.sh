@@ -58,6 +58,11 @@ for package in "${required_packages[@]}"; do
   fi
 done
 ros2 pkg executables step_motor | grep -q '^step_motor motor_node$'
+if ! python3 -c "import icp_servoing, apriltag_pick, vision_arm_executor"; then
+  echo "ROS2 visual Python modules are not importable." >&2
+  echo "Run: ./scripts/local_robot_arm.sh build" >&2
+  exit 1
+fi
 
 declare -a CHILD_PIDS=()
 STOPPING=false

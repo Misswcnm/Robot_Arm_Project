@@ -10,6 +10,13 @@ source_ros2() {
   set -u
 }
 
+source_workspace() {
+  # Colcon setup files read optional tracing variables before defining them.
+  set +u
+  source "$ROOT_DIR/install/setup.bash"
+  set -u
+}
+
 case "$ACTION" in
   check)
     source_ros2
@@ -24,10 +31,13 @@ case "$ACTION" in
     cd "$ROOT_DIR"
     colcon build --base-paths src/icp_servoing src/apriltag_pick src/vision_arm_executor \
       --packages-select icp_servoing apriltag_pick vision_arm_executor
+    source_workspace
+    python3 -c "import icp_servoing, apriltag_pick, vision_arm_executor"
+    echo "ROS2 visual packages built and importable."
     ;;
   vision)
     source_ros2
-    source "$ROOT_DIR/install/setup.bash"
+    source_workspace
     ros2 run vision_arm_executor vision_arm_executor --ros-args \
       --params-file "$ROOT_DIR/src/vision_arm_executor/config/executor.yaml"
     ;;

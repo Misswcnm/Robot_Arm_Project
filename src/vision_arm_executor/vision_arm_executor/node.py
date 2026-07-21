@@ -75,8 +75,16 @@ class ExecutorNode(Node):
                 self.cfg['rpc_allowed_clients']))
 
     def _pc(self, message):
-        from icp_servoing.pointcloud import cloud_to_xyz
-        self.latest_pc = cloud_to_xyz(message)
+        try:
+            from icp_servoing.pointcloud import cloud_to_xyz
+            points = cloud_to_xyz(message)
+        except Exception as error:
+            # A malformed/transitional camera frame must not terminate the
+            # executor and tear down the complete one-key stack.
+            self.get_logger().error(
+                'PointCloud2 conversion failed; frame skipped: %s' % error)
+            return
+        self.latest_pc = points
         self.pc_seq += 1
 
     def wait_fresh(self, timeout=2.0):
