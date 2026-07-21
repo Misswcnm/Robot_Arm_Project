@@ -166,12 +166,19 @@ class VisionExecutor:
         metrics = self._owner_metrics()
         try:
             robot = self._robot(initialize=False)
-            metrics.update({
-                'robot_mode': self._robot_mode(robot),
-                'pose': robot.get_tool(warn=False),
-            })
+            robot_mode = self._robot_mode(robot)
+            pose = robot.get_tool(warn=False)
+            metrics.update({'robot_mode': robot_mode, 'pose': pose})
+            if robot_mode is None or pose is None:
+                return self.response(
+                    request_id, action, 'failed',
+                    'CR5 RobotMode/GetPose unavailable', 'robot_unavailable',
+                    metrics=metrics)
         except Exception as error:
             metrics['robot_error'] = str(error)
+            return self.response(
+                request_id, action, 'failed', str(error),
+                'robot_unavailable', metrics=metrics)
         return self.response(
             request_id, action, 'succeeded', 'status read', metrics=metrics)
 
@@ -518,6 +525,12 @@ class VisionExecutor:
                     'AprilTag cached target passed dry-run',
                     metrics={'cache_record_id': cache['record_id'],
                              'tag_id': cache['tag_id'], 'dry_run': True})
+            if not self.execution_enabled:
+                raise RuntimeError('execution_disabled')
+            # Only a real pick after explicit execution_enable may change the
+            # controller state. initialize() performs the standard safe
+            # ClearError/Disable/Enable/Speed/Collision/User0/Tool0 sequence.
+            tag.robot.initialize()
             self._check_tag_robot_drift(tag, cache)
             self._sync_tag_execution(True)
             tag.last_localization = self._restore_localization(

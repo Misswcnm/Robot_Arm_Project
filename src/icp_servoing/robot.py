@@ -1,4 +1,5 @@
 """CR5 robot interface: init, movj, GetPose, wait_stop."""
+import threading
 import time
 import numpy as np
 import rclpy
@@ -40,8 +41,16 @@ class CR5Robot:
 
     def _call(self, client, req, timeout=10.0):
         fut = client.call_async(req)
-        # spin_until_future_complete: ROS2标准方式, 比手写spin_once循环高效
-        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=timeout)
+        # vision_arm_executor already owns this node in a MultiThreadedExecutor;
+        # trying to spin the same node again makes valid service replies appear
+        # as timeouts. Standalone icp_servoing still needs local spinning.
+        if getattr(self._node, 'executor', None) is not None:
+            completed = threading.Event()
+            fut.add_done_callback(lambda unused: completed.set())
+            completed.wait(timeout)
+        else:
+            rclpy.spin_until_future_complete(
+                self._node, fut, timeout_sec=timeout)
         if not fut.done():
             fut.cancel()
             return False, 'timeout'

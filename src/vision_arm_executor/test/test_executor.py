@@ -21,6 +21,12 @@ class ExecutorTests(unittest.TestCase):
   result=e.submit(req)
   self.assertEqual('succeeded',result['status'])
   self.assertEqual(0,e.robot.init_calls)
+ def test_arm_status_fails_when_feedback_is_unavailable(self):
+  e=self.make(); robot=FakeRobot(); robot.get_mode=lambda:None; robot.get_tool=lambda **kw:None; e.robot=robot
+  req={'request_id':'missing-status','action':'arm_status','params':{},'timeout_sec':1,'dry_run':False}
+  result=e.submit(req)
+  self.assertEqual('failed',result['status'])
+  self.assertEqual('robot_unavailable',result['error_code'])
  def test_cancel_unknown(self):
   e=self.make(); r=e.submit({'request_id':'c','action':'task_cancel','params':{'request_id':'none'},'timeout_sec':1,'dry_run':False}); self.assertEqual('failed',r['status'])
  def test_motion_is_rejected_until_explicit_enable(self):
