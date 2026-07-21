@@ -42,7 +42,8 @@ if [[ "$HARDWARE_ONLY" == false && "$VISION_RPC_HOST" != "127.0.0.1" && -z "$VIS
 fi
 
 ROS_LOG_DIR="${ROS_LOG_DIR:-$PROJECT_DIR/.runtime/roslog}"
-export ROS_LOG_DIR IP_address DOBOT_TYPE
+export ROS_LOG_DIR IP_address DOBOT_TYPE VISION_RPC_HOST VEHICLE_IP
+export VISION_RPC_AUTH_TOKEN
 mkdir -p "$ROS_LOG_DIR"
 
 required_packages=(cr_robot_ros2 realsense2_camera step_motor)
@@ -108,10 +109,7 @@ if [[ "$HARDWARE_ONLY" == false ]]; then
       --params-file "$PROJECT_DIR/src/apriltag_pick/config/tags.yaml"
   start_component VisionExecutor \
     ros2 run vision_arm_executor vision_arm_executor --ros-args \
-      --params-file "$PROJECT_DIR/src/vision_arm_executor/config/executor.yaml" \
-      -p "rpc_host:=$VISION_RPC_HOST" \
-      -p "rpc_allowed_clients:=['$VEHICLE_IP/32']" \
-      -p "rpc_auth_token:=$VISION_RPC_AUTH_TOKEN"
+      --params-file "$PROJECT_DIR/src/vision_arm_executor/config/executor.yaml"
 fi
 
 if [[ "$DRY_RUN" == true ]]; then

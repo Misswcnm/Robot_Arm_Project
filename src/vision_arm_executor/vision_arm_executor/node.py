@@ -1,3 +1,4 @@
+import os
 import time
 
 import rclpy
@@ -39,6 +40,18 @@ class ExecutorNode(Node):
         self.cfg = {
             key: self.declare_parameter(key, value).value
             for key, value in defaults.items()}
+        # Network settings are operational secrets/configuration. Environment
+        # overrides avoid ROS2 CLI/YAML parsing failures for empty or special
+        # token values and keep the token out of the process command line.
+        rpc_host = os.environ.get('VISION_RPC_HOST', '').strip()
+        vehicle_ip = os.environ.get('VEHICLE_IP', '').strip()
+        rpc_token = os.environ.get('VISION_RPC_AUTH_TOKEN', '')
+        if rpc_host:
+            self.cfg['rpc_host'] = rpc_host
+        if vehicle_ip:
+            self.cfg['rpc_allowed_clients'] = [vehicle_ip + '/32']
+        if rpc_token:
+            self.cfg['rpc_auth_token'] = rpc_token
         self.latest_pc = None
         self.pc_seq = 0
         self.create_subscription(
@@ -56,8 +69,10 @@ class ExecutorNode(Node):
             auth_token=self.cfg['rpc_auth_token'])
         self.server.start()
         self.get_logger().info(
-            'vision RPC listening on %s:%s; execution disabled' %
-            (self.cfg['rpc_host'], self.cfg['rpc_port']))
+            'vision RPC listening on %s:%s; allowed_clients=%s; '
+            'execution disabled' % (
+                self.cfg['rpc_host'], self.cfg['rpc_port'],
+                self.cfg['rpc_allowed_clients']))
 
     def _pc(self, message):
         from icp_servoing.pointcloud import cloud_to_xyz
