@@ -49,6 +49,7 @@ class VisionExecutor:
         self.servo_factory = servo_factory
         self.tag_factory = tag_factory
         self.robot = None
+        self.robot_initialized = False
         self.servo = None
         self.tag = None
         os.makedirs(self.root, exist_ok=True)
@@ -164,7 +165,7 @@ class VisionExecutor:
     def _status(self, request_id, action):
         metrics = self._owner_metrics()
         try:
-            robot = self._robot()
+            robot = self._robot(initialize=False)
             metrics.update({
                 'robot_mode': self._robot_mode(robot),
                 'pose': robot.get_tool(warn=False),
@@ -239,7 +240,7 @@ class VisionExecutor:
             getter = getattr(robot, 'get_robot_mode')
         return getter()
 
-    def _robot(self):
+    def _robot(self, initialize=True):
         if self.robot is None:
             if self.robot_factory:
                 self.robot = self.robot_factory(
@@ -248,9 +249,11 @@ class VisionExecutor:
                 from icp_servoing.robot import CR5Robot
                 self.robot = CR5Robot(
                     self.node, speed=int(self.cfg['robot_speed']))
+        if initialize and not self.robot_initialized:
             initialized = self.robot.init()
             if initialized is False:
                 raise RuntimeError('CR5 initialization failed')
+            self.robot_initialized = True
         return self.robot
 
     def _servo(self):

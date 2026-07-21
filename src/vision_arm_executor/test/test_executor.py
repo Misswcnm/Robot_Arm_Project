@@ -4,8 +4,8 @@ from vision_arm_executor.executor import VisionExecutor
 
 class FakeRobot(object):
  MODE_ENABLED=5; MODE_BACKDRIVE=6
- def __init__(self,*a): self.dragging=False
- def init(self): return True
+ def __init__(self,*a): self.dragging=False; self.init_calls=0
+ def init(self): self.init_calls+=1; return True
  def get_mode(self): return 5
  def get_tool(self,**kw): return [0,0,100,0,0,0]
 class ExecutorTests(unittest.TestCase):
@@ -16,6 +16,11 @@ class ExecutorTests(unittest.TestCase):
   e=self.make(); self.assertFalse(e.execution_enabled); self.assertEqual('succeeded',e.submit({'request_id':'x','action':'execution_enable','params':{},'timeout_sec':1,'dry_run':False})['status']); self.assertTrue(e.execution_enabled); self.assertFalse(self.make().execution_enabled)
  def test_request_id_idempotent(self):
   e=self.make(); req={'request_id':'same','action':'health','params':{},'timeout_sec':1,'dry_run':False}; self.assertEqual(e.submit(req),e.submit(req))
+ def test_arm_status_does_not_initialize_or_enable_robot(self):
+  e=self.make(); req={'request_id':'status','action':'arm_status','params':{},'timeout_sec':1,'dry_run':False}
+  result=e.submit(req)
+  self.assertEqual('succeeded',result['status'])
+  self.assertEqual(0,e.robot.init_calls)
  def test_cancel_unknown(self):
   e=self.make(); r=e.submit({'request_id':'c','action':'task_cancel','params':{'request_id':'none'},'timeout_sec':1,'dry_run':False}); self.assertEqual('failed',r['status'])
  def test_motion_is_rejected_until_explicit_enable(self):

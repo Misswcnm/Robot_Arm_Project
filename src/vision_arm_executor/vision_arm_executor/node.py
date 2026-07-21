@@ -49,7 +49,14 @@ class ExecutorNode(Node):
         if rpc_host:
             self.cfg['rpc_host'] = rpc_host
         if vehicle_ip:
-            self.cfg['rpc_allowed_clients'] = [vehicle_ip + '/32']
+            allowed_clients = ['127.0.0.1/32']
+            if self.cfg['rpc_host'] not in (
+                    '127.0.0.1', 'localhost', '0.0.0.0', '::1'):
+                allowed_clients.append(self.cfg['rpc_host'] + '/32')
+            if vehicle_ip not in ('127.0.0.1', '::1'):
+                allowed_clients.append(vehicle_ip + '/32')
+            self.cfg['rpc_allowed_clients'] = list(dict.fromkeys(
+                allowed_clients))
         if rpc_token:
             self.cfg['rpc_auth_token'] = rpc_token
         self.latest_pc = None
