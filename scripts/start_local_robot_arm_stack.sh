@@ -91,7 +91,10 @@ start_component() {
   if [[ "$DRY_RUN" == true ]]; then
     return
   fi
-  "$@" &
+  # Give every ros2 wrapper and the node/launch processes below it one process
+  # group.  Signalling only the wrapper can otherwise orphan a Python node
+  # (notably the NX gateway) and leave its TCP port falsely looking healthy.
+  setsid -- "$@" &
   CHILD_PIDS+=("$!")
 }
 
@@ -102,7 +105,12 @@ stop_children() {
   STOPPING=true
   if ((${#CHILD_PIDS[@]})); then
     echo "Stopping local robot-arm stack..."
-    kill -INT "${CHILD_PIDS[@]}" 2>/dev/null || true
+    local pid
+    for pid in "${CHILD_PIDS[@]}"; do
+      # Background jobs may inherit SIGINT as ignored from a non-interactive
+      # shell. SIGTERM is handled by ROS and also reliably stops Python nodes.
+      kill -TERM -- "-$pid" 2>/dev/null || true
+    done
     wait "${CHILD_PIDS[@]}" 2>/dev/null || true
   fi
 }
