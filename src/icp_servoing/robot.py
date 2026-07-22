@@ -3,6 +3,7 @@ import threading
 import time
 import numpy as np
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as Rot
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
@@ -17,22 +18,31 @@ class CR5Robot:
         self._node = node
         self._speed = speed
         self._logger = node.get_logger()
+        # PointCloud2 conversion runs on this node's default callback group.
+        # Keep dashboard service replies in their own serialized group so a
+        # stream of camera callbacks cannot starve RobotMode/GetPose futures.
+        self._service_group = MutuallyExclusiveCallbackGroup()
 
-        self.ClearError   = node.create_client(ClearError,   '/dobot_bringup_ros2/srv/ClearError')
-        self.ResetRobot   = node.create_client(ResetRobot,   '/dobot_bringup_ros2/srv/ResetRobot')
-        self.DisableRobot = node.create_client(DisableRobot, '/dobot_bringup_ros2/srv/DisableRobot')
-        self.EnableRobot  = node.create_client(EnableRobot,  '/dobot_bringup_ros2/srv/EnableRobot')
-        self.MovJ         = node.create_client(MovJ,         '/dobot_bringup_ros2/srv/MovJ')
-        self.SpeedFactor  = node.create_client(SpeedFactor,  '/dobot_bringup_ros2/srv/SpeedFactor')
-        self.SetCollision = node.create_client(SetCollisionLevel, '/dobot_bringup_ros2/srv/SetCollisionLevel')
-        self.RobotMode    = node.create_client(RobotMode,    '/dobot_bringup_ros2/srv/RobotMode')
-        self.GetErrorID   = node.create_client(GetErrorID,   '/dobot_bringup_ros2/srv/GetErrorID')
-        self.GetAngle     = node.create_client(GetAngle,     '/dobot_bringup_ros2/srv/GetAngle')
-        self.GetPose      = node.create_client(GetPose,      '/dobot_bringup_ros2/srv/GetPose')
-        self.StartDrag    = node.create_client(StartDrag,    '/dobot_bringup_ros2/srv/StartDrag')
-        self.StopDrag     = node.create_client(StopDrag,     '/dobot_bringup_ros2/srv/StopDrag')
-        self.User         = node.create_client(User,         '/dobot_bringup_ros2/srv/User')
-        self.Tool         = node.create_client(Tool,         '/dobot_bringup_ros2/srv/Tool')
+        def service(service_type, name):
+            return node.create_client(
+                service_type, '/dobot_bringup_ros2/srv/' + name,
+                callback_group=self._service_group)
+
+        self.ClearError = service(ClearError, 'ClearError')
+        self.ResetRobot = service(ResetRobot, 'ResetRobot')
+        self.DisableRobot = service(DisableRobot, 'DisableRobot')
+        self.EnableRobot = service(EnableRobot, 'EnableRobot')
+        self.MovJ = service(MovJ, 'MovJ')
+        self.SpeedFactor = service(SpeedFactor, 'SpeedFactor')
+        self.SetCollision = service(SetCollisionLevel, 'SetCollisionLevel')
+        self.RobotMode = service(RobotMode, 'RobotMode')
+        self.GetErrorID = service(GetErrorID, 'GetErrorID')
+        self.GetAngle = service(GetAngle, 'GetAngle')
+        self.GetPose = service(GetPose, 'GetPose')
+        self.StartDrag = service(StartDrag, 'StartDrag')
+        self.StopDrag = service(StopDrag, 'StopDrag')
+        self.User = service(User, 'User')
+        self.Tool = service(Tool, 'Tool')
 
         for n, c in [('EnableRobot', self.EnableRobot), ('MovJ', self.MovJ)]:
             while not c.wait_for_service(timeout_sec=1.0):

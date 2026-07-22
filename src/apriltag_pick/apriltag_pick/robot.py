@@ -8,6 +8,7 @@ from dobot_msgs_v4.srv import (
     ClearError, DisableRobot, EnableRobot, GetErrorID, GetPose, MovJ,
     RobotMode, SetCollisionLevel, SpeedFactor, StartDrag, StopDrag,
     Tool, ToolDOInstant, User)
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 from .transforms import matrix_to_tool_pose
 
@@ -29,24 +30,30 @@ class CR5Robot:
         self.speed = int(speed)
         self.last_getpose_warn = 0.0
         self.dragging = False
-        self.clear = node.create_client(ClearError, f'{self.PREFIX}/ClearError')
-        self.disable = node.create_client(DisableRobot, f'{self.PREFIX}/DisableRobot')
-        self.enable = node.create_client(EnableRobot, f'{self.PREFIX}/EnableRobot')
-        self.movj = node.create_client(MovJ, f'{self.PREFIX}/MovJ')
-        self.speed_factor = node.create_client(SpeedFactor, f'{self.PREFIX}/SpeedFactor')
-        self.collision = node.create_client(
-            SetCollisionLevel, f'{self.PREFIX}/SetCollisionLevel')
-        self.mode = node.create_client(RobotMode, f'{self.PREFIX}/RobotMode')
-        self.errors = node.create_client(GetErrorID, f'{self.PREFIX}/GetErrorID')
-        self.start_drag_client = node.create_client(
-            StartDrag, f'{self.PREFIX}/StartDrag')
-        self.stop_drag_client = node.create_client(
-            StopDrag, f'{self.PREFIX}/StopDrag')
-        self.tool_do = node.create_client(
-            ToolDOInstant, f'{self.PREFIX}/ToolDOInstant')
-        self.get_pose_client = node.create_client(GetPose, f'{self.PREFIX}/GetPose')
-        self.user_frame = node.create_client(User, f'{self.PREFIX}/User')
-        self.tool_frame = node.create_client(Tool, f'{self.PREFIX}/Tool')
+        # TF/image/detection subscriptions use this node's default callback
+        # group. Service completions need an independent serialized group or
+        # dense camera callbacks can make valid CR replies look timed out.
+        self._service_group = MutuallyExclusiveCallbackGroup()
+
+        def service(service_type, name):
+            return node.create_client(
+                service_type, f'{self.PREFIX}/{name}',
+                callback_group=self._service_group)
+
+        self.clear = service(ClearError, 'ClearError')
+        self.disable = service(DisableRobot, 'DisableRobot')
+        self.enable = service(EnableRobot, 'EnableRobot')
+        self.movj = service(MovJ, 'MovJ')
+        self.speed_factor = service(SpeedFactor, 'SpeedFactor')
+        self.collision = service(SetCollisionLevel, 'SetCollisionLevel')
+        self.mode = service(RobotMode, 'RobotMode')
+        self.errors = service(GetErrorID, 'GetErrorID')
+        self.start_drag_client = service(StartDrag, 'StartDrag')
+        self.stop_drag_client = service(StopDrag, 'StopDrag')
+        self.tool_do = service(ToolDOInstant, 'ToolDOInstant')
+        self.get_pose_client = service(GetPose, 'GetPose')
+        self.user_frame = service(User, 'User')
+        self.tool_frame = service(Tool, 'Tool')
 
     @staticmethod
     def valid_tool_pose(tool):
