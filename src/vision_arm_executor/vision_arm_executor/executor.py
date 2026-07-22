@@ -7,6 +7,7 @@ import traceback
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from .backends import AprilTagBackend, IcpBackend
 from .store import atomic_json, digest, load_json, now
 
 
@@ -38,7 +39,8 @@ class VisionExecutor:
     """ROS2 visual-task state machine. This module never imports rospy."""
 
     def __init__(self, node, cfg, robot_factory=None, servo_factory=None,
-                 tag_factory=None):
+                 tag_factory=None, icp_backend_factory=None,
+                 apriltag_backend_factory=None):
         self.node = node
         self.cfg = cfg
         self.lock = threading.RLock()
@@ -52,10 +54,10 @@ class VisionExecutor:
         self.robot_factory = robot_factory
         self.servo_factory = servo_factory
         self.tag_factory = tag_factory
-        self.robot = None
-        self.robot_initialized = False
-        self.servo = None
-        self.tag = None
+        self.icp_backend_factory = icp_backend_factory
+        self.apriltag_backend_factory = apriltag_backend_factory
+        self._icp_instance = None
+        self._apriltag_instance = None
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(os.path.join(self.root, 'records'), exist_ok=True)
 
@@ -144,13 +146,13 @@ class VisionExecutor:
                 metrics={'target_request_id': target})
         if action == 'execution_enable':
             self.execution_enabled = True
-            self._sync_tag_execution(False)
+            self._disable_apriltag_motion()
             return self.response(
                 request_id, action, 'succeeded',
                 'real motion explicitly enabled')
         if action == 'execution_disable':
             self.execution_enabled = False
-            self._sync_tag_execution(False)
+            self._disable_apriltag_motion()
             with self.lock:
                 if self.owner:
                     self.cancelled.add(self.owner)
@@ -169,11 +171,9 @@ class VisionExecutor:
     def _status(self, request_id, action):
         metrics = self._owner_metrics()
         try:
-            robot = self._robot(initialize=False)
-            robot_mode = self._robot_mode(robot)
-            pose = robot.get_tool(warn=False)
-            metrics.update({'robot_mode': robot_mode, 'pose': pose})
-            if robot_mode is None or pose is None:
+            state = self._icp().robot_state()
+            metrics.update({'robot_mode': state.mode, 'pose': state.pose})
+            if state.mode is None or state.pose is None:
                 return self.response(
                     request_id, action, 'failed',
                     'CR5 RobotMode/GetPose unavailable', 'robot_unavailable',
@@ -244,69 +244,43 @@ class VisionExecutor:
             if task and task.get('status') == 'running':
                 task.update(progress=progress, metrics=metrics)
 
-    @staticmethod
-    def _robot_mode(robot):
-        getter = getattr(robot, 'get_mode', None)
-        if getter is None:
-            getter = getattr(robot, 'get_robot_mode')
-        return getter()
+    def _icp(self):
+        if self._icp_instance is None:
+            factory = self.icp_backend_factory or IcpBackend
+            self._icp_instance = factory(
+                self.node, self.cfg, robot_factory=self.robot_factory,
+                servo_factory=self.servo_factory)
+        return self._icp_instance
 
-    def _robot(self, initialize=True):
-        if self.robot is None:
-            if self.robot_factory:
-                self.robot = self.robot_factory(
-                    self.node, int(self.cfg['robot_speed']))
-            else:
-                from icp_servoing.robot import CR5Robot
-                self.robot = CR5Robot(
-                    self.node, speed=int(self.cfg['robot_speed']))
-        if initialize and not self.robot_initialized:
-            initialized = self.robot.init()
-            if initialized is False:
-                raise RuntimeError('CR5 initialization failed')
-            self.robot_initialized = True
-        return self.robot
+    def _apriltag(self):
+        if self._apriltag_instance is None:
+            factory = self.apriltag_backend_factory or AprilTagBackend
+            self._apriltag_instance = factory(
+                self.node, tag_factory=self.tag_factory)
+        return self._apriltag_instance
 
-    def _servo(self):
-        if self.servo is None:
-            from icp_servoing.handeye import load_X
-            from icp_servoing.servoing import VisualServo
-            factory = self.servo_factory or VisualServo
-            self.servo = factory(
-                self._robot(),
-                load_X(os.path.expanduser(self.cfg['handeye_path'])))
-            self.servo._pc_node = self.node
-        return self.servo
+    def _disable_apriltag_motion(self):
+        # The backend only grants motion during its bounded pick() call.
+        if self._apriltag_instance is not None:
+            self._apriltag_instance.disable_motion()
 
-    def _tag(self):
-        if self.tag is None:
-            if self.tag_factory:
-                self.tag = self.tag_factory(self.node)
-            else:
-                from apriltag_pick.pick_node import AprilTagPickNode
-                self.tag = AprilTagPickNode()
-        return self.tag
-
-    def _sync_tag_execution(self, enabled):
-        if self.tag is not None:
-            self.tag.execute_enabled = bool(enabled)
-
-    def _motion_safety(self, request, robot=None, target=None):
+    def _motion_safety(self, request, backend=None, target=None):
         if request.get('dry_run'):
             return
         request_id = request['request_id']
         self._checkpoint(request_id)
         if not self.execution_enabled:
             raise RuntimeError('execution_disabled')
-        robot = robot or self._robot()
-        mode = self._robot_mode(robot)
-        dragging = bool(getattr(robot, 'dragging', False))
-        if dragging or mode == getattr(robot, 'MODE_BACKDRIVE', 6):
+        selected_backend = backend or self._icp()
+        if backend is None:
+            selected_backend.initialize_robot()
+        state = selected_backend.robot_state()
+        if state.dragging or state.mode == state.backdrive_mode:
             raise RuntimeError('robot_in_drag_mode')
-        if mode != getattr(robot, 'MODE_ENABLED', 5):
+        if state.mode != state.enabled_mode:
             raise RuntimeError('robot_not_enabled')
         if target is not None:
-            current = robot.get_tool(warn=False)
+            current = state.pose
             if current is None:
                 raise RuntimeError('GetPose failed')
             target = np.asarray(target, dtype=float)
@@ -358,26 +332,22 @@ class VisionExecutor:
                     request_id, action, 'succeeded',
                     '%s dry-run passed; robot state was not changed' % action,
                     metrics={'dry_run': True})
-            robot = self._robot(initialize=False)
+            backend = self._icp()
             method = {
                 'robot_reset': 'reset_robot',
                 'robot_enable': 'enable_robot',
                 'robot_disable': 'disable_robot',
                 'robot_clear_error': 'clear_error',
             }[action]
-            result = getattr(robot, method)()
+            result = getattr(backend, method)()
             if result is False:
                 raise RuntimeError('%s failed' % action)
-            if action == 'robot_enable':
-                self.robot_initialized = True
-            elif action in {'robot_reset', 'robot_disable'}:
-                self.robot_initialized = False
             if action in {'robot_reset', 'robot_disable'}:
                 self.execution_enabled = False
-                self._sync_tag_execution(False)
+                self._disable_apriltag_motion()
             return self.response(
                 request_id, action, 'succeeded', '%s completed' % action,
-                metrics={'robot_mode': self._robot_mode(robot)})
+                metrics={'robot_mode': backend.robot_state().mode})
 
         if action == 'vision_icp_record_a':
             if dry_run:
@@ -386,28 +356,26 @@ class VisionExecutor:
                     'ICP A dry-run passed; no template was overwritten',
                     metrics={'dry_run': True})
             self._motion_safety(request)
-            servo = self._servo()
+            backend = self._icp()
             frames = int(request['params'].get(
                 'frames', self.cfg['icp_frames']))
-            if not servo.record_template(frames):
-                raise RuntimeError('ICP template recording failed')
             record_id = 'icp_a-' + str(int(time.time() * 1000))
             template_path = os.path.join(
                 self.root, 'records', 'icp_a', record_id + '.npz')
-            servo.save_template(template_path)
+            reference = backend.record_reference(frames, template_path)
             handeye_path, handeye_sha = self._calibration_digest(
                 'handeye_path')
             payload, artifacts = self._record(
                 'icp_a', {
                     'request_id': request_id,
-                    'T_base_flange_A': servo._T_base_tool_ref.tolist(),
-                    'template_frames': frames,
-                    'template_path': template_path,
-                    'template_sha256': digest(template_path),
+                    'T_base_flange_A': reference.flange_transform.tolist(),
+                    'template_frames': reference.frames,
+                    'template_path': reference.template_path,
+                    'template_sha256': digest(reference.template_path),
                     'handeye_path': handeye_path,
                     'handeye_sha256': handeye_sha,
                 }, record_id=record_id)
-            artifacts.insert(0, template_path)
+            artifacts.insert(0, reference.template_path)
             return self.response(
                 request_id, action, 'succeeded', 'ICP reference A recorded',
                 metrics={'record_id': payload['record_id'], 'frames': frames},
@@ -427,13 +395,7 @@ class VisionExecutor:
                     'ICP B dry-run passed; no record was overwritten',
                     metrics={'a_record_id': a_record['record_id']})
             self._motion_safety(request)
-            pose = self._robot().get_tool(warn=False)
-            if pose is None:
-                raise RuntimeError('GetPose failed')
-            transform = np.eye(4)
-            transform[:3, 3] = pose[:3]
-            transform[:3, :3] = Rotation.from_euler(
-                'xyz', pose[3:], degrees=True).as_matrix()
+            transform = self._icp().flange_transform()
             delta = np.linalg.inv(
                 np.asarray(a_record['T_base_flange_A'], dtype=float)) @ transform
             payload, artifacts = self._record('icp_b', {
@@ -454,7 +416,7 @@ class VisionExecutor:
 
         if action in {'vision_icp_align', 'vision_icp_align_and_move_b'}:
             a_record = self._load_and_validate_icp_a()
-            servo = self._servo()
+            backend = self._icp()
             if dry_run:
                 return self.response(
                     request_id, action, 'succeeded',
@@ -462,37 +424,28 @@ class VisionExecutor:
                     metrics={'converged': False, 'dry_run': True,
                              'a_record_id': a_record['record_id']})
             self._motion_safety(request)
-            servo.load_template(a_record['template_path'])
             maximum = int(request['params'].get(
                 'max_iters', self.cfg['icp_max_iters']))
-            servo.motion_guard = lambda target: self._motion_safety(
-                request, target=target)
-            try:
-                converged = servo.align(
-                    maximum,
-                    should_stop=lambda: self._should_stop(request_id),
-                    progress_callback=lambda current, total, result: self._progress(
-                        request_id, current, total, result))
-            finally:
-                servo.motion_guard = None
+            alignment = backend.align(
+                a_record['template_path'], maximum,
+                should_stop=lambda: self._should_stop(request_id),
+                progress_callback=lambda current, total, result: self._progress(
+                    request_id, current, total, result),
+                motion_guard=lambda target: self._motion_safety(
+                    request, backend=backend, target=target))
             self._checkpoint(request_id)
-            metrics = self._jsonify(servo.last_align_result)
+            metrics = self._jsonify(alignment.metrics)
             metrics['a_record_id'] = a_record['record_id']
-            if not converged:
+            if not alignment.converged:
                 raise RuntimeError(
                     'ICP did not converge; B motion prohibited: ' +
                     str(metrics.get('reason', 'unknown')))
             if action == 'vision_icp_align_and_move_b':
                 b_record = self._load_and_validate_icp_b(a_record)
-                current = servo._get_tool_matrix()
-                if current is None:
-                    raise RuntimeError('GetPose failed after ICP convergence')
-                target = current @ np.asarray(
-                    b_record['T_A_to_B'], dtype=float)
-                self._motion_safety(request, target=target)
-                self._checkpoint(request_id)
-                if not self._robot().movj_pose(target, 'ICP A-to-B'):
-                    raise RuntimeError('relative B move failed')
+                target = backend.move_relative(
+                    b_record['T_A_to_B'], 'ICP A-to-B',
+                    motion_guard=lambda value: self._motion_safety(
+                        request, backend=backend, target=value))
                 metrics.update(
                     b_record_id=b_record['record_id'],
                     T_target=target.tolist())
@@ -501,25 +454,24 @@ class VisionExecutor:
                 metrics=metrics)
 
         if action == 'apriltag_locate':
-            tag = self._tag()
-            target = tag.locate()
-            localization = tag.last_localization
-            handeye_path = os.path.expanduser(tag.handeye_path)
-            tcp_path = os.path.expanduser(tag.tcp_calibration_path)
+            location = self._apriltag().locate()
+            identity = location.identity
+            localization = location.localization
             payload, artifacts = self._record('apriltag_cache', {
                 'request_id': request_id,
                 'cached_at': now(),
-                'tag_id': tag._target_tag_id(),
-                'tag_frame': tag.tag_frame,
-                'target': target.tolist(),
+                'tag_id': identity.tag_id,
+                'tag_frame': identity.tag_frame,
+                'target': location.target.tolist(),
                 'localization': self._jsonify(localization),
                 'frames': int(localization['frames']),
                 'spread_mm': float(localization['spread_mm']),
                 'ttl_sec': float(self.cfg['apriltag_cache_ttl_sec']),
-                'handeye_path': handeye_path,
-                'handeye_sha256': digest(handeye_path),
-                'tcp_calibration_path': tcp_path,
-                'tcp_calibration_sha256': digest(tcp_path),
+                'handeye_path': identity.handeye_path,
+                'handeye_sha256': digest(identity.handeye_path),
+                'tcp_calibration_path': identity.tcp_calibration_path,
+                'tcp_calibration_sha256': digest(
+                    identity.tcp_calibration_path),
             })
             debug_path = localization.get('debug_image_path')
             if debug_path:
@@ -535,13 +487,7 @@ class VisionExecutor:
                 }, artifacts=artifacts)
 
         if action == 'apriltag_validate':
-            tag = self._tag()
-            mode = tag.robot.get_mode()
-            if not tag.robot.dragging and mode != tag.robot.MODE_BACKDRIVE:
-                raise RuntimeError(
-                    'apriltag_validate requires manual drag positioning at '
-                    'the Tag center before recording truth')
-            value = tag.record_manual_tag_center()
+            value = self._apriltag().validate_manual()
             return self.response(
                 request_id, action, 'succeeded',
                 'AprilTag manual validation truth recorded',
@@ -549,8 +495,8 @@ class VisionExecutor:
                          'error_norm_mm': float(np.linalg.norm(value))})
 
         if action == 'apriltag_pick':
-            tag = self._tag()
-            cache = self._load_and_validate_tag_cache(tag)
+            backend = self._apriltag()
+            cache = self._load_and_validate_tag_cache(backend)
             target = np.asarray(cache['target'], dtype=float)
             if dry_run:
                 return self.response(
@@ -563,23 +509,16 @@ class VisionExecutor:
             # Only a real pick after explicit execution_enable may change the
             # controller state. initialize() performs the standard safe
             # ClearError/Disable/Enable/Speed/Collision/User0/Tool0 sequence.
-            tag.robot.initialize()
-            self._check_tag_robot_drift(tag, cache)
-            self._sync_tag_execution(True)
-            tag.last_localization = self._restore_localization(
-                cache['localization'])
+            backend.prepare_pick(cache['localization'])
+            self._check_tag_robot_drift(backend, cache)
 
             def tag_safety(stage, stage_target):
                 self._checkpoint(request_id)
                 self._motion_safety(
-                    request, robot=tag.robot, target=stage_target)
+                    request, backend=backend, target=stage_target)
 
-            try:
-                self._motion_safety(request, robot=tag.robot, target=target)
-                tag.pick(safety_check=tag_safety)
-            finally:
-                # The executor is the sole enable authority.
-                self._sync_tag_execution(False)
+            self._motion_safety(request, backend=backend, target=target)
+            backend.pick(safety_check=tag_safety)
             return self.response(
                 request_id, action, 'succeeded',
                 'AprilTag cached pick complete',
@@ -614,7 +553,7 @@ class VisionExecutor:
             raise RuntimeError('ICP A/B calibration version mismatch')
         return record
 
-    def _load_and_validate_tag_cache(self, tag):
+    def _load_and_validate_tag_cache(self, backend):
         path = os.path.join(self.root, 'apriltag_cache.json')
         cache = load_json(path)
         if not cache:
@@ -622,43 +561,23 @@ class VisionExecutor:
         age = time.time() - os.path.getmtime(path)
         if age > float(self.cfg['apriltag_cache_ttl_sec']):
             raise RuntimeError('AprilTag cache expired')
-        if cache.get('tag_id') != tag._target_tag_id():
+        identity = backend.identity()
+        if cache.get('tag_id') != identity.tag_id:
             raise RuntimeError('AprilTag ID changed since locate')
-        if cache.get('handeye_sha256') != digest(tag.handeye_path):
+        if cache.get('handeye_sha256') != digest(identity.handeye_path):
             raise RuntimeError('hand-eye calibration changed since locate')
         if cache.get('tcp_calibration_sha256') != digest(
-                tag.tcp_calibration_path):
+                identity.tcp_calibration_path):
             raise RuntimeError('TCP calibration changed since locate')
         return cache
 
-    def _check_tag_robot_drift(self, tag, cache):
-        current = tag.robot.get_tool(warn=False)
-        detection = cache.get('localization', {}).get('flange_xyzrpy')
-        if current is None or not detection:
-            raise RuntimeError('cannot validate robot pose against Tag cache')
-        translation = float(np.linalg.norm(
-            np.asarray(current[:3]) - np.asarray(detection[:3])))
-        current_rotation = Rotation.from_euler(
-            'xyz', current[3:6], degrees=True)
-        detection_rotation = Rotation.from_euler(
-            'xyz', detection[3:6], degrees=True)
-        rotation = float(np.degrees(
-            (current_rotation * detection_rotation.inv()).magnitude()))
+    def _check_tag_robot_drift(self, backend, cache):
+        translation, rotation = backend.localization_drift(
+            cache.get('localization', {}))
         if translation > float(self.cfg['apriltag_max_robot_drift_mm']):
             raise RuntimeError('robot moved since AprilTag locate')
         if rotation > float(self.cfg['apriltag_max_robot_drift_deg']):
             raise RuntimeError('robot rotated since AprilTag locate')
-
-    @staticmethod
-    def _restore_localization(value):
-        result = dict(value)
-        array_keys = {
-            'base_flange_at_detection', 'camera_tag', 'base_tag',
-            'predicted_contact_tip', 'base_flange_target'}
-        for key in array_keys:
-            if key in result:
-                result[key] = np.asarray(result[key], dtype=float)
-        return result
 
     def _jsonify(self, value):
         if isinstance(value, np.ndarray):

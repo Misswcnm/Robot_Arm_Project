@@ -14,9 +14,12 @@ class FakeRobot(object):
  def disable_robot(self): self.calls.append('disable'); self.mode=4; return True
  def clear_error(self): self.calls.append('clear_error'); return True
 class ExecutorTests(unittest.TestCase):
- def make(self):
+ def make(self, robot=None):
+  robot=robot or FakeRobot()
   cfg={'data_dir':tempfile.mkdtemp(),'robot_speed':15,'workspace_min_xyz_mm':[-1e3]*3,'workspace_max_xyz_mm':[1e3]*3,'max_move_translation_mm':300,'max_move_rotation_deg':45,'icp_frames':2,'icp_max_iters':1,'apriltag_cache_ttl_sec':1,'apriltag_max_robot_drift_mm':10,'apriltag_max_robot_drift_deg':3,'handeye_path':'/dev/null','tcp_calibration_path':'/dev/null'}
-  return VisionExecutor(None,cfg,robot_factory=lambda *a:FakeRobot())
+  executor=VisionExecutor(None,cfg,robot_factory=lambda *a:robot)
+  executor.fake_robot=robot
+  return executor
  def test_enable_does_not_survive_new_executor(self):
   e=self.make(); self.assertFalse(e.execution_enabled); self.assertEqual('succeeded',e.submit({'request_id':'x','action':'execution_enable','params':{},'timeout_sec':1,'dry_run':False})['status']); self.assertTrue(e.execution_enabled); self.assertFalse(self.make().execution_enabled)
  def test_request_id_idempotent(self):
@@ -25,9 +28,9 @@ class ExecutorTests(unittest.TestCase):
   e=self.make(); req={'request_id':'status','action':'arm_status','params':{},'timeout_sec':1,'dry_run':False}
   result=e.submit(req)
   self.assertEqual('succeeded',result['status'])
-  self.assertEqual(0,e.robot.init_calls)
+  self.assertEqual(0,e.fake_robot.init_calls)
  def test_arm_status_fails_when_feedback_is_unavailable(self):
-  e=self.make(); robot=FakeRobot(); robot.get_mode=lambda:None; robot.get_tool=lambda **kw:None; e.robot=robot
+  robot=FakeRobot(); robot.get_mode=lambda:None; robot.get_tool=lambda **kw:None; e=self.make(robot)
   req={'request_id':'missing-status','action':'arm_status','params':{},'timeout_sec':1,'dry_run':False}
   result=e.submit(req)
   self.assertEqual('failed',result['status'])
@@ -57,8 +60,8 @@ class ExecutorTests(unittest.TestCase):
    if e.tasks['robot-enable']['status'] != 'accepted' and e.tasks['robot-enable']['status'] != 'running': break
    time.sleep(.01)
   self.assertEqual('succeeded',e.tasks['robot-enable']['status'])
-  self.assertTrue(e.robot_initialized)
-  self.assertEqual(['enable'],e.robot.calls)
+  self.assertTrue(e._icp().initialized)
+  self.assertEqual(['enable'],e.fake_robot.calls)
  def test_robot_disable_revokes_motion_permission(self):
   e=self.make(); e.execution_enabled=True
   req={'request_id':'robot-disable','action':'robot_disable','params':{},'timeout_sec':1,'dry_run':False}
@@ -69,4 +72,4 @@ class ExecutorTests(unittest.TestCase):
    time.sleep(.01)
   self.assertEqual('succeeded',e.tasks['robot-disable']['status'])
   self.assertFalse(e.execution_enabled)
-  self.assertFalse(e.robot_initialized)
+  self.assertFalse(e._icp().initialized)
