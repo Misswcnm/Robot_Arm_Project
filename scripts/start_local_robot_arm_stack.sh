@@ -36,6 +36,13 @@ set -u
 VISION_RPC_HOST="${VISION_RPC_HOST:-127.0.0.1}"
 VEHICLE_IP="${VEHICLE_IP:-127.0.0.1}"
 VISION_RPC_AUTH_TOKEN="${VISION_RPC_AUTH_TOKEN:-}"
+NX_COMPAT_ENABLED="${NX_COMPAT_ENABLED:-false}"
+NX_COMPAT_HOST="${NX_COMPAT_HOST:-0.0.0.0}"
+NX_COMPAT_PORT="${NX_COMPAT_PORT:-8888}"
+NX_COMPAT_ALLOWED_CLIENTS="${NX_COMPAT_ALLOWED_CLIENTS:-$VEHICLE_IP/32}"
+NX_ROUTE_FILE="${NX_ROUTE_FILE:-$PROJECT_DIR/src/vision_arm_executor/config/nx_routes.json}"
+NX_VISION_RPC_HOST="${NX_VISION_RPC_HOST:-$VISION_RPC_HOST}"
+NX_VISION_RPC_PORT="${NX_VISION_RPC_PORT:-17881}"
 if [[ "$HARDWARE_ONLY" == false && "$VISION_RPC_HOST" != "127.0.0.1" && -z "$VISION_RPC_AUTH_TOKEN" ]]; then
   echo "VISION_RPC_AUTH_TOKEN is required when VISION_RPC_HOST is not 127.0.0.1" >&2
   exit 2
@@ -44,6 +51,8 @@ fi
 ROS_LOG_DIR="${ROS_LOG_DIR:-$PROJECT_DIR/.runtime/roslog}"
 export ROS_LOG_DIR IP_address DOBOT_TYPE VISION_RPC_HOST VEHICLE_IP
 export VISION_RPC_AUTH_TOKEN
+export NX_COMPAT_HOST NX_COMPAT_PORT NX_COMPAT_ALLOWED_CLIENTS NX_ROUTE_FILE
+export NX_VISION_RPC_HOST NX_VISION_RPC_PORT
 mkdir -p "$ROS_LOG_DIR"
 
 required_packages=(cr_robot_ros2 realsense2_camera step_motor)
@@ -115,6 +124,20 @@ if [[ "$HARDWARE_ONLY" == false ]]; then
   start_component VisionExecutor \
     ros2 run vision_arm_executor vision_arm_executor --ros-args \
       --params-file "$PROJECT_DIR/src/vision_arm_executor/config/executor.yaml"
+  if [[ "$NX_COMPAT_ENABLED" == true ]]; then
+    if [[ ! -f "$NX_ROUTE_FILE" ]]; then
+      echo "NX route file does not exist: $NX_ROUTE_FILE" >&2
+      exit 1
+    fi
+    start_component NxCompatGateway \
+      ros2 run vision_arm_executor nx_compat_gateway \
+        --host "$NX_COMPAT_HOST" \
+        --port "$NX_COMPAT_PORT" \
+        --allowed-clients "$NX_COMPAT_ALLOWED_CLIENTS" \
+        --route-file "$NX_ROUTE_FILE" \
+        --rpc-host "$NX_VISION_RPC_HOST" \
+        --rpc-port "$NX_VISION_RPC_PORT"
+  fi
 fi
 
 if [[ "$DRY_RUN" == true ]]; then

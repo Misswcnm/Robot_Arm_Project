@@ -4,10 +4,15 @@ from vision_arm_executor.executor import VisionExecutor
 
 class FakeRobot(object):
  MODE_ENABLED=5; MODE_BACKDRIVE=6
- def __init__(self,*a): self.dragging=False; self.init_calls=0
+ def __init__(self,*a):
+  self.dragging=False; self.init_calls=0; self.calls=[]; self.mode=5
  def init(self): self.init_calls+=1; return True
- def get_mode(self): return 5
+ def get_mode(self): return self.mode
  def get_tool(self,**kw): return [0,0,100,0,0,0]
+ def reset_robot(self): self.calls.append('reset'); self.mode=4; return True
+ def enable_robot(self): self.calls.append('enable'); self.mode=5; return True
+ def disable_robot(self): self.calls.append('disable'); self.mode=4; return True
+ def clear_error(self): self.calls.append('clear_error'); return True
 class ExecutorTests(unittest.TestCase):
  def make(self):
   cfg={'data_dir':tempfile.mkdtemp(),'robot_speed':15,'workspace_min_xyz_mm':[-1e3]*3,'workspace_max_xyz_mm':[1e3]*3,'max_move_translation_mm':300,'max_move_rotation_deg':45,'icp_frames':2,'icp_max_iters':1,'apriltag_cache_ttl_sec':1,'apriltag_max_robot_drift_mm':10,'apriltag_max_robot_drift_deg':3,'handeye_path':'/dev/null','tcp_calibration_path':'/dev/null'}
@@ -44,3 +49,24 @@ class ExecutorTests(unittest.TestCase):
   import time; time.sleep(.02)
   self.assertEqual('succeeded',e.tasks['dry']['status'])
   self.assertFalse(__import__('os').path.exists(__import__('os').path.join(e.root,'icp_a.json')))
+ def test_robot_enable_is_serialized_and_marks_robot_initialized(self):
+  e=self.make(); req={'request_id':'robot-enable','action':'robot_enable','params':{},'timeout_sec':1,'dry_run':False}
+  self.assertEqual('accepted',e.submit(req)['status'])
+  import time
+  for unused in range(20):
+   if e.tasks['robot-enable']['status'] != 'accepted' and e.tasks['robot-enable']['status'] != 'running': break
+   time.sleep(.01)
+  self.assertEqual('succeeded',e.tasks['robot-enable']['status'])
+  self.assertTrue(e.robot_initialized)
+  self.assertEqual(['enable'],e.robot.calls)
+ def test_robot_disable_revokes_motion_permission(self):
+  e=self.make(); e.execution_enabled=True
+  req={'request_id':'robot-disable','action':'robot_disable','params':{},'timeout_sec':1,'dry_run':False}
+  e.submit(req)
+  import time
+  for unused in range(20):
+   if e.tasks['robot-disable']['status'] not in ('accepted','running'): break
+   time.sleep(.01)
+  self.assertEqual('succeeded',e.tasks['robot-disable']['status'])
+  self.assertFalse(e.execution_enabled)
+  self.assertFalse(e.robot_initialized)

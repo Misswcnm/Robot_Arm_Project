@@ -28,7 +28,8 @@ roslaunch master_node master_node.launch
 curl -s http://<VEHICLE_IP>:1819/robot/mechanical_arm/check_connection
 ```
 
-其 NX 通道保持原有 `mapid/poseid` 协议；本地视觉流程不会向它发送 NX 指令。
+其 NX 通道保持原有 `mapid/poseid` 协议。启用本地NX兼容网关后，小车仍走
+原协议，但连接目标由本机模拟，网关再转换成视觉执行器RPC。
 
 ## 本地视觉电脑：安全启动顺序
 
@@ -73,4 +74,73 @@ cp config/local_robot_arm.env.example config/local_robot_arm.env
 5. 本地：ICP A/B 和 AprilTag locate/validate，均不执行抓取。
 6. 经现场确认后才启用真实运动。
 
-当前 master_node 未修改，因此它不会感知本地视觉任务的完成状态。若以后需要“导航到点位后自动触发视觉任务并回写任务状态”，应新增 application 外部的桥接进程，而不是修改小车后端。
+`master_node` 本身保持未修改。未启用兼容网关时，它不会感知本地视觉任务；
+启用下述网关后，导航点任务可通过旧NX协议触发视觉动作，并在成功时收到原有
+`status=done` 完成信号。
+
+## 本机模拟原NX
+
+小车代码固定连接 `192.168.2.103:8888`。不修改小车后端时，先在本机有线网卡
+增加第二地址（把 `eno1` 换成现场实际网卡）：
+
+```bash
+sudo ip addr add 192.168.2.103/24 dev eno1
+ip -4 addr show dev eno1
+```
+
+编辑 `config/local_robot_arm.env`：
+
+```bash
+export NX_COMPAT_ENABLED="true"
+export NX_COMPAT_HOST="0.0.0.0"
+export NX_COMPAT_PORT="8888"
+export NX_COMPAT_ALLOWED_CLIENTS="192.168.2.15/32"
+export NX_ROUTE_FILE="$HOME/Robot_Arm_Project/src/vision_arm_executor/config/nx_routes.json"
+export NX_VISION_RPC_HOST="192.168.2.20"
+```
+
+随后编辑 `src/vision_arm_executor/config/nx_routes.json`。配置默认是
+`dry_run=true` 且没有任何路由，未知点位会拒绝执行。例如：
+
+```json
+{
+  "schema_version": 1,
+  "defaults": {"timeout_sec": 200, "dry_run": true},
+  "teaching_routes": [
+    {"mapid": "map_01", "poseid": "icp_a", "action": "vision_icp_record_a"},
+    {"mapid": "map_01", "poseid": "icp_b", "action": "vision_icp_record_b"}
+  ],
+  "routes": [
+    {"mapid": "map_01", "poseid": "icp_work", "action": "vision_icp_align_and_move_b"},
+    {"mapid": "map_01", "poseid": "tag_locate", "action": "apriltag_locate"},
+    {"mapid": "map_01", "poseid": "tag_pick", "action": "apriltag_pick"}
+  ]
+}
+```
+
+路由支持 `mapid`、`poseid`、`label`，值为 `"*"` 表示通配；匹配时最具体的
+规则优先。完成dry-run验收后，只对确认需要真实执行的规则设置
+`"dry_run": false`。
+
+启动：
+
+```bash
+./scripts/local_robot_arm.sh build
+./scripts/local_robot_arm.sh all --dry-run
+./scripts/local_robot_arm.sh all
+```
+
+日志中应出现：
+
+```text
+NX compatibility gateway listening on 0.0.0.0:8888
+NX vehicle connected: 192.168.2.15:...
+```
+
+旧命令转换如下：`1→ResetRobot`、`2→EnableRobot`、`3→DisableRobot`、
+`4→execution_enable`、`5→execution_disable`、`6→ClearError`。其中4/5是本地
+视觉执行器的远程运动许可开关，进程重启后仍默认关闭。
+
+自动任务成功后，网关才向小车回复 `{"status":"done"}`。失败只回复
+`status=failed`，绝不伪装成功；由于旧小车后端只识别 `done`，失败时小车仍会
+等待到原有200秒超时，这是保持application零修改时的已知限制。

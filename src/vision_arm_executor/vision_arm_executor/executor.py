@@ -11,6 +11,10 @@ from .store import atomic_json, digest, load_json, now
 
 
 RESOURCE_ACTIONS = {
+    'robot_reset',
+    'robot_enable',
+    'robot_disable',
+    'robot_clear_error',
     'vision_icp_record_a',
     'vision_icp_record_b',
     'vision_icp_align',
@@ -345,6 +349,35 @@ class VisionExecutor:
         action = request['action']
         request_id = request['request_id']
         dry_run = bool(request.get('dry_run', False))
+
+        if action in {
+                'robot_reset', 'robot_enable', 'robot_disable',
+                'robot_clear_error'}:
+            if dry_run:
+                return self.response(
+                    request_id, action, 'succeeded',
+                    '%s dry-run passed; robot state was not changed' % action,
+                    metrics={'dry_run': True})
+            robot = self._robot(initialize=False)
+            method = {
+                'robot_reset': 'reset_robot',
+                'robot_enable': 'enable_robot',
+                'robot_disable': 'disable_robot',
+                'robot_clear_error': 'clear_error',
+            }[action]
+            result = getattr(robot, method)()
+            if result is False:
+                raise RuntimeError('%s failed' % action)
+            if action == 'robot_enable':
+                self.robot_initialized = True
+            elif action in {'robot_reset', 'robot_disable'}:
+                self.robot_initialized = False
+            if action in {'robot_reset', 'robot_disable'}:
+                self.execution_enabled = False
+                self._sync_tag_execution(False)
+            return self.response(
+                request_id, action, 'succeeded', '%s completed' % action,
+                metrics={'robot_mode': self._robot_mode(robot)})
 
         if action == 'vision_icp_record_a':
             if dry_run:

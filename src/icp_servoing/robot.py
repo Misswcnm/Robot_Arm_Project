@@ -8,7 +8,7 @@ from scipy.spatial.transform import Rotation as Rot
 from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
                                 MovJ, SpeedFactor, GetAngle, GetPose, GetErrorID,
                                 SetCollisionLevel, RobotMode, StartDrag, StopDrag,
-                                Tool, User)
+                                Tool, User, ResetRobot)
 
 
 class CR5Robot:
@@ -19,6 +19,7 @@ class CR5Robot:
         self._logger = node.get_logger()
 
         self.ClearError   = node.create_client(ClearError,   '/dobot_bringup_ros2/srv/ClearError')
+        self.ResetRobot   = node.create_client(ResetRobot,   '/dobot_bringup_ros2/srv/ResetRobot')
         self.DisableRobot = node.create_client(DisableRobot, '/dobot_bringup_ros2/srv/DisableRobot')
         self.EnableRobot  = node.create_client(EnableRobot,  '/dobot_bringup_ros2/srv/EnableRobot')
         self.MovJ         = node.create_client(MovJ,         '/dobot_bringup_ros2/srv/MovJ')
@@ -38,6 +39,34 @@ class CR5Robot:
                 self._logger.info(f'等待 {n}...')
 
         self._last_getpose_warn = 0.0
+
+    @staticmethod
+    def _response_ok(call_result):
+        ok, response = call_result
+        return bool(ok and response is not None and
+                    getattr(response, 'res', -1) == 0)
+
+    def reset_robot(self) -> bool:
+        """Reset the CR controller without authorizing subsequent motion."""
+        return self._response_ok(
+            self._call(self.ResetRobot, ResetRobot.Request(), timeout=5.0))
+
+    def enable_robot(self) -> bool:
+        """Enable CR5 and re-apply the project's conservative motion setup."""
+        if not self._response_ok(
+                self._call(self.EnableRobot, EnableRobot.Request(), timeout=12.0)):
+            return False
+        return self.apply_motion_safety() and self.use_base_tool0()
+
+    def disable_robot(self) -> bool:
+        """Disable CR5; this is intentionally allowed while motion is gated."""
+        return self._response_ok(
+            self._call(self.DisableRobot, DisableRobot.Request(), timeout=5.0))
+
+    def clear_error(self) -> bool:
+        """Clear controller alarms without automatically enabling the robot."""
+        return self._response_ok(
+            self._call(self.ClearError, ClearError.Request(), timeout=5.0))
 
     def _call(self, client, req, timeout=10.0):
         fut = client.call_async(req)
