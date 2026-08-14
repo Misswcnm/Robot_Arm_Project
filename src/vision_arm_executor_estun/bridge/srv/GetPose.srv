@@ -1,0 +1,5 @@
+---
+bool success
+# Unified vision pose: [x, y, z, roll, pitch, yaw], millimetres/degrees.
+float64[6] pose
+string message

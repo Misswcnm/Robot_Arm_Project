@@ -1,20 +1,12 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- 设置机械臂类型环境变量 -->
-    <env name="DOBOT_TYPE" value="cr3" />
-    
-    <!-- 设置ROS环境变量 -->
-    <env name="ROS_DISTRO" value="noetic" />
-    
-    <!-- 启动master_node -->
+    <arg name="arm_vendor" default="dobot" />
+    <arg name="nx_host" default="192.168.2.20" />
+    <arg name="nx_port" default="8888" />
+
     <node pkg="master_node" type="master_node" respawn="false" name="master_node" output="screen">
-        <!-- 可以在这里添加其他参数 -->
-    </node>
-    
-    <!-- 启动机械臂控制器 -->
-    <node pkg="master_node" type="mechanical_arm_controller.py" respawn="false" name="mechanical_arm_controller" output="screen">
-        <!-- 机械臂控制器参数 -->
-        <param name="nx_host" value="192.168.2.103" />
-        <param name="nx_port" value="8888" />
+        <param name="arm_vendor" value="$(arg arm_vendor)" />
+        <param name="nx_host" value="$(arg nx_host)" />
+        <param name="nx_port" value="$(arg nx_port)" />
     </node>
 </launch>

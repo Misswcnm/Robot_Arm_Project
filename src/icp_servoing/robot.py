@@ -14,6 +14,13 @@ from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
 
 class CR5Robot:
     """CR5 机械臂控制 (不继承Node, 接收外部node)"""
+    MODE_DISABLED = 4
+    MODE_ENABLED = 5
+    MODE_BACKDRIVE = 6
+    MODE_RUNNING = 7
+    MODE_ERROR = 9
+    MODE_COLLISION = 11
+
     def __init__(self, node: Node, speed: int = 15):
         self._node = node
         self._speed = speed
@@ -98,16 +105,42 @@ class CR5Robot:
         except Exception as e:
             return False, str(e)
 
+    def _settle_after_enable(self, delay=0.1):
+        """Let the controller settle without stealing an executor-owned node.
+
+        rclpy.spin_once(node) temporarily moves the node to the global
+        executor. When vision_arm_executor already owns this node, removing it
+        from that temporary executor leaves subsequent service futures without
+        a spinning executor and valid CR5 replies appear as timeouts.
+        """
+        if getattr(self._node, 'executor', None) is None:
+            rclpy.spin_once(self._node, timeout_sec=float(delay))
+        else:
+            time.sleep(float(delay))
+
     # ── Init (全部指令连续发送, recv后立即下一步) ──
     def init(self):
+        # A production task must not cycle an already enabled controller
+        # through DisableRobot -> EnableRobot.  Re-apply only the bounded
+        # motion settings and coordinate frames when mode 5 is already live.
+        if self.get_robot_mode() == self.MODE_ENABLED:
+            if not self.apply_motion_safety():
+                raise RuntimeError('速度/碰撞等级设置失败')
+            if not self.use_base_tool0():
+                raise RuntimeError('User(0)/Tool(0) 坐标系设置失败')
+            self._logger.info(
+                f'✅ CR5 already enabled  speed={self._speed}%  '
+                'collision=Lv.5')
+            return True
         self._call(self.ClearError, ClearError.Request())
         self._call(self.DisableRobot, DisableRobot.Request())
         self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)  # ~4s
-        rclpy.spin_once(self._node, timeout_sec=0.1)  # 让topic到位
+        self._settle_after_enable()
         self.apply_motion_safety()
         if not self.use_base_tool0():
             raise RuntimeError('User(0)/Tool(0) 坐标系设置失败')
         self._logger.info(f'✅ CR5 ready  speed={self._speed}%  collision=Lv.5')
+        return True
 
     def use_base_tool0(self) -> bool:
         """Select User0/Tool0 so GetPose represents T_base_flange."""
@@ -200,10 +233,15 @@ class CR5Robot:
         """直接使用控制器笛卡尔MovJ，并等待队列真正启动和到位."""
         return self.movj_pose_status(target, label=label) == 'arrived'
 
-    def movj_pose_status(self, target, label: str = 'MovJ') -> str:
+    def movj_pose_status(self, target, label: str = 'MovJ',
+                         start_pose=None) -> str:
         """返回 arrived/queued/failed: queued表示已入队但未确认到位."""
         pose = self.matrix_to_pose(target) if isinstance(target, np.ndarray) else list(target)
-        pre_move = self.get_tool()
+        # The servo loop already reads the pre-move pose for its motion
+        # accounting. Reuse it when supplied instead of issuing a duplicate
+        # GetPose immediately before MovJ.
+        pre_move = (
+            list(start_pose) if start_pose is not None else self.get_tool())
         self._logger.info(
             f'{label}: 直接发送MovJ(pose) pose=[{pose[0]:.3f} {pose[1]:.3f} {pose[2]:.3f} '
             f'{pose[3]:.3f} {pose[4]:.3f} {pose[5]:.3f}]')
@@ -367,7 +405,7 @@ class CR5Robot:
         if r.res != 0:
             self._logger.error(f'EnableRobot 返回异常 res={r.res}')
             return False
-        rclpy.spin_once(self._node, timeout_sec=0.1)
+        self._settle_after_enable()
         return self.apply_motion_safety() and self.use_base_tool0()
 
     def recover(self) -> bool:
@@ -375,7 +413,7 @@ class CR5Robot:
         self._logger.error('ERROR! 执行ClearError+EnableRobot恢复序列...')
         self._call(self.ClearError, ClearError.Request())
         ok, _ = self._call(self.EnableRobot, EnableRobot.Request(), timeout=10.0)
-        rclpy.spin_once(self._node, timeout_sec=0.1)
+        self._settle_after_enable()
         if not ok:
             self._logger.error('EnableRobot恢复失败')
             return False

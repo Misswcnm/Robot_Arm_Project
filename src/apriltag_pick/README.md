@@ -94,6 +94,7 @@ ros2 run apriltag_pick pick_node --ros-args \
 对应JSON的 `pnp3d` 字段保存同帧 `T_camera_tag`、rvec、tvec、每角点误差和
 重投影RMS。`tag_size_m` 必须与 `tags.yaml` 中的实际黑色外框边长一致。
 
-程序遵循本项目 CR5 约束：不调用 `PowerOn`，初始化为
-`ClearError → DisableRobot → EnableRobot → SpeedFactor → SetCollisionLevel(5)`，
-运动只发旧固件支持的 `MovJ(x,y,z,rx,ry,rz)`。
+程序不调用 `PowerOn`。CR5 已处于 mode=5 时只重设速度、碰撞等级和
+User0/Tool0，不执行 Disable/Enable；仅非使能状态恢复时才执行
+`ClearError → DisableRobot → EnableRobot`。运动使用旧固件支持的
+`MovJ(x,y,z,rx,ry,rz)`。

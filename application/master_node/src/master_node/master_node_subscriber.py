@@ -7,50 +7,6 @@ import math as math
 import os
 import json
 import sys
-
-def safe_json_loads(json_str):
-    """
-    安全地解析JSON字符串，处理编码问题
-    
-    Args:
-        json_str: 要解析的JSON字符串
-        
-    Returns:
-        解析后的JSON对象
-    """
-    try:
-        if isinstance(json_str, str):
-            # 确保字符串是UTF-8编码的
-            json_str = json_str.encode('utf-8').decode('utf-8')
-        return json.loads(json_str)
-    except (UnicodeDecodeError, UnicodeEncodeError) as e:
-        rospy.logerr("JSON编码错误: %s", safe_str(e))
-        # 尝试使用latin-1编码作为备选
-        try:
-            if isinstance(json_str, str):
-                json_str = json_str.encode('latin-1').decode('utf-8')
-            return json.loads(json_str)
-        except Exception as e2:
-            rospy.logerr("JSON解析完全失败: %s", safe_str(e2))
-            return None
-    except Exception as e:
-        rospy.logerr("JSON解析错误: %s", safe_str(e))
-        return None
-
-def safe_str(e):
-    """
-    安全地转换异常为字符串，避免编码错误
-    
-    Args:
-        e: 异常对象
-        
-    Returns:
-        str: 安全的字符串表示
-    """
-    try:
-        return str(e)
-    except UnicodeError:
-        return repr(e)
 import common_service.srv
 from enum import Enum,unique
 from xiaolv_msgs.msg import Chassis_odometry,Battery,Meteorological_sensor,Output,Input,Dr210_ultrasonic, Dr210_state,Pelco_state,Gps,Traffic_light_state,drobot_chassis_state,cleaning_state
@@ -73,10 +29,17 @@ import dr_nav_services.msg as drobot_nav_service
 from geometry_msgs.msg import PointStamped ,PoseStamped
 import master_node.coordinates as helper
 from datetime import datetime
-import master_node.mechanical_arm_controller as mechanical_arm_controller
-import json
 import drobot_manager_console.srv as console_service
-from drobot_manager_console.srv import MechanicalArmAction, MechanicalArmActionRequest, MechanicalArmActionResponse
+try:
+    from drobot_manager_console.srv import (
+        MechanicalArmAction,
+        MechanicalArmActionRequest,
+        MechanicalArmActionResponse)
+except ImportError:
+    # 旧版小车没有生成 MechanicalArmAction 服务；话题仍可用
+    MechanicalArmAction = None
+    MechanicalArmActionRequest = None
+    MechanicalArmActionResponse = None
 
 class MasterNodeSubscriber():
     sub_table = {}
@@ -103,14 +66,20 @@ class MasterNodeSubscriber():
     sensor_scan_grid_list = []
 
     # 构造函数，定义类的时候会自动引用
-    def __init__(self, mn):
+    def __init__(self, mn, mechanical_arm_controller):
         print("master_node_subscriber.py xc *********************0000************************")
         # 监听的topic
         self.master_node = mn
         self.TfListener = TransformListener()
-        
-        # 初始化机械臂控制器，使用正确的NX IP地址
-        self.mechanical_arm_controller = mechanical_arm_controller.MechanicalArmController(nx_host="192.168.2.103", nx_port=8888)
+
+        # Controller 由进程入口根据 launch 参数创建后注入。
+        if mechanical_arm_controller is None:
+            raise ValueError('mechanical_arm_controller不能为空')
+        print("机械臂视觉后端地址: {}:{}, vendor={}".format(
+            mechanical_arm_controller.nx_host,
+            mechanical_arm_controller.nx_port,
+            mechanical_arm_controller.arm_vendor))
+        self.mechanical_arm_controller = mechanical_arm_controller
         self.create_subscriber("velocity","wheel_car_like",Chassis_odometry,self.vel_cb) #1
         self.create_subscriber("raw_scan","scan", LaserScan, self.laser_scan_cb) #2
         self.create_subscriber("scan_grid","scan_grid",LaserScanGrid, self.laser_scan_grid_cb) #3
@@ -156,13 +125,25 @@ class MasterNodeSubscriber():
         self.create_subscriber("auto_mode","/drive_mode_status",std_msgs.msg.Int8, self.drive_mode_status_cb, queuesize = 10)
         self.create_subscriber("clean_state","/sweep_state",cleaning_state, self.cleaning_state_cb, queuesize = 5)
         self.create_subscriber("washer_devices_state","/cmd_clean_expand",std_msgs.msg.Int16, self.washer_devices_state_cb, queuesize = 5)
-        
-        # 创建机械臂动作话题订阅
-        self.create_subscriber("mechanical_arm_action_request","/mechanical_arm/action_request",std_msgs.msg.String,self.mechanical_arm_action_cb)
-        
-        # 创建机械臂动作服务
-        self.mechanical_arm_service = rospy.Service('/mechanical_arm/execute_action', MechanicalArmAction, self.handle_mechanical_arm_action)
-        print("机械臂动作服务已注册: /mechanical_arm/execute_action")
+
+        # 任务管理器触发机械臂（朋友版）：话题 + 可选服务；与 GOAL_REACHED 到站触发并存
+        self.create_subscriber(
+            "mechanical_arm_action_request",
+            "/mechanical_arm/action_request",
+            std_msgs.msg.String,
+            self.mechanical_arm_action_cb)
+        self.mechanical_arm_service = None
+        if MechanicalArmAction is not None:
+            self.mechanical_arm_service = rospy.Service(
+                '/mechanical_arm/execute_action',
+                MechanicalArmAction,
+                self.handle_mechanical_arm_action)
+            print("机械臂动作服务已注册: /mechanical_arm/execute_action")
+        else:
+            rospy.logwarn(
+                "未生成MechanicalArmAction服务，跳过服务注册；"
+                "/mechanical_arm/action_request话题仍可使用")
+
         exception_event_arr = ["sensor_exception_event", "chassis_exception_event"]
         self.create_subscriber("sensor_exception_event","/sensor_exception_event",CommonEvent, self.sensor_exception_cb, queuesize = 5)
         self.create_subscriber("chassis_exception_event","/sensor_exception_event",CommonEvent, self.sensor_exception_cb, queuesize = 5)
@@ -648,7 +629,7 @@ class MasterNodeSubscriber():
                 self.submsg_table['bt_navigator_status']['nav_status_data']['information'] = "FIXPATH_GOAL_UNREACHED"
         elif status_type == 4:
             #navigation status
-            self.submsg_table['bt_navigator_status']['nav_status_type'] = "navigation"  
+            self.submsg_table['bt_navigator_status']['nav_status_type'] = "navigation"
             status_data = (bt_navigator_status_msg & 240) >> 4  #analyze status data
             self.submsg_table['bt_navigator_status']['nav_status_data'] = {}
             if status_data == 2:
@@ -675,8 +656,8 @@ class MasterNodeSubscriber():
             elif status_data == 9:
                 self.submsg_table['bt_navigator_status']['nav_status_data']["finished"] = True
                 self.submsg_table['bt_navigator_status']['nav_status_data']['information'] = "GOAL_REACHED"
-                # 触发机械臂动作
-                self._trigger_mechanical_arm_action("GOAL_REACHED")
+                # 机械臂由任务管理器使用精确的 mapid/poseid 唯一触发。
+                # 此处只更新导航状态，避免使用缓存点位重复执行机械臂。
             elif status_data == 10:
                 self.submsg_table['bt_navigator_status']['nav_status_data']["finished"] = True
                 self.submsg_table['bt_navigator_status']['nav_status_data']['information'] = "GOAL_UNREACHED"
@@ -1044,7 +1025,7 @@ class MasterNodeSubscriber():
         clean_sate_msg['watering_swtich'] = data.water_switch_status   #当前洒水的状态：true: 表示当前正在洒水，false：未在洒水
         clean_sate_msg['sweep_switch'] = data.clean_switch_status      #当前清扫的状态：true: 表示当前正在清扫，false：未在清扫
         self.submsg_table['clean_state'] = clean_sate_msg
-    
+
     def washer_devices_state_cb(self, data):
         if self.submsg_recived_table['clean_state'] == False:
             self.submsg_recived_table['clean_state'] = True
@@ -1166,11 +1147,7 @@ class MasterNodeSubscriber():
             msg = {}
             msg['Level'] = data.level
             total_sensor_id = []
-            # 使用安全的JSON解析函数处理编码问题
-            value = safe_json_loads(data.event_content)
-            if value is None:
-                rospy.logerr("无法解析传感器异常事件内容")
-                return
+            value = json.loads(data.event_content)
             for id in value:
                 total_sensor_id.append(id['SensorID'].encode("ascii"))
             msg['Info'] = 'Laser disconnection, please check the laser !'
@@ -1179,382 +1156,186 @@ class MasterNodeSubscriber():
         if data.identifier == 'ChassisExceptionEvent':
             if self.submsg_recived_table['chassis_exception_event'] == False:
                 self.submsg_recived_table['chassis_exception_event'] = True
-            msg = {}    
+            msg = {}
             msg['Level'] = data.level
             msg['Info'] = data.event_content
             self.submsg_table['chassis_exception_event'] = msg
 
     def _trigger_mechanical_arm_action(self, status_type):
         """
-        触发机械臂动作 - 已禁用
-        注意：机械臂动作现在由任务管理器统一管理，此方法已禁用以避免重复触发
-        """
-        # 机械臂动作现在由任务管理器通过ROS话题统一管理
-        # 此方法已禁用以避免重复触发
-        print("=== 机械臂动作触发已禁用 ===")
-        print("状态类型: {}".format(status_type))
-        print("注意：机械臂动作现在由任务管理器统一管理，避免重复触发")
-        return
-    
-    def _get_current_mechanical_arm_action(self, current_task):
-        """
-        获取当前任务的机械臂动作信息
-        
-        Args:
-            current_task: 当前任务信息
-            
-        Returns:
-            dict: 机械臂动作信息，如果没有则返回None
-        """
-        try:
-            # 获取当前任务的所有动作
-            actions = current_task.get('actions', [])
-            
-            # 查找机械臂动作
-            for action in actions:
-                if action.get('type') == 'MECHANICAL_ARM':
-                    rospy.loginfo("找到机械臂动作: %s", action)
-                    return action
-            
-            rospy.loginfo("当前任务点无机械臂动作")
-            return None
-            
-        except Exception as e:
-            rospy.logerr("获取机械臂动作信息时发生异常: %s", safe_str(e))
-            return None
-    
-    def _get_current_task_from_manager(self):
-        """
-        直接从任务管理器获取当前任务信息
-        
-        Returns:
-            dict: 当前任务信息，如果没有则返回None
-        """
-        try:
-            print("尝试从任务管理器获取任务状态...")
-            rospy.loginfo("尝试从任务管理器获取任务状态...")
-            
-            # 调用任务管理器服务获取任务状态
-            task_status_req = console_service.GetTaskStatusRequest()
-            get_task_status_srv = rospy.ServiceProxy("/drobot_task_manager/get_task_status", console_service.GetTaskStatus)
-            
-            try:
-                get_task_status_srv.wait_for_service(3)
-                print("任务管理器服务可用")
-            except rospy.ROSException:
-                print("任务管理器服务不可用")
-                return None
-            
-            try:
-                resp = get_task_status_srv(task_status_req)
-                print("任务管理器服务调用成功")
-                print("  resp.success: {}".format(resp.success))
-                print("  resp.status: {}".format(resp.status))
-                print("  resp.current_task: {}".format(resp.current_task))
-                print("  resp.task: {}".format(resp.task))
-            except Exception as e:
-                print("任务管理器服务调用失败: {}".format(str(e)))
-                return None
-            
-            if resp.success:  # 服务调用成功，即使status为0也要处理
-                # 使用安全的JSON解析函数处理编码问题
-                current_task = safe_json_loads(resp.current_task)
-                tasks = safe_json_loads(resp.task)
-                
-                if current_task is None or tasks is None:
-                    rospy.logerr("无法解析任务管理器返回的JSON数据")
-                    return None
-                
-                # 构造任务信息 - 从tasks中提取点位信息
-                
-                # 从tasks中查找当前任务
-                current_point = ''
-                point_name = ''
-                if 'tasks' in tasks and tasks['tasks']:
-                    for task in tasks['tasks']:
-                        if task.get('name') == 'NavigationTask':
-                            param = task.get('param', {})
-                            current_point = param.get('point_name', '')
-                            point_name = param.get('point_name', '')
-                            
-                            # 获取动作列表
-                            actions = task.get('actions', [])
-                            break
-                
-                # 如果从tasks中没找到，再尝试从current_task中获取
-                if not current_point:
-                    current_point = current_task.get('param', {}).get('point_name', '')
-                    if not current_point:
-                        current_point = current_task.get('point_name', '')
-                    if not current_point:
-                        current_point = current_task.get('current_point', '')
-                
-                if not point_name:
-                    point_name = current_task.get('param', {}).get('point_name', '')
-                    if not point_name:
-                        point_name = current_task.get('point_name', '')
-                    if not point_name:
-                        point_name = current_task.get('current_point', '')
-                
-                # 获取动作列表
-                actions = []
-                if 'tasks' in tasks and tasks['tasks']:
-                    for task in tasks['tasks']:
-                        if task.get('name') == 'NavigationTask':
-                            actions = task.get('actions', [])
-                            break
-                
-                task_info = {
-                    'name': tasks.get('name', ''),
-                    'current_point': current_point,
-                    'point_name': point_name,
-                    'actions': actions
-                }
-                
-                # 安全地处理任务信息格式化，避免编码问题
-                try:
-                    safe_task_info = str(task_info).encode('utf-8').decode('utf-8')
-                    print("从任务管理器获取到任务信息: {}".format(safe_task_info))
-                    rospy.loginfo("从任务管理器获取到任务信息: %s", safe_task_info)
-                except (UnicodeError, UnicodeDecodeError):
-                    print("从任务管理器获取到任务信息: {}".format(repr(task_info)))
-                    rospy.loginfo("从任务管理器获取到任务信息: %s", repr(task_info))
-                
-                # 同时更新master_node中的任务信息
-                if hasattr(self.master_node, 'current_task_info'):
-                    self.master_node.current_task_info = task_info
-                    print("已更新master_node中的任务信息")
-                    rospy.loginfo("已更新master_node中的任务信息")
-                
-                return task_info
-            else:
-                print("任务管理器返回失败或无运行任务")
-                rospy.logwarn("任务管理器返回失败或无运行任务")
-                return None
-                
-        except Exception as e:
-            print("从任务管理器获取任务信息时发生异常: {}".format(safe_str(e)))
-            rospy.logerr("从任务管理器获取任务信息时发生异常: %s", safe_str(e))
-            return None
-    
-    
-    def _get_point_uuid_from_list(self, point_name):
-        """
-        从点位列表中获取点位UUID（参考示教完成时的逻辑）
-        
-        Args:
-            point_name: 点位名称
-            
-        Returns:
-            str: 点位UUID，如果找不到则返回None
-        """
-        try:
-            print("从点位列表查找UUID - 点位名称: {}".format(point_name))
-            
-            # 调用获取所有点位的服务
-            get_poses_req = console_service.GetPosesRequest()
-            get_poses_srv = rospy.ServiceProxy("/drobot_pose_manager/get_poses", console_service.GetPoses)
-            
-            try:
-                get_poses_srv.wait_for_service(3)
-            except rospy.ROSException:
-                print("点位管理服务不可用")
-                return None
-            
-            resp = get_poses_srv(get_poses_req)
-            
-            if resp.success and resp.poses:
-                # 遍历所有点位查找匹配的点位
-                for pose in resp.poses:
-                    if hasattr(pose, 'name') and pose.name == point_name:
-                        if hasattr(pose, 'poseId') and pose.poseId:
-                            print("在点位列表中找到UUID: {}".format(pose.poseId))
-                            return pose.poseId
-                        elif hasattr(pose, 'id') and pose.id:
-                            print("在点位列表中找到ID: {}".format(pose.id))
-                            return pose.id
-                
-                print("在点位列表中未找到匹配的点位")
-                return None
-            else:
-                print("获取点位列表失败")
-                return None
-                
-        except Exception as e:
-            print("从点位列表查找UUID时发生异常: {}".format(safe_str(e)))
-            return None
-    
-    def _get_current_point_actions_from_tasks(self, tasks, current_task):
-        """
-        从任务信息中获取当前点位的动作列表
-        
-        Args:
-            tasks: 任务信息
-            current_task: 当前任务信息
-            
-        Returns:
-            list: 当前点位的动作列表
-        """
-        try:
-            # 首先尝试从param中获取，如果没有则从根级别获取
-            current_point_name = current_task.get('param', {}).get('point_name', '')
-            if not current_point_name:
-                current_point_name = current_task.get('point_name', '')
-            if not current_point_name:
-                # 如果还是没有，尝试使用current_point作为点位名称
-                current_point_name = current_task.get('current_point', '')
-            if not current_point_name:
-                return []
-            
-            # 确保字符串是安全的UTF-8编码
-            try:
-                current_point_name = str(current_point_name).encode('utf-8').decode('utf-8')
-            except (UnicodeError, UnicodeDecodeError):
-                current_point_name = str(current_point_name)
-            
-            # 从任务中查找当前点位对应的子任务
-            sub_tasks = tasks.get('tasks', [])  # 修改为tasks而不是subTasks
-            print("查找子任务，当前点位名称: {}".format(current_point_name))
-            print("子任务列表: {}".format(sub_tasks))
-            for sub_task in sub_tasks:
-                # 安全地处理子任务的点位名称
-                try:
-                    sub_point_name = str(sub_task.get('point_name', '')).encode('utf-8').decode('utf-8')
-                    sub_name = str(sub_task.get('name', '')).encode('utf-8').decode('utf-8')
-                except (UnicodeError, UnicodeDecodeError):
-                    sub_point_name = str(sub_task.get('point_name', ''))
-                    sub_name = str(sub_task.get('name', ''))
-                
-                # 多种匹配方式：精确匹配、包含匹配、ID匹配
-                exact_match = (sub_point_name == current_point_name or 
-                              sub_name == current_point_name)
-                
-                # 检查是否包含当前点位ID
-                contains_match = (current_point_name in sub_point_name or 
-                                current_point_name in sub_name)
-                
-                # 检查子任务是否包含当前点位ID
-                reverse_contains_match = (sub_point_name in current_point_name or 
-                                        sub_name in current_point_name)
-                
-                if exact_match or contains_match or reverse_contains_match:
-                    actions = sub_task.get('actions', [])
-                    # 安全地处理字符串格式化，避免编码问题
-                    try:
-                        safe_current_point_name = str(current_point_name).encode('utf-8').decode('utf-8')
-                        safe_actions = str(actions).encode('utf-8').decode('utf-8')
-                        print("找到当前点位动作: {} -> {}".format(safe_current_point_name, safe_actions))
-                        rospy.loginfo("找到当前点位动作: %s -> %s", safe_current_point_name, safe_actions)
-                    except (UnicodeError, UnicodeDecodeError):
-                        print("找到当前点位动作: {} -> {}".format(repr(current_point_name), repr(actions)))
-                        rospy.loginfo("找到当前点位动作: %s -> %s", repr(current_point_name), repr(actions))
-                    return actions
-            
-            # 安全地处理字符串格式化，避免编码问题
-            try:
-                safe_current_point_name = str(current_point_name).encode('utf-8').decode('utf-8')
-                print("未找到当前点位 {} 对应的动作".format(safe_current_point_name))
-                rospy.logwarn("未找到当前点位 %s 对应的动作", safe_current_point_name)
-            except (UnicodeError, UnicodeDecodeError):
-                print("未找到当前点位 {} 对应的动作".format(repr(current_point_name)))
-                rospy.logwarn("未找到当前点位 %s 对应的动作", repr(current_point_name))
-            return []
-            
-        except Exception as e:
-            print("获取当前点位动作时发生异常: {}".format(safe_str(e)))
-            rospy.logerr("获取当前点位动作时发生异常: %s", safe_str(e))
-            return []
+        触发机械臂动作
+        机器人到达导航点时发送 mapid + poseid 给 NX
 
-    def _get_current_map_id(self):
-        """
-        获取当前地图ID
-        
-        Returns:
-            str: 当前地图ID
+        Args:
+            status_type: 导航状态类型 ("GOAL_REACHED" 或 "FIXPATH_REACHED")
         """
         try:
-            # 从地图信息中获取地图ID
-            if self.check_reviced('map_info'):
-                map_info = self.submsg_table['map_info']
-                map_id = getattr(map_info, 'mapId', None) or getattr(map_info, 'mapname', 'unknown_map')
-                rospy.loginfo("获取到当前地图ID: %s", map_id)
-                return str(map_id)
+            if status_type != "GOAL_REACHED":
+                rospy.loginfo("导航状态为 %s，跳过机械臂动作触发", status_type)
+                return
+
+            map_id, pose_id, point_name = self._resolve_current_nav_point()
+            if not map_id or not pose_id:
+                rospy.logwarn("无法解析当前地图/点位，跳过机械臂动作触发 map=%s pose=%s", map_id, pose_id)
+                return
+
+            rospy.loginfo("机器人到达导航点，触发机械臂动作 - 地图: %s, 点位: %s (%s)",
+                          map_id, pose_id, point_name)
+
+            # 写入 current_task_info 便于调试与后续扩展
+            self.master_node.current_task_info = {
+                'current_point': pose_id,
+                'point_name': point_name,
+                'map_id': map_id,
+            }
+
+            success = self.mechanical_arm_controller.execute_navigation_point_action(map_id, pose_id)
+            if success:
+                rospy.loginfo("机械臂动作触发成功 - 地图: %s, 点位: %s", map_id, pose_id)
             else:
-                rospy.logwarn("无法获取地图信息，使用默认地图ID")
-                return 'unknown_map'
-                
+                rospy.logwarn("机械臂动作触发失败 - 地图: %s, 点位: %s", map_id, pose_id)
+
         except Exception as e:
-            rospy.logerr("获取地图ID时发生异常: %s", safe_str(e))
-            return 'unknown_map'
-    
+            rospy.logerr("触发机械臂动作时发生异常: %s", str(e))
+
+    def _resolve_current_nav_point(self):
+        """
+        从地图信息与任务状态解析当前 mapid / poseid
+
+        Returns:
+            (map_id, pose_id, point_name)
+        """
+        map_id = ''
+        pose_id = ''
+        point_name = ''
+
+        try:
+            if self.check_reviced('map_info'):
+                map_id = str(getattr(self.submsg_table['map_info'], 'mapId', '') or '')
+        except Exception as e:
+            rospy.logwarn("获取地图ID失败: %s", str(e))
+
+        # 优先使用已缓存的任务信息
+        try:
+            if hasattr(self.master_node, 'current_task_info') and self.master_node.current_task_info:
+                cached = self.master_node.current_task_info
+                if cached.get('current_point'):
+                    pose_id = str(cached.get('current_point'))
+                    point_name = str(cached.get('point_name', pose_id))
+                    if cached.get('map_id') and not map_id:
+                        map_id = str(cached.get('map_id'))
+        except Exception:
+            pass
+
+        # 从任务管理器查询当前导航点
+        if not pose_id:
+            try:
+                import drobot_manager_console.srv as console_service
+                task_status_req = console_service.GetTaskStatusRequest()
+                get_task_status_srv = rospy.ServiceProxy(
+                    "/drobot_task_manager/get_task_status", console_service.GetTaskStatus)
+                resp = get_task_status_srv(task_status_req)
+                if resp.success:
+                    current_task = json.loads(resp.current_task)
+                    tasks_payload = json.loads(resp.task)
+
+                    param = current_task.get('param') or {}
+                    point_name = str(param.get('point_name') or param.get('name') or '')
+                    pose_id = str(
+                        param.get('id') or
+                        param.get('point_id') or
+                        param.get('pose_id') or
+                        param.get('poseId') or
+                        ''
+                    )
+
+                    # 从任务列表按索引取点
+                    if not pose_id:
+                        idx = int(current_task.get('current_task', 0) or 0) - 1
+                        task_list = []
+                        if isinstance(tasks_payload, dict):
+                            task_list = tasks_payload.get('tasks') or []
+                        elif isinstance(tasks_payload, list):
+                            task_list = tasks_payload
+                        if 0 <= idx < len(task_list):
+                            sub = task_list[idx] or {}
+                            pose_id = str(sub.get('id') or sub.get('poseId') or sub.get('pose_id') or '')
+                            if not point_name:
+                                point_name = str(sub.get('name') or sub.get('point_name') or pose_id)
+                            # 若有 MECHANICAL_ARM 动作，优先使用其 pointId
+                            for action in (sub.get('actions') or []):
+                                if action.get('type') == 'MECHANICAL_ARM':
+                                    arm_point = (action.get('param') or {}).get('pointId')
+                                    if arm_point:
+                                        pose_id = str(arm_point)
+                                        break
+
+                    # 名字兜底：示教时也可能用名称作 poseid
+                    if not pose_id and point_name:
+                        pose_id = point_name
+            except Exception as e:
+                rospy.logwarn("查询任务状态解析点位失败: %s", str(e))
+
+        if not map_id:
+            map_id = 'unknown_map'
+        if not point_name:
+            point_name = pose_id
+        return map_id, pose_id, point_name
+
     def mechanical_arm_action_cb(self, msg):
         """
-        处理机械臂动作请求话题
-        
-        Args:
-            msg: std_msgs.String 包含 "map_id|point_id" 格式的消息
+        处理机械臂动作请求话题（任务管理器）
+        消息格式: "map_id|point_id"
         """
         try:
             print("=== 机械臂动作请求 ===")
             print("原始消息: {}".format(msg.data))
-            
-            # 解析消息格式: "map_id|point_id"
+
             if "|" in msg.data:
                 map_id, point_id = msg.data.split("|", 1)
                 print("地图ID: {}".format(map_id))
                 print("点位ID: {}".format(point_id))
-                
-                # 调用机械臂控制器执行动作
+
                 success = self.mechanical_arm_controller.execute_navigation_point_action(
                     map_id=map_id,
                     point_id=point_id,
-                    wait_for_completion=True,  # 任务管理器需要等待完成
-                    timeout=200  # 200秒超时
+                    wait_for_completion=True,
+                    timeout=300
                 )
-                
+
                 if success:
                     print("=== 机械臂动作执行成功 ===")
                 else:
                     print("=== 机械臂动作执行失败 ===")
             else:
                 print("=== 机械臂动作消息格式错误: {} ===".format(msg.data))
-                
+
         except Exception as e:
-            error_msg = "机械臂动作处理异常: {}".format(safe_str(e))
+            error_msg = "机械臂动作处理异常: {}".format(str(e))
             print("[ERROR] {}".format(error_msg))
             rospy.logerr("%s", error_msg)
-    
+
     def handle_mechanical_arm_action(self, req):
         """
-        处理机械臂动作服务请求
-        
-        Args:
-            req: MechanicalArmActionRequest
-            
-        Returns:
-            MechanicalArmActionResponse
+        处理机械臂动作服务请求（可选，依赖 MechanicalArmAction.srv）
         """
         try:
             print("=== 机械臂动作服务请求 ===")
             print("地图ID: {}".format(req.map_id))
             print("点位ID: {}".format(req.point_id))
-            print("拍摄类型: {}".format(req.camera_type if hasattr(req, 'camera_type') and req.camera_type else 'visible(默认)'))
-            print("机械臂点标签: {}".format(req.label if hasattr(req, 'label') and req.label else '所有机械臂点'))
-            print("补光灯开关: {}".format(req.fill_light_enabled if hasattr(req, 'fill_light_enabled') else False))
             print("等待完成: {}".format(req.wait_for_completion))
             print("超时时间: {}秒".format(req.timeout))
-            
-            # 调用机械臂控制器执行动作
+
             success = self.mechanical_arm_controller.execute_navigation_point_action(
                 map_id=req.map_id,
                 point_id=req.point_id,
-                camera_type=req.camera_type if hasattr(req, 'camera_type') else '',  # 传递拍摄类型
-                label=req.label if hasattr(req, 'label') else '',  # 传递机械臂点标签
-                fill_light_enabled=req.fill_light_enabled if hasattr(req, 'fill_light_enabled') else False,  # 传递补光灯开关状态
                 wait_for_completion=req.wait_for_completion,
                 timeout=req.timeout
             )
-            
+
+            if MechanicalArmActionResponse is None:
+                return None
+
             if success:
                 print("=== 机械臂动作执行成功 ===")
                 return MechanicalArmActionResponse(
@@ -1562,18 +1343,19 @@ class MasterNodeSubscriber():
                     error_message="",
                     completion_message="机械臂动作执行完成"
                 )
-            else:
-                print("=== 机械臂动作执行失败 ===")
-                return MechanicalArmActionResponse(
-                    success=False,
-                    error_message="机械臂动作执行失败",
-                    completion_message=""
-                )
-                
+            print("=== 机械臂动作执行失败 ===")
+            return MechanicalArmActionResponse(
+                success=False,
+                error_message="机械臂动作执行失败",
+                completion_message=""
+            )
+
         except Exception as e:
-            error_msg = "机械臂动作服务处理异常: {}".format(safe_str(e))
+            error_msg = "机械臂动作服务处理异常: {}".format(str(e))
             print("[ERROR] {}".format(error_msg))
             rospy.logerr("%s", error_msg)
+            if MechanicalArmActionResponse is None:
+                return None
             return MechanicalArmActionResponse(
                 success=False,
                 error_message=error_msg,

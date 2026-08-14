@@ -30,7 +30,7 @@ class ExecutorNode(Node):
             'apriltag_cache_ttl_sec': 60.0,
             'apriltag_max_robot_drift_mm': 10.0,
             'apriltag_max_robot_drift_deg': 3.0,
-            'max_move_translation_mm': 300.0,
+            'max_move_translation_mm': 500.0,
             'max_move_rotation_deg': 45.0,
             'workspace_min_xyz_mm': [-850.0, -850.0, 20.0],
             'workspace_max_xyz_mm': [850.0, 850.0, 1200.0],

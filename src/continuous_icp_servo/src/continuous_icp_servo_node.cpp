@@ -296,18 +296,6 @@ private:
         next.valid = true;
         {
           std::lock_guard<std::mutex> lk(tool_mtx_);
-          if (latest_tool_.valid) {
-            const Point previous(latest_tool_.x, latest_tool_.y, latest_tool_.z);
-            const Point current(next.x, next.y, next.z);
-            if ((current - previous).norm() > 200.0) {
-              const int dropped = ++getpose_drop_count_;
-              if (dropped == 1 || dropped % 20 == 0) {
-                RCLCPP_WARN(this->get_logger(), "拒绝GetPose跳变：%.1fmm", (current - previous).norm());
-              }
-              finishDashboardRequest();
-              return;
-            }
-          }
           latest_tool_ = next;
           pose_history_.push_back(next);
           while (pose_history_.size() > 100) {

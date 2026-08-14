@@ -16,7 +16,7 @@ vision_arm_executor:
     apriltag_cache_ttl_sec: 60.0
     apriltag_max_robot_drift_mm: 10.0
     apriltag_max_robot_drift_deg: 3.0
-    max_move_translation_mm: 300.0
+    max_move_translation_mm: 500.0
     max_move_rotation_deg: 45.0
     workspace_min_xyz_mm: [-850.0, -850.0, 20.0]
     workspace_max_xyz_mm: [850.0, 850.0, 1200.0]
@@ -33,7 +33,7 @@ apriltag_pick:
     tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260714_095024.json"
     debug_output_dir: "/home/ylx/Robot_Arm_Project/scripts/apriltag_validation_runs"
     robot_speed: 15
-    # Only vision_arm_executor.execution_enable may temporarily enable pick.
+    # NX production enables motion until explicit execution_disable or teaching.
     execute_enabled: false
     samples: 10
     sample_window_sec: 2.0

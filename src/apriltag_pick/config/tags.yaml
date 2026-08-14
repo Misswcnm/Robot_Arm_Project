@@ -12,6 +12,6 @@
       sharpening: 0.25
       debug: false
     pose_estimation_method: pnp
-    tag:
-      ids: [0]
-      frames: ["tag36h11:0"]
+    # Do not configure tag.ids/tag.frames: apriltag_ros then publishes every
+    # detected 36h11 ID with its default frame name tag36h11:<id>. The station
+    # point's saved tag_id selects one target when several tags are visible.

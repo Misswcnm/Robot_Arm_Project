@@ -2,10 +2,15 @@ import json
 import uuid
 
 MAX_MESSAGE_BYTES = 65536
-VALID_ACTIONS = set(['arm_status','vision_icp_record_a','vision_icp_record_b',
- 'vision_icp_align','vision_icp_align_and_move_b','apriltag_locate','apriltag_validate',
- 'apriltag_pick','task_status','task_cancel','execution_enable','execution_disable','health',
- 'robot_reset','robot_enable','robot_disable','robot_clear_error'])
+VALID_ACTIONS = set(['arm_status',
+ 'vision_point_teach','vision_station_points','vision_station_execute',
+ 'vision_icp_align',
+ 'vision_icp_align_and_move_b',
+ 'apriltag_locate','apriltag_locate_and_pick',
+ 'apriltag_locate_and_touch','apriltag_validate',
+ 'apriltag_pick','task_status','task_cancel','execution_enable',
+ 'execution_disable','health','robot_reset','robot_enable','robot_disable',
+ 'robot_start_drag','robot_stop_drag','robot_clear_error'])
 
 def request_id(value=None): return value or str(uuid.uuid4())
 def decode_line(data, limit=MAX_MESSAGE_BYTES):

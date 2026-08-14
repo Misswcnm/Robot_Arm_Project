@@ -6,8 +6,8 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   T_delta = X @ T_cam @ X⁻¹              (camera→tool frame)
   T_correction = inv(T_delta)             (取消误差的方向)
   T_target = T_cur @ T_correction         (100%全量补偿)
-  → MovJ(x,y,z,rx,ry,rz)                 (控制器笛卡尔点到点)
-    失败/未到位时 → Jacobian IK → JointMovJ 兜底
+  → 控制器IK求最终目标
+    ESTUN无解时 → 完整可逆的平滑空间过渡点 → 原目标
 """
 import os
 import tempfile
@@ -33,17 +33,22 @@ class VisualServo:
         self._p2plane_ref = None
         self._T_base_tool_ref = None
         self._T_base_camera_ref = None
-        self._last_tool = None
         self._step_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
-        self.final_icp_trans_thresh_mm = 2.0
+        # Allow one residual-qualified ICP result within 4 mm.  The extra
+        # 2 mm absorbs the measured calibration/reconstruction deviation.
+        self.final_icp_trans_thresh_mm = 4.0
         self.final_icp_rot_thresh_deg = 0.2
-        self.final_stable_frames = 2
+        # One residual-qualified frame is sufficient after the explicit
+        # production recovery move to the taught A pose.
+        self.final_stable_frames = 1
         self._stable_count = 0
         self.point_to_plane_trigger_mm = 10.0
         self.point_to_plane_dmax = 0.010
         self.point_to_plane_iters = 6
         self.point_to_plane_max_points = 80000
+        self.template_capture_max_motion_mm = 2.0
+        self.template_capture_max_rotation_deg = 0.5
         self._cartesian_movj_disabled = False
         self.last_align_result = {}
 
@@ -90,20 +95,31 @@ class VisualServo:
 
     @staticmethod
     def _estimate_normals(pts: np.ndarray, tree, k: int = 16) -> np.ndarray:
-        """用局部PCA估计模板点法向, 供point-to-plane精配准使用."""
+        """Vectorized local-PCA normals for point-to-plane registration.
+
+        The old implementation called ``np.linalg.svd`` once per point from a
+        Python loop.  An 80k-point template therefore took minutes and starved
+        the commissioning request.  Query neighbours once, then solve the
+        3x3 covariance matrices in bounded vectorized batches.
+        """
         if len(pts) == 0:
             return np.empty((0, 3), dtype=np.float64)
         kk = min(k, len(pts))
         _, idx = tree.query(pts, k=kk, workers=-1)
         if kk == 1:
             return np.tile(np.array([0.0, 0.0, 1.0]), (len(pts), 1))
-        normals = np.zeros_like(pts)
-        for i, neigh_idx in enumerate(idx):
-            q = pts[np.atleast_1d(neigh_idx)]
-            q = q - q.mean(axis=0)
-            _, _, vh = np.linalg.svd(q, full_matrices=False)
-            n = vh[-1]
-            normals[i] = n / (np.linalg.norm(n) + 1e-12)
+        normals = np.empty_like(pts)
+        batch_size = 4096
+        for start in range(0, len(pts), batch_size):
+            stop = min(len(pts), start + batch_size)
+            neighbours = pts[idx[start:stop]]
+            centred = neighbours - neighbours.mean(axis=1, keepdims=True)
+            covariance = np.einsum(
+                'bki,bkj->bij', centred, centred, optimize=True)
+            unused_values, eigenvectors = np.linalg.eigh(covariance)
+            normals[start:stop] = eigenvectors[:, :, 0]
+        normals /= np.linalg.norm(
+            normals, axis=1, keepdims=True) + 1e-12
         return normals
 
     @staticmethod
@@ -187,9 +203,14 @@ class VisualServo:
 
     # ── Template: pre-build pyramid with KDTree ──
     def record_template(self, n_frames: int = 5) -> bool:
-        """多帧融合→5mm压缩→预建3层KDTree pyramid"""
+        """Synchronously capture A, then build the persistent ICP template."""
+        started = time.perf_counter()
         print(f'🎯 录制模板 ({n_frames} 帧)...')
-        pc_node = getattr(self, '_pc_node', None)
+        T_before = self._read_tool_matrix()
+        if T_before is None:
+            print('❌ 模板采集前 GetPose 无有效位姿')
+            return False
+
         frames = []
         for i in range(n_frames):
             pc = self._capture_pc(vs=0.005)
@@ -198,6 +219,29 @@ class VisualServo:
                 print(f'  [{i+1}/{n_frames}] {len(pc)} 点')
         if len(frames) < 2:
             print('❌ 点云帧不足'); return False
+
+        # Read the robot pose immediately after acquisition, before any costly
+        # cloud processing.  A template is invalid if the arm moved while its
+        # camera frames were being collected.
+        T_after = self._read_tool_matrix()
+        if T_after is None:
+            print('❌ 模板采集后 GetPose 无有效位姿')
+            return False
+        T_motion = np.linalg.inv(T_before) @ T_after
+        capture_motion_mm = float(np.linalg.norm(T_motion[:3, 3]))
+        capture_rotation_deg = float(np.degrees(np.linalg.norm(
+            Rot.from_matrix(T_motion[:3, :3]).as_rotvec())))
+        if (capture_motion_mm > self.template_capture_max_motion_mm or
+                capture_rotation_deg >
+                self.template_capture_max_rotation_deg):
+            print(
+                '❌ 模板采集期间机械臂移动: '
+                f'{capture_motion_mm:.2f}mm/{capture_rotation_deg:.3f}° '
+                f'(限制 {self.template_capture_max_motion_mm:.1f}mm/'
+                f'{self.template_capture_max_rotation_deg:.1f}°)')
+            return False
+        self._T_base_tool_ref = T_after
+        self._T_base_camera_ref = self._T_base_tool_ref @ self.X
 
         # Fuse + compress to 5mm (target ~100k points)
         merged = np.vstack(frames)
@@ -220,15 +264,14 @@ class VisualServo:
         self._p2plane_ref = (p2_pts, p2_tree, p2_normals)
         print(f'  L3(p2plane): {len(p2_pts)}pts normals={((time.perf_counter()-t_normals)*1000):.0f}ms')
 
-        self._T_base_tool_ref = self._get_tool_matrix()
-        if self._T_base_tool_ref is None:
-            print('❌ GetPose 无有效位姿'); return False
-        self._T_base_camera_ref = self._T_base_tool_ref @ self.X
-
         self._step_count = 0  # reset for new template
         self._stable_count = 0
         t = self._T_base_tool_ref[:3, 3]
-        print(f'✅ 模板OK  xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}]')
+        elapsed = time.perf_counter() - started
+        print(
+            f'✅ 模板OK  xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}] '
+            f'capture_motion={capture_motion_mm:.2f}mm/'
+            f'{capture_rotation_deg:.3f}° total={elapsed:.2f}s')
         return True
 
     def save_template(self, path: str) -> str:
@@ -277,26 +320,20 @@ class VisualServo:
                 saved['T_base_tool_ref'], dtype=float)
             self._T_base_camera_ref = np.asarray(
                 saved['T_base_camera_ref'], dtype=float)
-        self._last_tool = None
         self._stable_count = 0
         return True
 
-    def _get_tool_matrix(self) -> np.ndarray | None:
-        """GetPose → 4x4 SE3. 跳变>200mm时拒绝, 用上次有效值."""
+    def _read_tool_matrix(self) -> np.ndarray | None:
+        """Read one unmodified GetPose sample as a 4x4 base-flange pose."""
         tool = self.robot.get_tool()
         if tool is None:
             return None
         x, y, z = tool[:3]
-        # Jump detection
-        if self._last_tool is not None:
-            d = np.linalg.norm(np.array([x,y,z]) - np.array(self._last_tool[:3]))
-            if d > 200:
-                print(f'  ⚠ GetPose跳变{d:.0f}mm, 用上次值')
-                x, y, z = self._last_tool[:3]
-                tool = self._last_tool
-        self._last_tool = tool
-        R = Rot.from_euler('xyz', [tool[3], tool[4], tool[5]], degrees=True).as_matrix()
-        T = np.eye(4); T[:3,:3] = R; T[:3,3] = [x, y, z]
+        R = Rot.from_euler(
+            'xyz', [tool[3], tool[4], tool[5]], degrees=True).as_matrix()
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
         return T
 
     def _capture_pc(self, vs: float = 0.005) -> np.ndarray | None:
@@ -304,7 +341,9 @@ class VisualServo:
         pc_node = getattr(self, '_pc_node', None)
         if pc_node is None:
             return None
-        pc_node.wait_fresh()  # ← 确保是新帧
+        if not pc_node.wait_fresh(timeout=2.0):
+            print('  ⚠ 等待新点云帧超时')
+            return None
         pc = pc_node.latest_pc
         if pc is not None and len(pc) > 500:
             return voxel_down(pc, vs)
@@ -334,7 +373,7 @@ class VisualServo:
             out['error'] = '点云失败'
             return out
 
-        T_cur = self._get_tool_matrix()
+        T_cur = self._read_tool_matrix()
         if T_cur is None:
             out['error'] = 'GetPose失败'
             return out
@@ -511,8 +550,51 @@ class VisualServo:
                 return out
 
         pre_move = self.robot.get_tool()
+        solved_path_move = getattr(
+            self.robot, 'movj_solved_path_status', None)
+        motion_path = (
+            'Codroid平滑空间过渡IK'
+            if solved_path_move is not None else '优先MovJ(pose)')
         print(f'  {mode}补偿 100% (step{self._step_count}, 不限幅): '
-              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  优先MovJ(pose)')
+              f'Δp=[{dp[0]:.1f} {dp[1]:.1f} {dp[2]:.1f}]mm  '
+              f'{motion_path}')
+        if solved_path_move is not None:
+            print('  ↳ ESTUN先解最终目标；无解时预规划完整可逆的平滑空间过渡点')
+            solved_status = solved_path_move(
+                T_target, label=f'{mode}补偿/Codroid IK',
+                start_pose=pre_move, motion_guard=motion_guard)
+            if solved_status == 'arrived':
+                motion_mode = getattr(
+                    self.robot, 'last_icp_motion_mode', None)
+                if motion_mode:
+                    out['motion_mode'] = str(motion_mode)
+                waypoint_count = getattr(
+                    self.robot, 'last_icp_waypoint_count', None)
+                if waypoint_count is not None:
+                    out['motion_waypoints'] = int(waypoint_count)
+                after = self.robot.get_tool()
+                if after and pre_move:
+                    dp_real = np.linalg.norm(
+                        np.array(after[:3]) - np.array(pre_move[:3]))
+                    Ra = Rot.from_euler(
+                        'xyz', after[3:6], degrees=True).as_matrix()
+                    Rb = Rot.from_euler(
+                        'xyz', pre_move[3:6], degrees=True).as_matrix()
+                    dr = np.degrees(np.linalg.norm(
+                        Rot.from_matrix(Ra @ Rb.T).as_rotvec()))
+                    self._total_dp += dp_real
+                    self._total_dr += dr
+                    print(f'  → Solved JointMovJ '
+                          f'{dp_real/10:.1f}cm  {dr:.1f}°')
+                out['ok'] = True
+                return out
+            out['ok'] = False
+            out['fatal'] = True
+            out['error'] = (
+                'Codroid最终目标及平滑空间过渡路径均无完整逆解；未发送运动')
+            print(f'  ❌ {out["error"]}')
+            return out
+
         attempted_cartesian_movj = False
         if self._cartesian_movj_disabled:
             print('  ↳ 本次闭环已检测到MovJ(pose)触发控制器ERROR, 直接使用Jacobian兜底')
@@ -521,7 +603,8 @@ class VisualServo:
 
         if attempted_cartesian_movj:
             movj_status = self.robot.movj_pose_status(
-                T_target, label=f'{mode}补偿/MovJ')
+                T_target, label=f'{mode}补偿/MovJ',
+                start_pose=pre_move)
             if movj_status == 'arrived':
                 after = self.robot.get_tool()
                 if after and pre_move:
@@ -563,7 +646,7 @@ class VisualServo:
             out['ok'] = False; out['error'] = 'Jacobian奇异'; return out
 
         target_j = [j_now[i] + dtheta[i] for i in range(6)]
-        print('  Jacobian补偿(100%, 不限幅): '
+        print('  Jacobian关节兜底: '
               f'Δp=[{jac_dp[0]:.1f} {jac_dp[1]:.1f} {jac_dp[2]:.1f}]mm '
               f'Δθ=[{dtheta[0]:+.2f} {dtheta[1]:+.2f} {dtheta[2]:+.2f} '
               f'{dtheta[3]:+.2f} {dtheta[4]:+.2f} {dtheta[5]:+.2f}]°')
@@ -619,6 +702,10 @@ class VisualServo:
                 return True
             if result.get('cancelled'):
                 self.last_align_result['reason'] = 'cancelled_or_timeout'
+                return False
+            if result.get('fatal'):
+                self.last_align_result['reason'] = 'motion_unreachable'
+                print('  ❌ 运动目标不可达，立即结束本次ICP闭环')
                 return False
             if result['ok']:
                 continue  # 成功, 下一轮

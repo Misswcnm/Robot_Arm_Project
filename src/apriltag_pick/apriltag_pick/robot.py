@@ -75,6 +75,18 @@ class CR5Robot:
 
     def initialize(self):
         """Never PowerOn: this CR5 requires this exact safe sequence."""
+        # Do not introduce a DisableRobot/EnableRobot cycle when production
+        # switches from an ICP point to an AprilTag point while the same CR5
+        # is already enabled.
+        if self.get_mode() == self.MODE_ENABLED:
+            if not self.apply_motion_safety():
+                raise RuntimeError('速度/碰撞等级设置失败')
+            if not self.use_base_tool0():
+                raise RuntimeError('User(0)/Tool(0) 坐标系设置失败')
+            self.dragging = False
+            self.log.info(
+                f'CR5 already enabled: speed={self.speed}%, collision=5')
+            return True
         self.call(self.clear, ClearError.Request())
         self.call(self.disable, DisableRobot.Request())
         response = self.call(self.enable, EnableRobot.Request(), 12.0)
@@ -88,6 +100,7 @@ class CR5Robot:
             raise RuntimeError(f'初始化后状态异常: RobotMode={self.get_mode()}，期望5')
         self.dragging = False
         self.log.info(f'CR5 ready: speed={self.speed}%, collision=5')
+        return True
 
     def use_base_tool0(self):
         """Select User0/Tool0 for commands whose target is a flange pose."""

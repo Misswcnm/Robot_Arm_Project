@@ -52,17 +52,34 @@ def load_handeye(path):
 
 def load_tcp_offset(path):
     """Load flange-origin to physical-tip translation in flange coordinates."""
-    path = Path(path).expanduser()
-    with path.open(encoding='utf-8') as stream:
-        data = json.load(stream)
+    current = Path(path).expanduser()
+    if not current.is_absolute():
+        current = current.resolve()
+    visited = set()
+    for _ in range(4):
+        current = current.resolve()
+        if current in visited:
+            raise ValueError(f'TCP标定指针循环引用: {current}')
+        visited.add(current)
+        with current.open(encoding='utf-8') as stream:
+            data = json.load(stream)
+        if isinstance(data, str):
+            target = Path(data).expanduser()
+            current = target if target.is_absolute() else current.parent / target
+            continue
+        if not isinstance(data, dict):
+            raise ValueError(f'无效TCP标定入口: {current}')
+        break
+    else:
+        raise ValueError(f'TCP标定指针层级过深: {path}')
     result = data['result']
     record = result.get(
         'tcp_offset_flange_mm', result.get('tcp_offset_tool_mm'))
     if record is None:
-        raise ValueError(f'缺少 tcp_offset_flange_mm: {path}')
+        raise ValueError(f'缺少 tcp_offset_flange_mm: {current}')
     offset = np.asarray(record, dtype=float)
     if offset.shape != (3,) or not np.isfinite(offset).all():
-        raise ValueError(f'无效TCP标定: {path}')
+        raise ValueError(f'无效TCP标定: {current}')
     return offset
 
 

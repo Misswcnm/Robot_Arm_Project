@@ -40,6 +40,8 @@ class AprilTagPickNode(Node):
         self.samples = int(p('samples', 10).value)
         self.max_sample_spread_mm = float(p('max_sample_spread_mm', 8.0).value)
         self.pregrasp_height = float(p('pregrasp_height_mm', 80.0).value)
+        self.motion_limits_enabled = bool(
+            p('motion_limits_enabled', True).value)
         self.min_base_z = float(p('min_base_z_mm', 20.0).value)
         self.max_reach = float(p('max_base_radius_mm', 850.0).value)
         self.gripper_enabled = bool(p('gripper.enabled', False).value)
@@ -65,11 +67,12 @@ class AprilTagPickNode(Node):
             self.get_logger().error(
                 '以下标定文件的坐标契约不完整，已强制关闭自动运动：\n  - ' +
                 '\n  - '.join(invalid_frame_files) +
-                '\n手眼必须声明 T_base_flange(User0) 与 T_flange_camera；'
+                '\n手眼必须声明 T_base_flange 与 T_flange_camera；'
                 'TCP 文件必须声明其法兰偏移约定。')
         self.robot = CR5Robot(self, speed=int(p('robot_speed', 15).value))
         self.latest = None
         self.history = []
+        self.tag_histories = {}
         self.image_history = []
         self.detection_history = []
         self.camera_info = None
@@ -99,8 +102,7 @@ class AprilTagPickNode(Node):
             _, data = load_handeye_document(path)
             frames = data.get('coordinate_frames', {})
             contract = str(frames.get('tcp_offset', '')).lower()
-            return (frames.get('user_index') == 0 and
-                    ('flange' in contract or frames.get('tool_index') == 0))
+            return 'flange' in contract
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
 
@@ -113,8 +115,7 @@ class AprilTagPickNode(Node):
                 frames.get('camera_extrinsic') == 'T_flange_camera' or
                 'flange' in str(frames.get('robot_pose', '')).lower())
             legacy_tool0_flange = frames.get('tool_index') == 0
-            return (frames.get('user_index') == 0 and
-                    (has_flange_contract or legacy_tool0_flange))
+            return has_flange_contract or legacy_tool0_flange
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
 
@@ -147,8 +148,14 @@ class AprilTagPickNode(Node):
         return float(np.degrees(np.arccos(cosine)))
 
     def _tf_callback(self, message):
+        family_prefix = self.tag_frame.rsplit(':', 1)[0] + ':'
         for item in message.transforms:
-            if item.child_frame_id != self.tag_frame:
+            child_frame = str(item.child_frame_id)
+            if not child_frame.startswith(family_prefix):
+                continue
+            try:
+                int(child_frame.rsplit(':', 1)[1])
+            except (IndexError, ValueError):
                 continue
             t, q = item.transform.translation, item.transform.rotation
             transform = pose_matrix(
@@ -156,9 +163,12 @@ class AprilTagPickNode(Node):
                 quat_xyzw=[q.x, q.y, q.z, q.w])
             stamp = item.header.stamp.sec + item.header.stamp.nanosec * 1e-9
             with self.lock:
-                self.latest = (stamp, transform)
-                self.history.append((stamp, transform))
-                self.history = self.history[-max(30, self.samples * 3):]
+                history = self.tag_histories.setdefault(child_frame, [])
+                history.append((stamp, transform))
+                del history[:-max(30, self.samples * 3)]
+                if child_frame == self.tag_frame:
+                    self.latest = (stamp, transform)
+                    self.history = list(history)
 
     @staticmethod
     def _message_stamp(message):
@@ -211,11 +221,20 @@ class AprilTagPickNode(Node):
                 self.detection_history.append((stamp, detection))
             self.detection_history = self.detection_history[-30:]
 
-    def _target_tag_id(self):
+    def _target_tag_id(self, tag_frame=None):
         try:
-            return int(self.tag_frame.rsplit(':', 1)[1])
+            return int(str(tag_frame or self.tag_frame).rsplit(':', 1)[1])
         except (IndexError, ValueError):
             return None
+
+    def _tag_frame_for_id(self, tag_id):
+        try:
+            tag_id = int(tag_id)
+        except (TypeError, ValueError):
+            raise RuntimeError('tag_id必须是非负整数')
+        if tag_id < 0:
+            raise RuntimeError('tag_id必须是非负整数')
+        return '%s:%d' % (self.tag_frame.rsplit(':', 1)[0], tag_id)
 
     def _draw_pnp_3d(self, image, detected_corners, camera_info,
                      camera_tag):
@@ -304,13 +323,17 @@ class AprilTagPickNode(Node):
             'cube_points_px': cube_2d_float.tolist(),
         }
 
-    def save_detection_debug(self, localization_stamp):
+    def save_detection_debug(self, localization_stamp, tag_id=None,
+                             tag_frame=None):
         """Save the image, detected border/centre, pixels and camera model."""
-        target_id = self._target_tag_id()
+        target_frame = tag_frame or self.tag_frame
+        target_id = (
+            self._target_tag_id(target_frame)
+            if tag_id is None else int(tag_id))
         with self.lock:
             detections = list(self.detection_history)
             images = list(self.image_history)
-            poses = list(self.history)
+            poses = list(self.tag_histories.get(target_frame, []))
             camera_info = dict(self.camera_info) if self.camera_info else None
         candidates = [
             item for item in detections
@@ -415,7 +438,7 @@ class AprilTagPickNode(Node):
             'camera_info': camera_info,
             'pose': {
                 'frame_contract': (
-                    'T_base_tag = T_base_flange(GetPose in User0) * '
+                    'T_base_tag = T_base_flange(GetPose) * '
                     'T_flange_camera(handeye) * T_camera_tag(AprilTag)'),
                 'base_flange_4x4': localization.get(
                     'base_flange_at_detection', np.eye(4)).tolist(),
@@ -435,17 +458,21 @@ class AprilTagPickNode(Node):
             json.dump(record, stream, ensure_ascii=False, indent=2)
         return pnp3d_path
 
-    def locate(self):
+    def locate(self, tag_id=None):
         if not self.robot.use_base_frame():
             raise RuntimeError('定位前无法锁定 User(0) 基座原点')
         flange_pose = self.robot.get_tool(warn=False)
         if flange_pose is None:
             raise RuntimeError('GetPose无有效位姿')
+        target_frame = (
+            self.tag_frame if tag_id is None
+            else self._tag_frame_for_id(tag_id))
+        target_id = self._target_tag_id(target_frame)
         now = self.get_clock().now().nanoseconds * 1e-9
         with self.lock:
-            history = list(self.history)
+            history = list(self.tag_histories.get(target_frame, []))
         if not history:
-            raise RuntimeError('尚未检测到Tag')
+            raise RuntimeError('尚未检测到Tag ID %s' % target_id)
         newest_stamp = history[-1][0]
         age = now - newest_stamp
         if age > self.max_detection_age:
@@ -483,12 +510,15 @@ class AprilTagPickNode(Node):
             base_flange_target[:3, :3] @ self.tcp_offset_flange)
         xyz = base_flange_target[:3, 3]
         radius = float(np.linalg.norm(xyz[:2]))
-        if xyz[2] < self.min_base_z or radius > self.max_reach:
+        if (self.motion_limits_enabled and
+                (xyz[2] < self.min_base_z or radius > self.max_reach)):
             raise RuntimeError(
                 f'目标越过安全边界: xyz={xyz.round(1).tolist()}, radius={radius:.1f}')
         self.localization_index += 1
         self.last_localization = {
             'index': self.localization_index,
+            'tag_id': target_id,
+            'tag_frame': target_frame,
             'stamp': newest_stamp,
             'detection_age_sec': age,
             'flange_xyzrpy': list(flange_pose),
@@ -501,11 +531,12 @@ class AprilTagPickNode(Node):
             'spread_mm': spread,
         }
         self.last_localization['debug_image_path'] = self.save_detection_debug(
-            newest_stamp)
+            newest_stamp, tag_id=target_id, tag_frame=target_frame)
         self.localization_cache.append(self.last_localization)
         self.localization_cache = self.localization_cache[-50:]
         print(
             f'[l#{self.localization_index}] '
+            f'tag_id={target_id} '
             f'tag={base_tag[:3, 3].round(2).tolist()}mm  '
             f'tip={tag_tip[:3, 3].round(2).tolist()}mm  '
             f'flange_target={xyz.round(2).tolist()}mm  '
@@ -571,7 +602,7 @@ class AprilTagPickNode(Node):
     def _check_localization_chain(self, base_flange, camera_tag, base_tag):
         """Fail fast when flange/camera transforms are malformed or mixed."""
         named = {
-            'T_base_flange(GetPose in User0)': base_flange,
+            'T_base_flange(GetPose)': base_flange,
             'T_flange_camera(handeye)': self.flange_from_camera,
             'T_camera_tag(AprilTag)': camera_tag,
             'T_base_tag(result)': base_tag,
@@ -857,26 +888,29 @@ class AprilTagPickNode(Node):
             raise RuntimeError('当前是定位模式；将 execute_enabled 改为 true 才允许运动')
         print(f'[p#{self.last_localization["index"]}] 使用缓存目标 '
               f'{target[:3, 3].round(2).tolist()}mm')
-        pregrasp = self.retract_pose(target, self.pregrasp_height)
-        if safety_check is not None:
-            safety_check('before_pregrasp', pregrasp)
         if self.gripper_enabled and not self.robot.set_gripper(
                 False, self.gripper_index, self.gripper_active_high):
             raise RuntimeError('夹爪打开失败')
-        if not self.robot.move_pose(pregrasp):
-            raise RuntimeError('预抓取位姿失败')
-        # The base-frame target is locked from the first observation. An
-        # eye-in-hand camera commonly loses/occludes the tag near contact, so
-        # the contact move must not depend on a second detection.
-        if safety_check is not None:
-            safety_check('before_contact', target)
-        if not self.robot.move_pose(target):
-            raise RuntimeError('抓取位姿失败')
+        move_apriltag_target = getattr(
+            self.robot, 'move_apriltag_target', None)
+        if move_apriltag_target is not None:
+            moved = move_apriltag_target(
+                target,
+                self.last_localization['predicted_contact_tip'],
+                self.last_localization['base_tag'],
+                self.tcp_offset_flange,
+                safety_check=safety_check)
+        else:
+            if safety_check is not None:
+                safety_check('before_contact', target)
+            moved = self.robot.move_pose(target)
+        if not moved:
+            raise RuntimeError('AprilTag目标位姿失败')
         if self.gripper_enabled and not self.robot.set_gripper(
                 True, self.gripper_index, self.gripper_active_high):
             raise RuntimeError('夹爪闭合失败')
         time.sleep(0.3)
-        self.get_logger().info('戳点流程完成：机械臂停留在目标位姿')
+        self.get_logger().info('AprilTag一次到位完成：机械臂停留在目标位姿')
 
 
 class CommandReader:

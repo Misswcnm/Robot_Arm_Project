@@ -121,13 +121,15 @@ def main():
             c = raw.lower()
             if c == 'q': break
             elif c == 'r':
-                servo.record_template(n_frames=5)
-                # 记录模板点A的位姿
-                tool = robot.get_tool()
-                if tool:
-                    T_tool_A = tool_to_matrix(tool)
+                if servo.record_template(n_frames=5):
+                    # record_template 已同步采集并校验点云前后 GetPose，
+                    # 直接复用同一份 A，避免模板和第二次 GetPose 不同帧。
+                    T_tool_A = servo._T_base_tool_ref.copy()
                     delta_A2B = None
-                    print(f'  点A已记录: xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
+                    t = T_tool_A[:3, 3]
+                    print(
+                        f'  点A已记录: '
+                        f'xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}]')
             elif c == 'm':
                 servo.step()
             elif c == 'a':
@@ -151,46 +153,62 @@ def main():
                 if not robot.start_drag():
                     print('  ❌ 拖拽模式启动失败')
                     continue
-                print('  拖拽中… 1=记录戳点位姿  2=记录点云模板  3=使能')
+                print('  拖拽中… 1=记录点云模板A  2=记录戳点B并使能  3=取消')
                 while True:
                     sub = input('  🖐 ').strip()
                     if sub == '1':
+                        if servo.record_template(n_frames=5):
+                            T_tool_A = servo._T_base_tool_ref.copy()
+                            delta_A2B = None
+                            t = T_tool_A[:3, 3]
+                            print(
+                                f'  ✅ 点云模板/点A已记录: '
+                                f'xyz=[{t[0]:.0f} {t[1]:.0f} {t[2]:.0f}]')
+                        else:
+                            print('  ❌ 点云模板记录失败')
+                        print(
+                            '  继续拖拽… '
+                            '1=重新记录A  2=记录戳点B并使能  3=取消')
+                    elif sub == '2':
+                        if T_tool_A is None:
+                            print('  ❌ 请先按1记录点云模板A')
+                            continue
                         time.sleep(0.3)
                         j = robot.get_joints()
                         tool = robot.get_tool()
-                        if tool and T_tool_A is not None:
-                            drag_joints = j
-                            T_tool_B = tool_to_matrix(tool)
-                            delta_A2B = np.linalg.inv(T_tool_A) @ T_tool_B
-                            d_mm = np.linalg.norm(delta_A2B[:3,3])
-                            dr_deg = np.degrees(np.linalg.norm(Rot.from_matrix(delta_A2B[:3,:3]).as_rotvec()))
-                            print(f'  ✅ 点B已记录: xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
-                            print(f'     Δ(A→B): {d_mm:.0f}mm  {dr_deg:.1f}°')
-                        elif j:
-                            drag_joints = j
-                            print(f'  ⚠ 无点A(GetPose), 仅存关节')
-                        print('  继续拖拽… 1=记录戳点位姿  2=记录点云模板  3=使能')
-                    elif sub == '2':
-                        if servo.record_template(n_frames=5):
-                            tool = robot.get_tool()
-                            if tool:
-                                T_tool_A = tool_to_matrix(tool)
-                                delta_A2B = None
-                                print(f'  ✅ 点云模板/点A已记录: xyz=[{tool[0]:.0f} {tool[1]:.0f} {tool[2]:.0f}]')
-                            else:
-                                print('  ⚠ 模板已记录, 但GetPose读取点A失败')
-                        else:
-                            print('  ❌ 点云模板记录失败')
-                        print('  继续拖拽… 1=记录戳点位姿  2=记录点云模板  3=使能')
+                        if not tool:
+                            print('  ❌ 戳点B的GetPose读取失败')
+                            continue
+                        drag_joints = j
+                        T_tool_B = tool_to_matrix(tool)
+                        delta_A2B = np.linalg.inv(T_tool_A) @ T_tool_B
+                        d_mm = np.linalg.norm(delta_A2B[:3,3])
+                        dr_deg = np.degrees(np.linalg.norm(
+                            Rot.from_matrix(
+                                delta_A2B[:3,:3]).as_rotvec()))
+                        print(
+                            f'  ✅ 点B已记录: '
+                            f'xyz=[{tool[0]:.0f} {tool[1]:.0f} '
+                            f'{tool[2]:.0f}]')
+                        print(
+                            f'     Δ(A→B): {d_mm:.0f}mm  {dr_deg:.1f}°')
+                        robot.stop_drag()
+                        if robot.enable():
+                            print('  已保存A/B并退出拖拽，已使能')
+                            break
+                        print('  ⚠ 已退出拖拽, 但使能失败')
+                        break
                     elif sub == '3':
                         robot.stop_drag()
                         if robot.enable():
-                            print('  已退出拖拽, 已使能')
+                            print('  已取消并退出拖拽, 已使能')
                         else:
                             print('  ⚠ 已退出拖拽, 但使能失败')
                         break
                     else:
-                        print('  1=记录戳点位姿  2=记录点云模板  3=使能')
+                        print(
+                            '  1=记录点云模板A  '
+                            '2=记录戳点B并使能  3=取消')
             elif c == 'g':
                 if delta_A2B is None:
                     print('⚠ 未记录戳点位姿 (拖拽中先按2录模板/点A, 再按1录戳点)')

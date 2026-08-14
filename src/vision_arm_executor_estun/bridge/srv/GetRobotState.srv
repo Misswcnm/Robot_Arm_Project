@@ -1,0 +1,5 @@
+---
+bool success
+int32 state
+uint32 status_flag
+string message

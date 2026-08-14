@@ -62,8 +62,8 @@ cp config/local_robot_arm.env.example config/local_robot_arm.env
 `VEHICLE_IP` 设为小车 IP，并配置强随机 `VISION_RPC_AUTH_TOKEN`。RPC 只放行
 `VEHICLE_IP/32`；不建议监听无限制的公共网卡。
 
-执行器启动后仍是 `execution_enabled=false`。先做健康检查与 dry-run；只有完成 ICP/AprilTag
-质量验证、工作空间确认和现场安全确认后，才可以显式请求 `execution_enable`。
+执行器启动后仍是 `execution_enabled=false`。本地显式运动测试需要先请求
+`execution_enable`；application 的路由生产任务由网关在单次任务内自动开放并回收权限。
 
 ## 分阶段验收
 
@@ -113,7 +113,7 @@ export NX_VISION_RPC_HOST="192.168.2.20"
   "routes": [
     {"mapid": "map_01", "poseid": "icp_work", "action": "vision_icp_align_and_move_b"},
     {"mapid": "map_01", "poseid": "tag_locate", "action": "apriltag_locate"},
-    {"mapid": "map_01", "poseid": "tag_pick", "action": "apriltag_pick"}
+    {"mapid": "map_01", "poseid": "tag_touch", "action": "apriltag_locate_and_touch"}
   ]
 }
 ```
@@ -138,8 +138,8 @@ NX vehicle connected: 192.168.2.15:...
 ```
 
 旧命令转换如下：`1→ResetRobot`、`2→EnableRobot`、`3→DisableRobot`、
-`4→execution_enable`、`5→execution_disable`、`6→ClearError`。其中4/5是本地
-视觉执行器的远程运动许可开关，进程重启后仍默认关闭。
+`4→StartDrag`、`5→StopDrag并恢复Enable`、`6→ClearError`。application 路由任务
+由网关自动管理单次运动许可；执行器进程重启后仍默认关闭运动许可。
 
 自动任务成功后，网关才向小车回复 `{"status":"done"}`。失败只回复
 `status=failed`，绝不伪装成功；由于旧小车后端只识别 `done`，失败时小车仍会

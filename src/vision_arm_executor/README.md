@@ -1,57 +1,68 @@
 # Vision Arm Executor
 
-`vision_arm_executor` is the ROS 2-only owner of CR5 visual operations. It uses UTF-8 JSON
-Lines on TCP port `17881`. The default is loopback-only. For the vehicle-to-local-computer
-wired connection, configure the local wired IP, the vehicle `/32` allowlist and an auth token;
-the ROS 1 process must never import `rclpy`.
+## 启动命令
 
-Start safely (motion remains disabled after every restart):
+构建：
 
 ```bash
 cd ~/Robot_Arm_Project
-colcon build --packages-select vision_arm_executor
-source install/setup.bash
-ros2 run vision_arm_executor vision_arm_executor --ros-args \
-  --params-file src/vision_arm_executor/config/executor.yaml
+./scripts/local_robot_arm.sh build
 ```
 
-Example request:
+一键启动完整机械臂视觉栈：
 
 ```bash
-printf '{"request_id":"locate-1","action":"apriltag_locate","params":{},"dry_run":true}\n' | nc 127.0.0.1 17881
+cd ~/Robot_Arm_Project
+./scripts/local_robot_arm.sh all
 ```
 
-For a wired request, every message also carries the configured token:
+单独启动本地视觉执行器：
 
-```json
-{
-  "request_id": "station-01-20260721-001",
-  "action": "vision_icp_align_and_move_b",
-  "params": {"max_iters": 30},
-  "timeout_sec": 120,
-  "dry_run": false,
-  "auth_token": "the-shared-random-token"
-}
+```bash
+cd ~/Robot_Arm_Project
+./scripts/local_robot_arm.sh vision
 ```
 
-Responses use `accepted`, `running`, `succeeded`, `failed`, `timeout`, or `cancelled`.
-`accepted` only means the task entered the queue. Query it with `task_status` and the original
-request id. Each TCP connection handles one request and then closes; long-task polling opens a
-new connection. Run `execution_enable` explicitly before a non-dry-run movement action.
+单独启动 NX TCP 兼容网关：
 
-Runtime records are atomically saved under `data/vision_arm` by default. ICP A stores a versioned
-compressed point-cloud template; B binds to that exact A record, template checksum and hand-eye
-checksum. AprilTag locate stores a versioned target cache. Pick rejects an expired cache, changed
-Tag ID, changed hand-eye/TCP calibration, or robot motion after localization, and it never silently
-re-detects the target.
+```bash
+cd ~/Robot_Arm_Project
+./scripts/local_robot_arm.sh nx-gateway
+```
 
-Recommended operational actions:
+## 项目结构
 
-- ICP commissioning: `vision_icp_record_a`, then standard drag/exit, then
-  `vision_icp_record_b` with `manual_positioned=true`.
-- ICP production: `vision_icp_align` or `vision_icp_align_and_move_b`.
-- AprilTag production: `apriltag_locate`, then `apriltag_pick` using the cached target.
-- AprilTag validation: locate, manually enter drag and touch the Tag center, then call
-  `apriltag_validate`; exit drag using the standard recovery sequence afterwards.
-- Safety and control: `health`, `arm_status`, `execution_enable`, `execution_disable`,
-  `task_status`, and `task_cancel`.
+```text
+src/vision_arm_executor/
+├── README.md
+├── 1.md
+├── 2_cr5_backend.md
+├── package.xml
+├── setup.py
+├── setup.cfg
+├── resource/
+│   └── vision_arm_executor
+├── config/
+│   ├── executor.yaml
+│   └── nx_routes.json
+├── vision_arm_executor/
+│   ├── __init__.py
+│   ├── node.py
+│   ├── server.py
+│   ├── protocol.py
+│   ├── nx_commands.py
+│   ├── nx_gateway.py
+│   ├── executor.py
+│   ├── teaching.py
+│   ├── station_store.py
+│   ├── store.py
+│   ├── backends.py
+│   └── teach_cli.py
+└── test/
+    ├── test_backends.py
+    ├── test_executor.py
+    ├── test_nx_gateway.py
+    ├── test_protocol.py
+    ├── test_server.py
+    └── test_station_store.py
+```

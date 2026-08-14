@@ -103,12 +103,23 @@ class MasterNode:
     authorized_state = bool(1-master_node.global_var.use_authorized_state)
     def __del__(self):
         # self.wiper_thread = False
-        self.MqttCM_client_.client_.disconnect()
-        self.MqttCM_client_.client_.loop_stop()
+        mqtt_client = getattr(self, 'MqttCM_client_', None)
+        mqtt_transport = getattr(mqtt_client, 'client_', None)
+        if mqtt_transport is not None:
+            try:
+                mqtt_transport.disconnect()
+                mqtt_transport.loop_stop()
+            except Exception:
+                pass
         self.timer_running_  = False
         self.wiper_thread_func_state = False
         rospy.loginfo("~~~~~~~~~~~~~~~~~~~~~Master~~~~~~~~~~~~~~~~~~~~~~~~" )
-        self.default_bag_recoder.stopRosbagRecord()
+        bag_recorder = getattr(self, 'default_bag_recoder', None)
+        if bag_recorder is not None:
+            try:
+                bag_recorder.stopRosbagRecord()
+            except Exception:
+                pass
         # self.master_node_state.state_operation == MasterNodeState.state_type.Idle
         pass
 
@@ -116,14 +127,16 @@ class MasterNode:
 
 
 
-    def __init__(self,uuid):
+    def __init__(self, uuid, mechanical_arm_controller):
         print("Master_node.py xc *********************0001************************")
         self.uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
         roslaunch.configure_logging(uuid)
         #add service function area
 
-        self.master_node_subscriber = MasterNodeSubscriber.MasterNodeSubscriber(self)
+        self.master_node_subscriber = MasterNodeSubscriber.MasterNodeSubscriber(
+            self, mechanical_arm_controller)
         print("Master_node.py xc *********************0002************************")
+        self.current_task_info = {}
         self.master_node_state = MasterNodeState(uuid)
         print("Master_node.py xc *********************0003************************")
         self.master_node_ping = MasterNodePing.MasterNodePing()
@@ -274,6 +287,7 @@ class MasterNode:
         self.service_lookup_table['mechanical_arm/send_enable'] = self.send_mechanical_arm_enable
         self.service_lookup_table['mechanical_arm/send_disable'] = self.send_mechanical_arm_disable
         self.service_lookup_table['mechanical_arm/check_connection'] = self.check_mechanical_arm_connection
+        self.service_lookup_table['mechanical_arm/get_vendor'] = self.get_mechanical_arm_vendor
 
         self.service_lookup_table['param/update_param']=self.update_param
         self.service_lookup_table['param/get_param']=self.get_param
@@ -358,10 +372,10 @@ class MasterNode:
         # 位置信息
         self.service_lookup_table['sensor_data/robot_pose_grid'] = self.get_robot_pose
         self.service_lookup_table['sensor_data/robot_footprint'] = self.get_robot_footprint
-        
+
         # 里程信息
         self.service_lookup_table['sensor_data/get_mileage_info'] = self.get_mileage_info
-        
+
         # 获取监控信息
         self.service_lookup_table['sensor_data/battery'] = self.get_battery
         self.service_lookup_table['sensor_data/meteorology'] = self.get_meteorology
@@ -3294,25 +3308,25 @@ class MasterNode:
             # 保存成功后，检查任务中的机械臂动作（不影响响应）
             print("=== TASK SAVED SUCCESSFULLY ===")
             mechanical_arm_count = 0
-            
+
             try:
                 import json
                 task_data = json.loads(task_json)
-                
+
                 if 'tasks' in task_data:
                     print("Total tasks in queue: %d" % len(task_data['tasks']))
                     for task_index, task in enumerate(task_data['tasks']):
                         task_name = task.get('name', 'Unknown')
                         task_type = task.get('type', 'Unknown')
                         print("Task[%d] name: %s, type: %s" % (task_index, task_name, task_type))
-                        
+
                         if 'actions' in task:
                             print("Task[%d] has %d actions" % (task_index, len(task['actions'])))
                             for action_index, action in enumerate(task['actions']):
                                 # 打印每个动作的type，方便调试
                                 action_type = action.get('type')
                                 print("Task[%d]Action[%d] type: %s" % (task_index, action_index, action_type))
-                                
+
                                 if action_type == 'MECHANICAL_ARM':
                                     mechanical_arm_count += 1
                                     print("*** FOUND MECHANICAL ARM ACTION ***")
@@ -3323,17 +3337,17 @@ class MasterNode:
                                     print("Point ID: %s" % action.get('param', {}).get('pointId'))
                                     print("Action time: %s" % action.get('actionTime'))
                                     print("*** MECHANICAL ARM ACTION CHECK COMPLETE ***")
-                
+
             except Exception as e:
                 # 安全地处理异常信息，避免编码问题
                 print("Error checking mechanical arm actions: %s" % str(e))
-            
+
             # 无论是否有异常，都显示最终结果
             if mechanical_arm_count > 0:
                 print("=== TASK SAVED WITH %d MECHANICAL ARM ACTIONS ===" % mechanical_arm_count)
             else:
                 print("=== TASK SAVED WITH NO MECHANICAL ARM ACTIONS ===")
-            
+
             request_handler.write(MasterNodeErrorCode.Successed())
             return
         pass
@@ -3856,7 +3870,7 @@ class MasterNode:
             request_handler.write(MasterNodeErrorCode.GetReturn(resp))
             return
         request_handler.write(MasterNodeErrorCode.Successed())
-    
+
     def delete_images(self,request_handler):
         # 获取要删除的图片ID列表
         try:
@@ -3865,40 +3879,40 @@ class MasterNode:
             # 从POST请求的body中获取数据
             request_data = json.loads(request_handler.request.body)
             images_data = request_data.get('images', [])
-            
+
             if not images_data:
                 print("[DELETE_IMAGES] 图片数据列表为空")
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAMETER_ERROR))
                 return
-            
+
             # 构建图片存储基础路径
             base_path = "/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
-            
+
             # 逐个删除图片
             success_count = 0
             failed_count = 0
-            
+
             for image_data in images_data:
                 try:
                     image_id = image_data.get('id', '')
                     image_type = image_data.get('type', '')
-                    
+
                     print("[DELETE_IMAGES] 开始删除图片ID: {} (类型: {})".format(image_id, image_type))
                     # 直接删除文件系统中的图片文件
                     file_deleted = self._delete_image_file_by_type(base_path, image_id, image_type)
-                    
+
                     if file_deleted:
                         success_count += 1
                         print("[DELETE_IMAGES] 成功删除文件: {} (类型: {})".format(image_id, image_type))
                     else:
                         failed_count += 1
                         print("[DELETE_IMAGES] 文件删除失败: {} (类型: {})".format(image_id, image_type))
-                        
+
                 except Exception as e:
                     failed_count += 1
                     print("[DELETE_IMAGES] 删除文件异常: {}".format(str(e)))
                     continue
-            
+
             # 返回删除结果
             result = {
                 "success_count": success_count,
@@ -3906,12 +3920,12 @@ class MasterNode:
                 "total_count": len(images_data)
             }
             request_handler.write(MasterNodeErrorCode.SuccessedData(result))
-            
+
         except Exception as e:
             print("[DELETE_IMAGES] 删除图片总体异常: {}".format(str(e)))
             request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAMETER_ERROR))
             return
-    
+
     def _delete_image_file(self, base_path, image_id):
         """
         删除文件系统中的图片文件
@@ -3920,40 +3934,40 @@ class MasterNode:
         try:
             import os
             import glob
-            
+
             if not os.path.exists(base_path):
                 print("[_DELETE_IMAGE_FILE] 基础路径不存在: {}".format(base_path))
                 return False
-            
+
             # 在所有可能的路径中查找并删除图片文件
             deleted_files = []
             total_found = 0
-            
+
             print("[_DELETE_IMAGE_FILE] 开始查找图片ID: {}".format(image_id))
-            
+
             # 遍历所有地图和点位查找图片
             for map_dir in os.listdir(base_path):
                 map_path = os.path.join(base_path, map_dir)
                 if not os.path.isdir(map_path):
                     continue
-                
+
                 for pose_dir in os.listdir(map_path):
                     pose_path = os.path.join(map_path, pose_dir)
                     if not os.path.isdir(pose_path):
                         continue
-                    
+
                     # 遍历type文件夹 (raw, result)
                     for type_dir in os.listdir(pose_path):
                         type_path = os.path.join(pose_path, type_dir)
                         if not os.path.isdir(type_path):
                             continue
-                        
+
                         # 遍历日期文件夹
                         for date_dir in os.listdir(type_path):
                             date_path = os.path.join(type_path, date_dir)
                             if not os.path.isdir(date_path):
                                 continue
-                            
+
                             # 查找匹配的图片文件
                             # 支持多种文件格式
                             for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
@@ -3962,8 +3976,8 @@ class MasterNode:
                                     filename = os.path.basename(file_path)
                                     # 更精确的匹配：检查文件名是否包含图片ID
                                     # 支持多种命名格式：image_id_123.jpg, 123_image.jpg, image_123_result.jpg 等
-                                    if (image_id in filename or 
-                                        filename.startswith(image_id + '_') or 
+                                    if (image_id in filename or
+                                        filename.startswith(image_id + '_') or
                                         filename.startswith(image_id + '.') or
                                         '_' + image_id + '_' in filename or
                                         '_' + image_id + '.' in filename):
@@ -3974,14 +3988,14 @@ class MasterNode:
                                             print("[_DELETE_IMAGE_FILE] 删除文件: {} (类型: {})".format(file_path, type_dir))
                                         except OSError as e:
                                             print("[_DELETE_IMAGE_FILE] 删除文件失败: {} - {}".format(file_path, str(e)))
-            
+
             print("[_DELETE_IMAGE_FILE] 图片ID: {} - 找到文件: {}, 成功删除: {}".format(image_id, total_found, len(deleted_files)))
             return len(deleted_files) > 0
-            
+
         except Exception as e:
             print("[_DELETE_IMAGE_FILE] 删除图片文件异常: {}".format(str(e)))
             return False
-    
+
     def _delete_image_file_by_type(self, base_path, image_id, image_type):
         """
         根据图片类型删除文件系统中的图片文件
@@ -3989,59 +4003,59 @@ class MasterNode:
         try:
             import os
             import glob
-            
+
             if not os.path.exists(base_path):
                 print("[_DELETE_IMAGE_FILE_BY_TYPE] 基础路径不存在: {}".format(base_path))
                 return False
-            
+
             deleted_files = []
             total_found = 0
-            
+
             print("[_DELETE_IMAGE_FILE_BY_TYPE] 开始查找图片ID: {} (类型: {})".format(image_id, image_type))
-            
+
             # 遍历所有地图和点位查找图片
             for map_dir in os.listdir(base_path):
                 map_path = os.path.join(base_path, map_dir)
                 if not os.path.isdir(map_path):
                     continue
-                
+
                 for pose_dir in os.listdir(map_path):
                     pose_path = os.path.join(map_path, pose_dir)
                     if not os.path.isdir(pose_path):
                         continue
-                    
+
                     # 如果指定了图片类型，只在该类型文件夹中查找
                     if image_type:
                         type_folders = [image_type]
                     else:
                         # 如果没有指定类型，遍历所有类型文件夹
-                        type_folders = ['raw', 'result', 'rc']
-                    
+                        type_folders = ['raw', 'result']
+
                     for type_dir in type_folders:
                         type_path = os.path.join(pose_path, type_dir)
                         if not os.path.isdir(type_path):
                             continue
-                        
+
                         # 遍历日期文件夹
                         for date_dir in os.listdir(type_path):
                             date_path = os.path.join(type_path, date_dir)
                             if not os.path.isdir(date_path):
                                 continue
-                            
+
                             # 查找匹配的图片文件
                             for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
                                 pattern = os.path.join(date_path, ext)
                                 for file_path in glob.glob(pattern):
                                     filename = os.path.basename(file_path)
                                     file_without_ext = os.path.splitext(filename)[0]
-                                    
+
                                     # 检查文件名是否精确匹配图片ID
                                     # 支持带扩展名和不带扩展名的匹配
                                     image_id_without_ext = os.path.splitext(image_id)[0]
-                                    
-                                    if (file_without_ext == image_id_without_ext or 
+
+                                    if (file_without_ext == image_id_without_ext or
                                         file_without_ext == image_id or
-                                        file_without_ext.startswith(image_id_without_ext + '_') or 
+                                        file_without_ext.startswith(image_id_without_ext + '_') or
                                         file_without_ext.endswith('_' + image_id_without_ext) or
                                         '_' + image_id_without_ext + '_' in file_without_ext):
                                         total_found += 1
@@ -4051,14 +4065,14 @@ class MasterNode:
                                             print("[_DELETE_IMAGE_FILE_BY_TYPE] 删除文件: {} (类型: {})".format(file_path, type_dir))
                                         except OSError as e:
                                             print("[_DELETE_IMAGE_FILE_BY_TYPE] 删除文件失败: {} - {}".format(file_path, str(e)))
-            
+
             print("[_DELETE_IMAGE_FILE_BY_TYPE] 图片ID: {} - 找到文件: {}, 成功删除: {}".format(image_id, total_found, len(deleted_files)))
             return len(deleted_files) > 0
-            
+
         except Exception as e:
             print("[_DELETE_IMAGE_FILE_BY_TYPE] 删除图片文件异常: {}".format(str(e)))
             return False
-    
+
     def upload_image(self,request_handler):
         if not len(request_handler.request.files) > 0:
             request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
@@ -4093,16 +4107,16 @@ class MasterNode:
             if not len(request_handler.request.body) > 0:
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
                 return
-            
+
             params = json.loads(request_handler.request.body)
             print("[QUERY_IMAGES] 原始请求参数: {}".format(params))
-            
+
             start_date = params.get('startDate', '')
             end_date = params.get('endDate', '')
             map_id = params.get('mapId', '')
             pose_id = params.get('poseId', '')
             image_type = params.get('imageType', '')
-            
+
             print("[QUERY_IMAGES] 解析后的参数:")
             print("  startDate: '{}'".format(start_date))
             print("  endDate: '{}'".format(end_date))
@@ -4112,13 +4126,13 @@ class MasterNode:
             print("[QUERY_IMAGES] 图片类型过滤条件: '{}'".format(image_type))
             print("[QUERY_IMAGES] 图片类型过滤条件类型: {}, 长度: {}".format(type(image_type), len(str(image_type))))
             print("[QUERY_IMAGES] 图片类型过滤条件repr: {}".format(repr(image_type)))
-            
+
             # 验证必须参数：如果选择了点位或图片类型，必须指定地图ID
             if (pose_id or image_type) and not map_id:
                 print("[QUERY_IMAGES] 错误：选择点位或图片类型时必须指定地图ID")
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
                 return
-            
+
             # 构建图片存储基础路径 - 使用运行时目录
             base_path ="/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
             # 必须指定地图ID才能查询
@@ -4126,16 +4140,16 @@ class MasterNode:
                 print("[QUERY_IMAGES] 错误：必须指定地图ID才能查询图片")
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
                 return
-            
+
             # 查询指定地图的图片
             map_path = os.path.join(base_path, map_id)
             if not os.path.exists(map_path):
                 print("[QUERY_IMAGES] 错误：地图路径不存在: {}".format(map_path))
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
                 return
-            
+
             images = []
-            
+
             # 如果指定了点位ID，查询该点位下的图片
             if pose_id:
                 pose_path = os.path.join(map_path, pose_id)
@@ -4151,7 +4165,7 @@ class MasterNode:
                     pose_path = os.path.join(map_path, pose_dir)
                     if os.path.isdir(pose_path):
                         images.extend(self._scan_images_in_path(pose_path, start_date, end_date, image_type, map_id, pose_dir))
-            
+
             # 去重：基于图片完整路径去重（因为不同目录下可能有同名文件）
             unique_images = []
             seen_paths = set()
@@ -4161,33 +4175,33 @@ class MasterNode:
                 if image_path not in seen_paths:
                     seen_paths.add(image_path)
                     unique_images.append(image)
-            
+
             # 按创建时间排序
             unique_images.sort(key=lambda x: x.get('createTime', ''), reverse=True)
-            
+
             result = {
                 'images': unique_images,
                 'total': len(unique_images)
             }
-            
+
             print("[QUERY_IMAGES] 原始找到 {} 张图片，去重后 {} 张图片".format(len(images), len(unique_images)))
-            
+
             # 显示每张图片的详细信息
             for i, img in enumerate(unique_images):
                 print("[QUERY_IMAGES] 图片 {}: 名称={}, 类型={}, 路径={}".format(i+1, img.get('name'), img.get('type'), img.get('path')))
             request_handler.write(MasterNodeErrorCode.SuccessedData(result))
-            
+
         except Exception as e:
             print("[QUERY_IMAGES] 查询图片时发生错误: {}".format(str(e)))
             request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.SYSTEM_ERROR))
-    
+
     def _scan_images_in_path(self, path, start_date, end_date, image_type='', map_id='', pose_id=''):
         """
         扫描指定路径下的图片文件
         路径结构: .../mapid/poseid/result|raw/YYYY-MM-DD/
         """
         images = []
-        
+
         try:
             print("[_SCAN_IMAGES] 开始扫描路径: {}".format(path))
             print("[_SCAN_IMAGES] 路径是否存在: {}".format(os.path.exists(path)))
@@ -4196,11 +4210,11 @@ class MasterNode:
             else:
                 print("[_SCAN_IMAGES] 路径不存在，无法扫描")
                 return images
-            
+
             # 检查路径下是否有类型目录（raw, result等）
             type_dirs = []
             date_dirs = []
-            
+
             for item in os.listdir(path):
                 item_path = os.path.join(path, item)
                 if os.path.isdir(item_path):
@@ -4208,17 +4222,17 @@ class MasterNode:
                     import re
                     if re.match(r'\d{4}-\d{2}-\d{2}', item):
                         date_dirs.append(item)
-                    elif item in ['raw', 'result', 'rc', 'error_rc']:  # 明确的类型目录
+                    elif item in ['raw', 'result']:  # 明确的类型目录
                         type_dirs.append(item)
-            
+
             print("[_SCAN_IMAGES] 类型目录: {}".format(type_dirs))
             print("[_SCAN_IMAGES] 日期目录: {}".format(date_dirs))
-            
+
             # 如果指定了图片类型，检查该类型是否存在
             if image_type and image_type not in type_dirs:
                 print("[_SCAN_IMAGES] 警告：指定的图片类型 '{}' 不存在，可用类型: {}".format(image_type, type_dirs))
                 return images
-            
+
             # 如果路径下直接有类型目录，说明这是点位路径，需要遍历类型目录
             if type_dirs:
                 print("[_SCAN_IMAGES] 检测到点位路径，遍历类型目录")
@@ -4227,14 +4241,14 @@ class MasterNode:
                     if not os.path.isdir(type_path):
                         print("[_SCAN_IMAGES] 跳过非目录: {}".format(type_dir))
                         continue
-                
+
                     # 如果指定了图片类型，只处理对应的类型
                     print("[_SCAN_IMAGES] 检查类型目录: '{}' vs 过滤条件: '{}'".format(type_dir, image_type))
                     print("[_SCAN_IMAGES] 类型目录长度: {}, 过滤条件长度: {}".format(len(type_dir), len(image_type)))
                     print("[_SCAN_IMAGES] 类型目录类型: {}, 过滤条件类型: {}".format(type(type_dir), type(image_type)))
                     print("[_SCAN_IMAGES] 类型目录repr: {}, 过滤条件repr: {}".format(repr(type_dir), repr(image_type)))
                     print("[_SCAN_IMAGES] 字符串比较结果: {}".format(type_dir == image_type))
-                    
+
                     # 修复逻辑：如果指定了图片类型，只处理匹配的类型；否则处理所有类型
                     if image_type:
                         # 指定了图片类型，只处理匹配的类型
@@ -4246,25 +4260,25 @@ class MasterNode:
                     else:
                         # 没有指定图片类型，处理所有类型
                         print("[_SCAN_IMAGES] 处理类型目录 '{}'，无过滤条件".format(type_dir))
-                
+
                     # 遍历日期文件夹
                     for date_dir in os.listdir(type_path):
                         date_path = os.path.join(type_path, date_dir)
                         if not os.path.isdir(date_path):
                             continue
-                        
+
                         # 检查日期过滤条件
                         if start_date and date_dir < start_date:
                             continue
                         if end_date and date_dir > end_date:
                             continue
-                        
+
                         # 扫描该日期文件夹下的图片文件
                         for filename in os.listdir(date_path):
                             if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
                                 file_path = os.path.join(date_path, filename)
                                 file_stat = os.stat(file_path)
-                                
+
                                 # 构建图片信息
                                 image_info = {
                                     'id': os.path.basename(file_path),
@@ -4277,11 +4291,11 @@ class MasterNode:
                                     'mapId': map_id,  # 使用传入的地图ID
                                     'poseId': pose_id  # 使用传入的点位ID
                                 }
-                                
+
                                 print("[_SCAN_IMAGES] 找到图片: {} - 类型: {} - 路径: {}".format(filename, type_dir, file_path))
-                                
+
                                 images.append(image_info)
-            
+
             # 如果路径下直接是日期目录，说明这是类型路径，直接扫描日期目录
             elif date_dirs:
                 print("[_SCAN_IMAGES] 检测到类型路径，直接扫描日期目录")
@@ -4289,19 +4303,19 @@ class MasterNode:
                     date_path = os.path.join(path, date_dir)
                     if not os.path.isdir(date_path):
                         continue
-                    
+
                     # 检查日期过滤条件
                     if start_date and date_dir < start_date:
                         continue
                     if end_date and date_dir > end_date:
                         continue
-                    
+
                     # 扫描该日期文件夹下的图片文件
                     for filename in os.listdir(date_path):
                         if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
                             file_path = os.path.join(date_path, filename)
                             file_stat = os.stat(file_path)
-                            
+
                             # 构建图片信息
                             image_info = {
                                 'id': os.path.basename(file_path),
@@ -4314,12 +4328,12 @@ class MasterNode:
                                 'mapId': map_id,  # 使用传入的地图ID
                                 'poseId': pose_id  # 使用传入的点位ID
                             }
-                            
+
                             images.append(image_info)
-                            
+
         except Exception as e:
             print("[_SCAN_IMAGES] 扫描路径 {} 时发生错误: {}".format(path, str(e)))
-        
+
         return images
 
     def get_image_file(self, request_handler):
@@ -4332,47 +4346,47 @@ class MasterNode:
             if not image_id:
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.PARAM_IS_EMPTY))
                 return
-            
+
             print("[GET_IMAGE_FILE] 请求图片ID: {}, 图片类型: {}".format(image_id, image_type))
-            
+
             # 构建图片存储基础路径 - 与query_images保持一致
             base_path = "/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
-            
+
             # 在所有可能的路径中查找图片
             image_found = False
             image_path = ""
             raw_image_path = ""  # 专门记录raw类型的图片路径
-            
+
             # 遍历所有地图和点位查找图片
             if os.path.exists(base_path):
                 for map_dir in os.listdir(base_path):
                     map_path = os.path.join(base_path, map_dir)
                     if not os.path.isdir(map_path):
                         continue
-                    
+
                     for pose_dir in os.listdir(map_path):
                         pose_path = os.path.join(map_path, pose_dir)
                         if not os.path.isdir(pose_path):
                             continue
-                        
+
                         # 遍历type文件夹
                         for type_dir in os.listdir(pose_path):
                             type_path = os.path.join(pose_path, type_dir)
                             if not os.path.isdir(type_path):
                                 continue
-                            
+
                             # 遍历日期文件夹
                             for date_dir in os.listdir(type_path):
                                 date_path = os.path.join(type_path, date_dir)
                                 if not os.path.isdir(date_path):
                                     continue
-                                
+
                                 # 查找匹配的图片文件
                                 for filename in os.listdir(date_path):
                                     if filename == image_id or filename.startswith(image_id.split('.')[0]):
                                         current_path = os.path.join(date_path, filename)
                                         print("[GET_IMAGE_FILE] 找到匹配图片: {} - 类型: {} - 路径: {}".format(filename, type_dir, current_path))
-                                        
+
                                         # 如果指定了图片类型，只返回匹配的类型
                                         if image_type:
                                             if type_dir == image_type:
@@ -4391,7 +4405,7 @@ class MasterNode:
                                                 print("[GET_IMAGE_FILE] 记录其他类型图片: {} - 类型: {}".format(current_path, type_dir))
                                                 image_path = current_path
                                                 image_found = True
-                                
+
                                 if image_found:
                                     break
                             if image_found:
@@ -4400,34 +4414,34 @@ class MasterNode:
                             break
                     if image_found:
                         break
-            
+
             # 优先使用raw类型的图片
             if raw_image_path:
                 image_path = raw_image_path
                 print("[GET_IMAGE_FILE] 最终选择raw类型图片: {}".format(image_path))
             elif image_path:
                 print("[GET_IMAGE_FILE] 使用其他类型图片: {}".format(image_path))
-            
+
             if not image_found or not os.path.exists(image_path):
                 print("[GET_IMAGE_FILE] 图片未找到: {}".format(image_id))
                 request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.FILE_NOT_EXISTED))
                 return
-            
+
             print("[GET_IMAGE_FILE] 找到图片: {}".format(image_path))
-            
+
             # 读取图片文件
             with open(image_path, 'rb') as f:
                 image_data = f.read()
-            
+
             # 设置响应头
             request_handler.set_header("Content-Type", "image/jpeg")
             request_handler.set_header("Content-Length", str(len(image_data)))
             request_handler.set_header("Access-Control-Allow-Origin", "*")
             request_handler.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            
+
             # 返回图片数据
             request_handler.write(image_data)
-            
+
         except Exception as e:
             print("[GET_IMAGE_FILE] 获取图片时发生错误: {}".format(str(e)))
             request_handler.write(MasterNodeErrorCode.Failed(MasterNodeErrorCode.SYSTEM_ERROR))
@@ -6396,7 +6410,7 @@ class MasterNode:
         cur_time = str(rospy.Time.now().secs) + str('.') + str(rospy.Time.now().nsecs)
         if self.master_node_subscriber.check_reviced('sensor_exception_event') and float(cur_time) < self.master_node_subscriber.cur_time_table['latest_laser_exception_time'] + 3:
             websocket_notice['sensor_exception_event'] = self.master_node_subscriber.submsg_table['sensor_exception_event']
-        
+
         if self.master_node_subscriber.check_reviced('chassis_exception_event'):
             websocket_notice['chassis_exception_event'] = self.master_node_subscriber.submsg_table['chassis_exception_event']
 
@@ -6479,81 +6493,113 @@ class MasterNode:
         直接通过TCP发送示教录点数据到NX
         """
         print("[TCP直接发送] 开始处理示教录点数据")
-        
+
         try:
             # 获取请求数据
             request_body = client.request.body
             print("[TCP直接发送] 请求体长度: {}".format(len(request_body) if request_body else 0))
-            
+
             if not request_body:
                 print("[TCP直接发送] 请求体为空")
                 client.write(MasterNodeErrorCode.ErrorData("请求体为空"))
                 return
-                
+
             request_data = json.loads(request_body.decode('utf-8'))
             print("[TCP直接发送] 解析的请求数据: {}".format(request_data))
-            
+
             # 提取参数
             map_id = request_data.get('mapid', 'unknown_map')
             point_id = request_data.get('poseid', '')
             point_type = request_data.get('type', 'demo_point_recorded')
             timestamp = request_data.get('timestamp', '')
             sequence = request_data.get('sequence', 0)
-            
+
             # 确保poseid不为空
             if not point_id or point_id == '' or point_id.strip() == '':
                 point_id = 'demo_point_' + str(int(time.time()))
                 print("[TCP直接发送] poseid为空，生成默认ID: {}".format(point_id))
-            
+
             print("[TCP直接发送] 收到示教录点数据: mapid={}, poseid={}, type={}".format(map_id, point_id, point_type))
-            
+
             # 构造TCP消息 - 使用前端发送的type字段
             tcp_message = {
                 'type': point_type,  # 使用前端发送的type值
                 'mapid': map_id,
                 'poseid': point_id
             }
-            
+
             print("[TCP直接发送] 构造的TCP消息: {}".format(tcp_message))
-            
+
             # 真正的TCP发送到NX
             print("[TCP直接发送] 示教录点数据接收成功，开始发送到NX")
-            
+
             # 检查机械臂控制器
             if not hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
                 print("[TCP直接发送] 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
                 return
-                
+
             # 获取机械臂控制器
             arm_controller = self.master_node_subscriber.mechanical_arm_controller
             print("[TCP直接发送] 机械臂控制器状态: {}".format(arm_controller.get_controller_status()))
-            
-            # 设置当前消息信息（用于关联返回的数据）
-            arm_controller.set_current_message_info(map_id, point_id, timestamp)
-            
-            # 通过机械臂控制器发送TCP消息
+
+            # 保存最近示教上下文（用于关联返回数据）
+            if hasattr(arm_controller, 'set_current_message_info'):
+                arm_controller.set_current_message_info(map_id, point_id, timestamp)
+
+            # 通过机械臂控制器发送TCP消息（支持越疆额外字段）
             try:
-                success = arm_controller._send_message(tcp_message)
-                if success:
+                teach_point_type = request_data.get('point_type', request_data.get('pointType', None))
+                teach_params = request_data.get('params', None) or {}
+                if arm_controller.is_dobot():
+                    if teach_point_type in (None, ''):
+                        client.write(MasterNodeErrorCode.ErrorData(
+                            "point_type不能为空，0=AprilTag，1=ICP"))
+                        return
+                    success = arm_controller.send_demo_point(
+                        map_id, point_id,
+                        msg_type=1 if point_type in ('type1', '1', 1, 'demo_point_recorded') else point_type,
+                        point_type=teach_point_type,
+                        params=teach_params,
+                        timeout=float(request_data.get('timeout_sec', 70)))
+                else:
+                    success = arm_controller._send_message(tcp_message, wait_response=False)
+                ok, nx_response = self._normalize_arm_send_result(success)
+                if ok:
                     print("[TCP直接发送] 示教录点数据发送到NX成功")
-                    
+
                     # 创建文件夹结构
                     self._create_demo_point_folders(map_id, point_id)
-                    
+
                     response_data = {
-                        "message": "TCP数据发送成功", 
+                        "message": "TCP数据发送成功",
                         "data": tcp_message,
-                        "status": "real_success"
+                        "status": "real_success",
+                        "nx_response": nx_response,
+                        "arm_vendor": arm_controller.get_arm_vendor(),
                     }
                     client.write(MasterNodeErrorCode.SuccessedData(response_data))
                 else:
-                    print("[TCP直接发送] 示教录点数据发送到NX失败")
-                    client.write(MasterNodeErrorCode.ErrorData("TCP数据发送失败"))
+                    print("[TCP直接发送] 示教录点数据发送到NX失败: {}".format(nx_response))
+                    err = nx_response if isinstance(nx_response, dict) else {}
+                    status_info = {}
+                    try:
+                        status_info = arm_controller.get_controller_status() or {}
+                    except Exception:
+                        pass
+                    detail = err.get('message') or 'TCP数据发送失败'
+                    client.write(MasterNodeErrorCode.ErrorData(
+                        "机械臂示教失败 [{}]: {} (vendor={}, nx={}:{}, tcp_connected={})".format(
+                            err.get('error_code', 'send_failed'),
+                            detail,
+                            status_info.get('arm_vendor', '?'),
+                            status_info.get('nx_host', '?'),
+                            status_info.get('nx_port', '?'),
+                            status_info.get('tcp_connected', '?'))))
             except Exception as tcp_error:
                 print("[TCP直接发送] TCP发送异常: {}".format(str(tcp_error)))
                 client.write(MasterNodeErrorCode.ErrorData("TCP发送异常: {}".format(str(tcp_error))))
-                
+
         except json.JSONDecodeError as e:
             print("[TCP直接发送] JSON解析错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("JSON解析错误: {}".format(str(e))))
@@ -6570,48 +6616,48 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             map_id = request_data.get('mapId', 'unknown_map')
             point_id = request_data.get('pointId', '')
             point_type = request_data.get('type', 'demo_point_recorded')
             timestamp = request_data.get('timestamp', '')
-            
+
             # 确保pointId不为空
             if not point_id or point_id == '':
                 point_id = 'demo_point_' + str(int(time.time()))
                 print("[TCP发送] pointId为空，生成默认ID: {}".format(point_id))
-            
+
             print("[TCP发送] 收到示教录点数据: mapId={}, pointId={}, type={}".format(map_id, point_id, point_type))
-            
+
             # 构造TCP消息 - 添加type字段并放在最前面
             tcp_message = {
                 'type': 'type1',
                 'mapid': map_id,
                 'poseid': point_id
             }
-            
+
             # 真正的TCP发送到NX
             print("[TCP发送] 示教录点数据接收成功，开始发送到NX")
             print("[TCP发送] TCP消息内容: {}".format(tcp_message))
-            
+
             # 检查机械臂控制器
             if not hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
                 print("[TCP发送] 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
                 return
-                
+
             # 获取机械臂控制器
             arm_controller = self.master_node_subscriber.mechanical_arm_controller
             print("[TCP发送] 机械臂控制器状态: {}".format(arm_controller.get_controller_status()))
-            
+
             # 通过机械臂控制器发送TCP消息
             try:
                 success = arm_controller._send_message(tcp_message)
                 if success:
                     print("[TCP发送] 示教录点数据发送到NX成功")
                     client.write(MasterNodeErrorCode.SuccessedData({
-                        "message": "TCP数据发送成功", 
+                        "message": "TCP数据发送成功",
                         "data": tcp_message,
                         "status": "real_success"
                     }))
@@ -6621,7 +6667,7 @@ class MasterNode:
             except Exception as tcp_error:
                 print("[TCP发送] TCP发送异常: {}".format(str(tcp_error)))
                 client.write(MasterNodeErrorCode.ErrorData("TCP发送异常: {}".format(str(tcp_error))))
-                
+
         except Exception as e:
             print("[TCP发送] 处理示教录点数据时发生错误: {}".format(str(e)))
             client.write_message(MasterNodeErrorCode.ErrorData("处理示教录点数据时发生错误: {}".format(str(e))))
@@ -6629,178 +6675,289 @@ class MasterNode:
     def send_demo_point_via_arm_controller(self, client):
         """
         通过机械臂控制器发送示教录点数据到NX
+        越疆需额外透传 point_type / params，并用短连接等真实响应
         """
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
-            # 提取参数
-            map_id = request_data.get('mapid', 'unknown_map')
-            point_id = request_data.get('poseid', '')
-            point_type = request_data.get('type', 'demo_point_recorded')
+
+            # 提取参数（兼容多种字段名）
+            map_id = request_data.get(
+                'mapid', request_data.get('map_id', request_data.get('mapId', 'unknown_map')))
+            point_id = request_data.get(
+                'poseid', request_data.get('pose_id', request_data.get('pointId', '')))
+            point_type = request_data.get('point_type', request_data.get('pointType', None))
+            params = request_data.get('params', None) or {}
+            # 示教开始可只传 mapid/poseid/point_type；兼容旧请求的 type 字段。
+            default_type = 1 if point_type not in (None, '') else 'type1'
+            msg_type = request_data.get('type', default_type)
             timestamp = request_data.get('timestamp', '')
-            
+
             # 确保poseid不为空
             if not point_id or point_id == '':
                 point_id = 'demo_point_' + str(int(time.time()))
                 print("[机械臂控制器] poseid为空，生成默认ID: {}".format(point_id))
-            
-            print("[机械臂控制器] 收到示教录点数据: mapid={}, poseid={}, type={}".format(map_id, point_id, point_type))
-            
-            # 构造TCP消息 - 使用前端发送的type字段
-            tcp_message = {
-                'type': point_type,  # 使用前端发送的type值
-                'mapid': map_id,
-                'poseid': point_id
-            }
-            
-            # 真正的TCP发送到NX
-            print("[机械臂控制器] 示教录点数据接收成功，开始发送到NX")
-            print("[机械臂控制器] TCP消息内容: {}".format(tcp_message))
-            
+
+            print("[机械臂控制器] 收到示教录点数据: mapid={}, poseid={}, type={}, point_type={}".format(
+                map_id, point_id, msg_type, point_type))
+
             # 检查机械臂控制器
             if not hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
                 print("[机械臂控制器] 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
                 return
-                
+
             # 获取机械臂控制器
             arm_controller = self.master_node_subscriber.mechanical_arm_controller
             print("[机械臂控制器] 机械臂控制器状态: {}".format(arm_controller.get_controller_status()))
-            
-            # 通过机械臂控制器发送TCP消息
+
+            # 归一化 type：前端可能传 type1/"1"/1
+            normalized_type = msg_type
+            if msg_type in ('type1', '1', 1, 'demo_point_recorded'):
+                normalized_type = 1 if arm_controller.is_dobot() else 'type1'
+            elif msg_type in ('type2', '2', 2):
+                # type2 在越疆是查询，示教完成不应走这里；兼容埃斯顿结束示教
+                normalized_type = 2 if arm_controller.is_dobot() else 'type2'
+
+            # 越疆示教开始必须带 point_type
+            if arm_controller.is_dobot() and normalized_type == 1 and point_type in (None, ''):
+                client.write(MasterNodeErrorCode.ErrorData(
+                    "point_type不能为空，0=AprilTag，1=ICP"))
+                return
+
             try:
-                success = arm_controller._send_message(tcp_message)
-                if success:
-                    print("[机械臂控制器] 示教录点数据发送到NX成功")
-                    
-                    # 创建文件夹结构
-                    self._create_demo_point_folders(map_id, point_id)
-                    
-                    client.write(MasterNodeErrorCode.SuccessedData({
-                        "message": "机械臂控制器数据发送成功", 
-                        "data": tcp_message,
-                        "status": "real_success"
-                    }))
+                if arm_controller.is_dobot() and normalized_type == 2:
+                    # 越疆 type2 = 查询点位
+                    result = arm_controller.query_demo_points(
+                        map_id, point_id,
+                        timeout=float(request_data.get('timeout_sec', 20)))
+                elif arm_controller.is_dobot():
+                    result = arm_controller.send_demo_point(
+                        map_id, point_id,
+                        msg_type=normalized_type,
+                        point_type=point_type,
+                        params=params,
+                        timeout=float(request_data.get('timeout_sec', 70)))
                 else:
-                    print("[机械臂控制器] 示教录点数据发送到NX失败")
-                    client.write(MasterNodeErrorCode.ErrorData("机械臂控制器数据发送失败"))
+                    tcp_message = {
+                        'type': normalized_type,
+                        'mapid': map_id,
+                        'poseid': point_id
+                    }
+                    result = arm_controller._send_message(tcp_message, wait_response=False)
+
+                ok, nx_response = self._normalize_arm_send_result(result)
+                if ok:
+                    print("[机械臂控制器] 示教数据发送到NX成功")
+                    self._create_demo_point_folders(map_id, point_id)
+                    response_data = {
+                        "message": (nx_response or {}).get('message', "机械臂控制器数据发送成功")
+                            if isinstance(nx_response, dict) else "机械臂控制器数据发送成功",
+                        "data": {
+                            "type": normalized_type,
+                            "mapid": map_id,
+                            "poseid": point_id,
+                            "point_type": point_type,
+                            "params": params,
+                        },
+                        "status": "real_success",
+                        "nx_response": nx_response if isinstance(nx_response, dict) else (
+                            result if isinstance(result, dict) else None),
+                        "arm_vendor": arm_controller.get_arm_vendor(),
+                    }
+                    client.write(MasterNodeErrorCode.SuccessedData(response_data))
+                else:
+                    err = nx_response if isinstance(nx_response, dict) else {}
+                    status_info = {}
+                    try:
+                        status_info = arm_controller.get_controller_status() or {}
+                    except Exception:
+                        pass
+                    print("[机械臂控制器] 示教录点数据发送到NX失败: {}".format(err or result))
+                    client.write(MasterNodeErrorCode.ErrorData(
+                        "机械臂示教失败 [{}]: {} (vendor={}, nx={}:{}, tcp_connected={})".format(
+                            err.get('error_code', 'send_failed'),
+                            err.get('message', '机械臂控制器数据发送失败'),
+                            status_info.get('arm_vendor', '?'),
+                            status_info.get('nx_host', '?'),
+                            status_info.get('nx_port', '?'),
+                            status_info.get('tcp_connected', '?'))))
             except Exception as tcp_error:
                 print("[机械臂控制器] TCP发送异常: {}".format(str(tcp_error)))
                 client.write(MasterNodeErrorCode.ErrorData("TCP发送异常: {}".format(str(tcp_error))))
-                
+
         except Exception as e:
             print("[机械臂控制器] 处理示教录点数据时发生错误: {}".format(str(e)))
             client.write_message(MasterNodeErrorCode.ErrorData("处理示教录点数据时发生错误: {}".format(str(e))))
 
+    def get_mechanical_arm_vendor(self, client):
+        """返回当前机械臂厂商配置"""
+        try:
+            if not hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
+                client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
+                return
+            arm_controller = self.master_node_subscriber.mechanical_arm_controller
+            status = arm_controller.get_controller_status()
+            client.write(MasterNodeErrorCode.SuccessedData({
+                "arm_vendor": arm_controller.get_arm_vendor(),
+                "status": status,
+            }))
+        except Exception as e:
+            client.write(MasterNodeErrorCode.ErrorData("获取机械臂厂商失败: {}".format(str(e))))
+
+    def _normalize_arm_send_result(self, result):
+        """将控制器返回值规范为 (ok, nx_response)"""
+        if result is True:
+            return True, None
+        if result is False or result is None:
+            return False, None
+        if isinstance(result, dict):
+            status = result.get('status')
+            arm = self.master_node_subscriber.mechanical_arm_controller
+            if arm and hasattr(arm, '_is_success_status') and arm._is_success_status(status):
+                return True, result
+            if arm and hasattr(arm, '_is_failure_status') and arm._is_failure_status(status):
+                return False, result
+            # 有 status 字段但未知时仍回传
+            return True, result
+        return bool(result), None
+
     def get_mechanical_arm_points_from_demo_files(self, client):
         """
-        从示教文件中查询机械臂点name值
-        查询路径: /root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node/{map_id}/{pose_id}/*.json
+        查询机械臂点位：
+        - dobot: TCP type=2 向 NX 查询
+        - estun: 从示教文件中查询
         """
         try:
             import json
             import glob
             import os
-            
-            # 基础路径
-            base_path = "/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
-            
+
             # 获取请求参数
             request_data = json.loads(client.request.body.decode('utf-8'))
-            map_id = request_data.get('map_id', '')
-            pose_id = request_data.get('pose_id', '')
-            
+            map_id = request_data.get('map_id', '') or request_data.get('mapid', '')
+            pose_id = request_data.get('pose_id', '') or request_data.get('poseid', '')
+
             print("[查询机械臂点] ========== 开始查询机械臂点 ==========")
             print("[查询机械臂点] 收到请求: map_id='{}', pose_id='{}'".format(map_id, pose_id))
+
+            arm_controller = None
+            if hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
+                arm_controller = self.master_node_subscriber.mechanical_arm_controller
+
+            # 越疆：走 NX type=2
+            if arm_controller and arm_controller.is_dobot():
+                if not map_id or not pose_id:
+                    client.write(MasterNodeErrorCode.ErrorData("越疆查询点位需要 map_id 和 pose_id"))
+                    return
+                result = arm_controller.query_demo_points(map_id, pose_id, timeout=20)
+                ok, nx_response = self._normalize_arm_send_result(result)
+                if not ok:
+                    client.write(MasterNodeErrorCode.ErrorData("查询机械臂点失败: {}".format(nx_response or result)))
+                    return
+                metrics = (nx_response or {}).get('metrics') or {}
+                points = metrics.get('points') or []
+                mechanical_arm_points = []
+                for p in points:
+                    mechanical_arm_points.append({
+                        "name": p.get('label') or p.get('name') or '',
+                        "label": p.get('label') or '',
+                        "point_type": p.get('point_type'),
+                        "map_id": metrics.get('mapid', map_id),
+                        "pose_id": metrics.get('poseid', pose_id),
+                        "file_path": '',
+                        "timestamp": '',
+                    })
+                client.write(MasterNodeErrorCode.SuccessedData({
+                    "mechanical_arm_points": mechanical_arm_points,
+                    "total_count": len(mechanical_arm_points),
+                    "search_path": "nx:type2",
+                    "arm_vendor": "dobot",
+                    "nx_response": nx_response,
+                }))
+                return
+
+            # 埃斯顿：读本地示教文件
+            # 基础路径
+            base_path = "/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
+
             print("[查询机械臂点] map_id类型: {}, pose_id类型: {}".format(type(map_id), type(pose_id)))
             print("[查询机械臂点] map_id长度: {}, pose_id长度: {}".format(len(map_id) if map_id else 0, len(pose_id) if pose_id else 0))
             print("[查询机械臂点] map_id是否为空: {}, pose_id是否为空: {}".format(map_id == '', pose_id == ''))
-            
-            # 检查基础路径是否存在
+
             if not os.path.exists(base_path):
                 print("[查询机械臂点] 基础路径不存在: {}".format(base_path))
                 client.write(MasterNodeErrorCode.SuccessedData({
                     "mechanical_arm_points": [],
                     "total_count": 0,
                     "search_path": base_path,
-                    "message": "示教文件目录不存在"
+                    "arm_vendor": "estun",
                 }))
                 return
-            
-            # 构造查询路径 - 修复查询策略
+
+            json_files = []
             search_paths = []
-            
+
             if map_id and pose_id:
-                # 只查询特定地图和点位的文件
                 specific_path = os.path.join(base_path, map_id, pose_id, "*.json")
-                search_paths.append(specific_path)  
+                search_paths.append(specific_path)
                 print("[查询机械臂点] 特定路径查询: {}".format(specific_path))
             elif map_id and not pose_id:
-                # 有地图ID但没有点位ID，返回空结果
                 print("[查询机械臂点] 有地图ID但点位ID为空，返回空结果")
                 client.write(MasterNodeErrorCode.SuccessedData({
                     "mechanical_arm_points": [],
-                    "total_count": 0
+                    "total_count": 0,
+                    "search_path": base_path,
+                    "arm_vendor": "estun",
                 }))
                 return
             else:
-                # 查询所有文件
                 all_path = os.path.join(base_path, "*", "*", "*.json")
                 search_paths.append(all_path)
                 print("[查询机械臂点] 全路径查询: {}".format(all_path))
-            
-            # 根据查询策略获取文件
-            json_files = []
+
             for search_path in search_paths:
                 found_files = glob.glob(search_path)
-                json_files.extend(found_files)
                 print("[查询机械臂点] 路径 {} 找到 {} 个文件".format(search_path, len(found_files)))
-            
+                json_files.extend(found_files)
+
             # 去重
             json_files = list(set(json_files))
             print("[查询机械臂点] 去重后总共找到 {} 个JSON文件".format(len(json_files)))
-            
-            # 如果没有找到文件，列出基础路径下的内容
+
             if len(json_files) == 0:
                 print("[查询机械臂点] 未找到JSON文件，列出基础路径内容:")
                 try:
                     for root, dirs, files in os.walk(base_path):
                         print("[查询机械臂点] 目录: {}, 文件: {}".format(root, files))
-                        if len(files) > 0:  # 只显示前几个目录
-                            break
+                        break
                 except Exception as e:
                     print("[查询机械臂点] 列出目录内容时出错: {}".format(str(e)))
-            
+
             mechanical_arm_points = []
-            
+
             print("[查询机械臂点] ========== 开始处理JSON文件 ==========")
             for i, json_file in enumerate(json_files):
                 print("[查询机械臂点] 处理文件 {}/{}: {}".format(i+1, len(json_files), json_file))
                 try:
-                    # 兼容不同Python版本的文件读取方式
-                    try:
-                        # 尝试使用encoding参数（Python 3+）
-                        with open(json_file, 'r', encoding='utf-8') as f:
+                    with open(json_file, 'r') as f:
+                        try:
                             data = json.load(f)
-                    except TypeError:
-                        # 如果不支持encoding参数，使用兼容方式
-                        print("[查询机械臂点] 使用兼容模式读取文件: {}".format(json_file))
-                        with open(json_file, 'r') as f:
-                            data = json.load(f)
-                    
+                        except Exception:
+                            print("[查询机械臂点] 使用兼容模式读取文件: {}".format(json_file))
+                            f.seek(0)
+                            data = json.loads(f.read())
+
                     print("[查询机械臂点] 文件内容结构: {}".format(list(data.keys()) if isinstance(data, dict) else type(data)))
-                    
+
                     # 检查是否是机械臂点位数据文件
-                    if 'points_data' in data and isinstance(data['points_data'], list):
+                    if isinstance(data, dict) and 'points_data' in data:
                         print("[查询机械臂点] 文件包含points_data，数量: {}".format(len(data['points_data'])))
-                        
-                        # 检查文件的地图和点位ID是否匹配请求参数
-                        file_map_id = data.get('map_id', '')
-                        file_pose_id = data.get('pose_id', '')
+
+                        file_map_id = data.get('map_id', data.get('mapid', ''))
+                        file_pose_id = data.get('pose_id', data.get('poseid', ''))
                         print("[查询机械臂点] 文件地图ID: '{}', 文件点位ID: '{}'".format(file_map_id, file_pose_id))
-                        
-                        # 如果提供了map_id和pose_id，只处理匹配的文件
+
                         if map_id and pose_id:
                             if file_map_id != map_id or file_pose_id != pose_id:
                                 print("[查询机械臂点] ✗ 文件不匹配请求参数，跳过")
@@ -6809,72 +6966,39 @@ class MasterNode:
                             if file_map_id != map_id:
                                 print("[查询机械臂点] ✗ 文件地图ID不匹配，跳过")
                                 continue
-                        
+
                         for j, point in enumerate(data['points_data']):
                             print("[查询机械臂点] 处理点 {}/{}: {}".format(j+1, len(data['points_data']), point))
-                            # 支持新格式的label字段和旧格式的name字段
-                            point_name = None
-                            if 'label' in point:
-                                point_name = point['label']
-                                print("[查询机械臂点] 使用label字段: {}".format(point_name))
-                            elif 'name' in point:
-                                point_name = point['name']
-                                print("[查询机械臂点] 使用name字段: {}".format(point_name))
-                            
-                            if point_name:
+                            if 'name' in point:
                                 point_info = {
-                                    'name': point_name,
-                                    'file_path': json_file,
-                                    'map_id': file_map_id,
-                                    'pose_id': file_pose_id,
-                                    'timestamp': data.get('timestamp', '')
+                                    "name": point['name'],
+                                    "file_path": json_file,
+                                    "map_id": file_map_id,
+                                    "pose_id": file_pose_id,
+                                    "timestamp": data.get('timestamp', ''),
                                 }
                                 mechanical_arm_points.append(point_info)
-                                print("[查询机械臂点] ✓ 找到机械臂点: {} (来自文件: {})".format(point_name, json_file))
+                                print("[查询机械臂点] ✓ 找到机械臂点: {} (来自文件: {})".format(point['name'], json_file))
                             else:
-                                print("[查询机械臂点] ✗ 点数据缺少name或label字段: {}".format(point))
-                                print("[查询机械臂点] 点数据包含的字段: {}".format(list(point.keys()) if isinstance(point, dict) else '非字典类型'))
+                                print("[查询机械臂点] ✗ 点数据缺少name字段: {}".format(point))
                     else:
                         print("[查询机械臂点] ✗ 文件不包含有效的points_data: {}".format(json_file))
                         if isinstance(data, dict):
                             print("[查询机械臂点] 文件包含的字段: {}".format(list(data.keys())))
-                    
+
                 except Exception as file_error:
                     print("[查询机械臂点] ✗ 读取文件 {} 时发生错误: {}".format(json_file, str(file_error)))
-                    continue
-            
+
             print("[查询机械臂点] ========== 查询结果汇总 ==========")
             print("[查询机械臂点] 总共找到 {} 个机械臂点".format(len(mechanical_arm_points)))
-            
-            # 输出所有找到的机械臂点详情
-            for i, point in enumerate(mechanical_arm_points):
-                print("[查询机械臂点] 点 {}/{}: 名称='{}', 文件='{}', 地图='{}', 点位='{}', 时间='{}'".format(
-                    i+1, len(mechanical_arm_points), 
-                    point['name'], 
-                    point['file_path'], 
-                    point['map_id'], 
-                    point['pose_id'], 
-                    point['timestamp']
-                ))
-            
-            # 按文件分组统计
-            file_stats = {}
-            for point in mechanical_arm_points:
-                file_path = point['file_path']
-                if file_path not in file_stats:
-                    file_stats[file_path] = 0
-                file_stats[file_path] += 1
-            
-            print("[查询机械臂点] 按文件分组统计:")
-            for file_path, count in file_stats.items():
-                print("[查询机械臂点]   {}: {} 个点".format(file_path, count))
-            
+
             client.write(MasterNodeErrorCode.SuccessedData({
                 "mechanical_arm_points": mechanical_arm_points,
                 "total_count": len(mechanical_arm_points),
-                "search_path": search_path
+                "search_path": base_path,
+                "arm_vendor": "estun",
             }))
-            
+
         except Exception as e:
             print("[查询机械臂点] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("查询机械臂点时发生错误: {}".format(str(e))))
@@ -6882,107 +7006,129 @@ class MasterNode:
     def send_mechanical_arm_command(self, client):
         """
         发送机械臂控制命令到NX
-        支持的命令: 1=复位, 2=手动, 3=自动, 4=清除报警
+        命令: 1复位 2上使能 3下使能 4自动/开始拖拽 5手动/取消拖拽 6清除报警
         """
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_command')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂控制] ========== 收到机械臂控制命令 ==========")
             print("[机械臂控制] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
+            try:
+                command = int(command)
+            except (TypeError, ValueError):
+                command = 0
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂控制] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
-            # 命令名称映射
-            command_names = {
-                1: "复位",
-                2: "上使能", 
-                3: "下使能",
-                4: "自动模式",
-                5: "手动模式",
-                6: "清除报警"
-            }
-            
+
+            is_dobot = False
+            if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
+                is_dobot = self.master_node_subscriber.mechanical_arm_controller.is_dobot()
+
+            # Dobot 的 1/2/5 由 NX 当前状态决定具体语义。
+            if is_dobot:
+                command_names = {
+                    1: "command1(示教记A/观察位或空闲复位)",
+                    2: "command2(示教记B或空闲上使能)",
+                    3: "下使能",
+                    4: "开始拖拽",
+                    5: "command5(示教取消或取消拖拽)",
+                    6: "清除报警"
+                }
+            else:
+                command_names = {
+                    1: "复位",
+                    2: "上使能",
+                    3: "下使能",
+                    4: "自动模式",
+                    5: "手动模式",
+                    6: "清除报警"
+                }
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂控制] 执行命令: {} ({})".format(command_name, command))
-            
-            # 构造TCP消息
-            tcp_message = {
-                'type': command_type,
-                'command': command,
-                'timestamp': timestamp
-            }
-            
-            print("[机械臂控制] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 获取控制器状态用于日志记录
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂控制] 控制器状态: {}".format(controller_status))
-                
-                # 发送命令（内部会自动处理连接检查和重连）
-                success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+
+                # 发送命令（dobot 走短连接等 NX 真实结果）
+                result = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(
+                    command,
+                    timeout=float(request_data.get('timeout_sec', 90)))
+                ok, nx_response = self._normalize_arm_send_result(result)
+                if ok:
                     print("[机械臂控制] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
-                        "message": "机械臂{}命令已发送".format(command_name),
+                        "message": (nx_response or {}).get(
+                            'message', "机械臂{}命令已发送".format(command_name))
+                            if isinstance(nx_response, dict)
+                            else "机械臂{}命令已发送".format(command_name),
                         "command": command,
                         "command_name": command_name,
-                        "timestamp": timestamp
+                        "timestamp": timestamp,
+                        "nx_response": nx_response,
+                        "arm_vendor": "dobot" if is_dobot else "estun",
                     }))
                 else:
                     print("[机械臂控制] ✗ 命令发送失败: {}".format(command_name))
-                    client.write(MasterNodeErrorCode.ErrorData("机械臂TCP连接异常，无法发送{}命令".format(command_name)))
+                    err = nx_response if isinstance(nx_response, dict) else {}
+                    client.write(MasterNodeErrorCode.ErrorData(
+                        "机械臂{}失败 [{}]: {}".format(
+                            command_name,
+                            err.get('error_code', ''),
+                            err.get('message', '机械臂TCP连接异常，无法发送命令'))))
             else:
                 print("[机械臂控制] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂控制] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
-                
+
     def check_mechanical_arm_connection(self, client):
         """
         检查机械臂TCP连接状态
         """
         try:
             print("[机械臂连接检查] ========== 检查机械臂TCP连接状态 ==========")
-            
+
             # 检查机械臂控制器是否存在
             if not hasattr(self.master_node_subscriber, 'mechanical_arm_controller'):
                 print("[机械臂连接检查] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
                 return
-            
+
             # 获取机械臂控制器
             arm_controller = self.master_node_subscriber.mechanical_arm_controller
-            
+
             # 检查连接状态
             connection_status = arm_controller.check_connection_status()
-            
+
             print("[机械臂连接检查] 连接状态: {}".format(connection_status))
-            
+
             if connection_status.get('connection_ok', False):
                 print("[机械臂连接检查] ✓ TCP连接正常")
                 client.write(MasterNodeErrorCode.SuccessedData({
                     "message": "机械臂TCP连接正常",
                     "status": connection_status,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "arm_vendor": arm_controller.get_arm_vendor(),
                 }))
             else:
                 print("[机械臂连接检查] ✗ TCP连接异常")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂TCP连接异常，请检查NX设备状态"))
-                
+
         except Exception as e:
             print("[机械臂连接检查] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("检查机械臂连接状态时发生错误: {}".format(str(e))))
@@ -6994,49 +7140,49 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_manual')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂手动模式] ========== 收到机械臂手动模式命令 ==========")
             print("[机械臂手动模式] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂手动模式] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂手动模式] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂手动模式] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 检查TCP连接状态
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂手动模式] 控制器状态: {}".format(controller_status))
-                
+
                 if not controller_status.get('tcp_connected', False):
                     print("[机械臂手动模式] ✗ TCP连接未建立，尝试重新连接...")
                     # 尝试重新连接
@@ -7047,9 +7193,10 @@ class MasterNode:
                         return
                     else:
                         print("[机械臂手动模式] ✓ 重新连接成功")
-                
+
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂手动模式] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7063,7 +7210,7 @@ class MasterNode:
             else:
                 print("[机械臂手动模式] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂手动模式] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7075,52 +7222,53 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_auto')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂自动模式] ========== 收到机械臂自动模式命令 ==========")
             print("[机械臂自动模式] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂自动模式] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂自动模式] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂自动模式] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 获取控制器状态用于日志记录
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂自动模式] 控制器状态: {}".format(controller_status))
-                
+
                 # 发送命令（内部会自动处理连接检查和重连）
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂自动模式] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7134,7 +7282,7 @@ class MasterNode:
             else:
                 print("[机械臂自动模式] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂自动模式] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7146,52 +7294,53 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_clear_alarm')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂清除报警] ========== 收到机械臂清除报警命令 ==========")
             print("[机械臂清除报警] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂清除报警] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂清除报警] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂清除报警] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 获取控制器状态用于日志记录
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂清除报警] 控制器状态: {}".format(controller_status))
-                
+
                 # 发送命令（内部会自动处理连接检查和重连）
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂清除报警] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7205,7 +7354,7 @@ class MasterNode:
             else:
                 print("[机械臂清除报警] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂清除报警] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7217,49 +7366,49 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_enable')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂上使能] ========== 收到机械臂上使能命令 ==========")
             print("[机械臂上使能] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂上使能] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂上使能] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂上使能] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 检查TCP连接状态
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂上使能] 控制器状态: {}".format(controller_status))
-                
+
                 if not controller_status.get('tcp_connected', False):
                     print("[机械臂上使能] ✗ TCP连接未建立，尝试重新连接...")
                     # 尝试重新连接
@@ -7270,9 +7419,10 @@ class MasterNode:
                         return
                     else:
                         print("[机械臂上使能] ✓ 重新连接成功")
-                
+
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂上使能] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7286,7 +7436,7 @@ class MasterNode:
             else:
                 print("[机械臂上使能] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂上使能] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7298,49 +7448,49 @@ class MasterNode:
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_disable')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂下使能] ========== 收到机械臂下使能命令 ==========")
             print("[机械臂下使能] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂下使能] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂下使能] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂下使能] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 检查TCP连接状态
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂下使能] 控制器状态: {}".format(controller_status))
-                
+
                 if not controller_status.get('tcp_connected', False):
                     print("[机械臂下使能] ✗ TCP连接未建立，尝试重新连接...")
                     # 尝试重新连接
@@ -7351,9 +7501,10 @@ class MasterNode:
                         return
                     else:
                         print("[机械臂下使能] ✓ 重新连接成功")
-                
+
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂下使能] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7367,7 +7518,7 @@ class MasterNode:
             else:
                 print("[机械臂下使能] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂下使能] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7376,7 +7527,7 @@ class MasterNode:
         """
         创建示教录点文件夹结构
         路径: /root/Drobot Navigation Module/WORKSPACE/src/application/masternode/{map_id}/{pose_id}
-        
+
         Args:
             map_id: 地图ID
             pose_id: 点位ID
@@ -7384,32 +7535,32 @@ class MasterNode:
         try:
             # 基础路径
             base_path = "/root/Drobot_Navigation_Module/WORKSPACE/src/application/master_node"
-            
+
             # 创建mapid文件夹路径
             map_folder = os.path.join(base_path, map_id)
-            
+
             # 创建poseid文件夹路径
             pose_folder = os.path.join(map_folder, pose_id)
-            
+
             print("[文件夹创建] 开始创建示教录点文件夹结构")
             print("[文件夹创建] 基础路径: {}".format(base_path))
             print("[文件夹创建] 地图文件夹: {}".format(map_folder))
             print("[文件夹创建] 点位文件夹: {}".format(pose_folder))
-            
+
             # 检查当前工作目录和权限
             import pwd
             import stat
             current_user = pwd.getpwuid(os.getuid()).pw_name
             print("[文件夹创建] 当前用户: {}".format(current_user))
             print("[文件夹创建] 当前工作目录: {}".format(os.getcwd()))
-            
+
             # 检查/root目录是否存在和权限
             if os.path.exists("/root"):
                 root_stat = os.stat("/root")
                 print("[文件夹创建] /root目录存在，权限: {}".format(oct(root_stat.st_mode)))
             else:
                 print("[文件夹创建] /root目录不存在")
-            
+
             # 创建基础路径（如果不存在）
             if not os.path.exists(base_path):
                 try:
@@ -7427,7 +7578,7 @@ class MasterNode:
                     print("[文件夹创建] 基础路径已存在: {}".format(base_path))
             else:
                 print("[文件夹创建] 基础路径已存在: {}".format(base_path))
-            
+
             # 创建mapid文件夹
             if not os.path.exists(map_folder):
                 try:
@@ -7445,7 +7596,7 @@ class MasterNode:
                     print("[文件夹创建] 地图文件夹已存在: {}".format(map_folder))
             else:
                 print("[文件夹创建] 地图文件夹已存在: {}".format(map_folder))
-            
+
             # 创建poseid文件夹
             if not os.path.exists(pose_folder):
                 try:
@@ -7463,20 +7614,20 @@ class MasterNode:
                     print("[文件夹创建] 点位文件夹已存在: {}".format(pose_folder))
             else:
                 print("[文件夹创建] 点位文件夹已存在: {}".format(pose_folder))
-            
+
             # 最终验证整个路径结构
             print("[文件夹创建] 最终验证文件夹结构:")
             print("[文件夹创建] 基础路径存在: {}".format(os.path.exists(base_path)))
             print("[文件夹创建] 地图文件夹存在: {}".format(os.path.exists(map_folder)))
             print("[文件夹创建] 点位文件夹存在: {}".format(os.path.exists(pose_folder)))
-            
+
             if os.path.exists(pose_folder):
                 print("[文件夹创建] 示教录点文件夹结构创建完成")
                 return True
             else:
                 print("[文件夹创建] 示教录点文件夹结构创建失败")
                 return False
-            
+
         except Exception as e:
             print("[文件夹创建] 创建示教录点文件夹时发生错误: {}".format(str(e)))
             return False
@@ -7695,52 +7846,53 @@ class IndexHandler(RequestHandler):
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_auto')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂自动模式] ========== 收到机械臂自动模式命令 ==========")
             print("[机械臂自动模式] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂自动模式] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂自动模式] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂自动模式] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 获取控制器状态用于日志记录
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂自动模式] 控制器状态: {}".format(controller_status))
-                
+
                 # 发送命令（内部会自动处理连接检查和重连）
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂自动模式] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7754,7 +7906,7 @@ class IndexHandler(RequestHandler):
             else:
                 print("[机械臂自动模式] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂自动模式] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
@@ -7766,52 +7918,53 @@ class IndexHandler(RequestHandler):
         try:
             # 获取请求数据
             request_data = json.loads(client.request.body.decode('utf-8'))
-            
+
             # 提取参数
             command = request_data.get('command', 0)
             command_type = request_data.get('type', 'mechanical_arm_clear_alarm')
             timestamp = request_data.get('timestamp', '')
-            
+
             print("[机械臂清除报警] ========== 收到机械臂清除报警命令 ==========")
             print("[机械臂清除报警] 命令类型: {}, 命令值: {}, 时间戳: {}".format(command_type, command, timestamp))
-            
+
             # 验证命令值
             if command not in [1, 2, 3, 4, 5, 6]:
                 print("[机械臂清除报警] ✗ 无效的命令值: {}".format(command))
                 client.write(MasterNodeErrorCode.ErrorData("无效的机械臂命令: {}".format(command)))
                 return
-            
+
             # 命令名称映射
             command_names = {
                 1: "复位",
-                2: "上使能", 
+                2: "上使能",
                 3: "下使能",
                 4: "自动模式",
                 5: "手动模式",
                 6: "清除报警"
             }
-            
+
             command_name = command_names.get(command, "未知命令")
             print("[机械臂清除报警] 执行命令: {} ({})".format(command_name, command))
-            
+
             # 构造TCP消息
             tcp_message = {
                 'type': command_type,
                 'command': command,
                 'timestamp': timestamp
             }
-            
+
             print("[机械臂清除报警] TCP消息内容: {}".format(tcp_message))
-            
+
             # 通过机械臂控制器发送TCP消息
             if hasattr(self.master_node_subscriber, 'mechanical_arm_controller') and self.master_node_subscriber.mechanical_arm_controller:
                 # 获取控制器状态用于日志记录
                 controller_status = self.master_node_subscriber.mechanical_arm_controller.get_controller_status()
                 print("[机械臂清除报警] 控制器状态: {}".format(controller_status))
-                
+
                 # 发送命令（内部会自动处理连接检查和重连）
                 success = self.master_node_subscriber.mechanical_arm_controller.send_mechanical_arm_command(command)
-                if success:
+                ok, _nx_resp = self._normalize_arm_send_result(success)
+                if ok:
                     print("[机械臂清除报警] ✓ 命令发送成功: {}".format(command_name))
                     client.write(MasterNodeErrorCode.SuccessedData({
                         "message": "机械臂{}命令已发送".format(command_name),
@@ -7825,7 +7978,7 @@ class IndexHandler(RequestHandler):
             else:
                 print("[机械臂清除报警] ✗ 机械臂控制器未初始化")
                 client.write(MasterNodeErrorCode.ErrorData("机械臂控制器未初始化"))
-                
+
         except Exception as e:
             print("[机械臂清除报警] 发生错误: {}".format(str(e)))
             client.write(MasterNodeErrorCode.ErrorData("发送机械臂命令时发生错误: {}".format(str(e))))
