@@ -1,0 +1,73 @@
+vision_arm_executor:
+  ros__parameters:
+    rpc_host: "127.0.0.1"
+    rpc_port: 17881
+    rpc_allowed_clients: ["127.0.0.1/32"]
+    rpc_auth_token: ""
+    data_dir: "~/Robot_Arm_Project/data/vision_arm_estun"
+    handeye_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/handeye/active.json"
+    tcp_calibration_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/tcp/active.json"
+    robot_speed: 15
+    max_message_bytes: 65536
+    socket_timeout_sec: 5.0
+    task_ttl_sec: 3600.0
+    apriltag_cache_ttl_sec: 60.0
+    apriltag_max_robot_drift_mm: 10.0
+    apriltag_max_robot_drift_deg: 3.0
+    motion_limits_enabled: false
+    icp_frames: 5
+    icp_max_iters: 30
+    icp_final_trans_thresh_mm: 4.0
+    icp_final_rot_thresh_deg: 1.5
+    icp_final_stable_frames: 1
+    estun_service_namespace: "/estun_codroid"
+    # RobotDemo.cpp legacy global reset APos. command=1 and every completed
+    # production point return to this joint position.
+    estun_reset_joints: [86.0, 23.0, -112.0, -176.0, -85.0, 0.0]
+    reset_after_each_point: true
+    estun_manual_drag_passthrough: true
+    estun_arrival_position_mm: 1.5
+    estun_arrival_rotation_deg: 1.0
+    estun_arrival_joint_deg: 0.02
+    estun_motion_timeout_sec: 30.0
+    # AprilTag keeps the exact final target; only the path is split into
+    # nearby native CPos moves so Codroid can preserve a reachable branch.
+    estun_apriltag_cartesian_step_mm: 30.0
+    estun_apriltag_rotation_step_deg: 5.0
+    estun_apriltag_approach_mm: 50.0
+    estun_apriltag_search_max_tilt_deg: 25.0
+    estun_apriltag_search_tilt_step_deg: 5.0
+    # ICP first solves the unchanged final target. If its IK seed fails, plan
+    # a short smooth Cartesian detour whose every pose is solved before motion.
+    estun_icp_waypoint_step_mm: 30.0
+    estun_icp_waypoint_max_steps: 4
+    estun_gripper_do_port: 18
+    estun_gripper_config_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/gripper/active.json"
+
+apriltag_pick:
+  ros__parameters:
+    tag_frame: "tag36h11:0"
+    tag_size_m: 0.152
+    handeye_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/handeye/active.json"
+    tcp_calibration_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/tcp/active.json"
+    debug_output_dir: "~/Robot_Arm_Project/data/vision_arm_estun/apriltag_validation_runs"
+    robot_speed: 15
+    execute_enabled: false
+    samples: 10
+    sample_window_sec: 2.0
+    max_detection_age_sec: 1.0
+    max_sample_spread_mm: 8.0
+    motion_limits_enabled: false
+    pregrasp_height_mm: 80.0
+    tag_to_tcp.xyz_mm: [0.0, 0.0, 0.0]
+    tag_to_tcp.rpy_deg: [180.0, 0.0, 0.0]
+    gripper.enabled: false
+    gripper.index: 1
+    gripper.active_high: true
+    estun_service_namespace: "/estun_codroid"
+    estun_manual_drag_passthrough: true
+    estun_arrival_position_mm: 1.5
+    estun_arrival_rotation_deg: 1.0
+    estun_motion_timeout_sec: 30.0
+    estun_gripper_do_port: 18
+    estun_gripper_config_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/gripper/active.json"

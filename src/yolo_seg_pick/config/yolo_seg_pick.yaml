@@ -1,0 +1,46 @@
+yolo_seg_pick:
+  ros__parameters:
+    # opencv_template：一个已知目标的 ORB 模板匹配；yolo11_seg：YOLO 分割。
+    detector_mode: "opencv_template"
+    # 从 D455 当前视角拍摄，仅包含目标且纹理清晰的模板图。
+    template_path: "src/yolo_seg_pick/templates/bottle_template_raw.png"
+    template_ratio_test: 0.75
+    template_min_matches: 12
+    template_min_inliers: 8
+
+    # 仅 detector_mode=yolo11_seg 时使用。
+    model_path: "src/yolo_seg_pick/models/yolo11x-seg.pt"
+    target_class: ""                 # COCO name, e.g. "bottle"; empty = highest-confidence object
+    confidence: 0.55
+    image_topic: "/camera/camera/color/image_raw"
+    aligned_depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    camera_info_topic: "/camera/camera/color/camera_info"
+    handeye_path: "/home/ylx/Robot_Arm_Project/scripts/active_handeye_calibration.json"
+    tcp_calibration_path: "/home/ylx/Robot_Arm_Project/scripts/tcp_calibration/tcp_calibration_20260714_095024.json"
+
+    # Valid masked depth range; D455 16UC1 is converted from mm to metres.
+    min_depth_m: 0.15
+    max_depth_m: 1.20
+    min_mask_points: 150
+    depth_trim_percent: 10.0
+
+    # Keep false until s/l results have been manually verified.
+    execute_enabled: true
+    robot_speed: 10
+    # 资料给出的 Step_Motor_ROS2 相对角度模式：先张开，抓取点闭合。
+    # 启动底层节点：ros2 run step_motor motor_node
+    step_gripper:
+      enabled: true
+      topic: "/motor_control"
+      id: 1
+      speed: 200
+      mode: 2
+      angle: 30000
+      sub_divide: 32
+      open_dir: 0
+      close_dir: 1
+      settle_sec: 1.5
+    pregrasp_height_mm: 100.0
+    lift_height_mm: 120.0
+    min_base_z_mm: 20.0
+    max_base_radius_mm: 850.0

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>CR5 手眼标定与 ICP 视觉伺服复现记录</title>
+<style>
+  @page { size: A4; margin: 2.2cm 2.0cm; }
+  body { font-family: "Noto Sans CJK SC", "Microsoft YaHei", "SimSun", sans-serif; color:#1f2933; line-height:1.55; font-size:11pt; }
+  h1 { font-size:22pt; text-align:center; margin: 0 0 8pt; color:#102a43; }
+  h2 { font-size:15pt; color:#123b66; border-bottom:1px solid #bcccdc; padding-bottom:3pt; margin-top:20pt; }
+  h3 { font-size:12.5pt; color:#243b53; margin-top:14pt; }
+  p { margin: 6pt 0; } ul { margin: 4pt 0 8pt 18pt; } li { margin: 2pt 0; }
+  table { border-collapse:collapse; width:16cm; margin:8pt 0 12pt; table-layout:auto; }
+  th, td { border:1px solid #9fb3c8; padding:5pt 6pt; vertical-align:top; } th { background:#e6f0fa; font-weight:bold; }
+  pre { background:#f5f7fa; border:1px solid #d9e2ec; padding:7pt; font-family:"Consolas", monospace; font-size:9.5pt; white-space:pre-wrap; }
+  .formula { font-family:"Cambria Math", "Times New Roman", serif; font-size:12pt; text-align:center; margin:8pt 0; padding:2pt 0; background:transparent; border:0; }
+  .caption, figcaption { text-align:center; color:#52606d; font-size:9.5pt; margin-top:4pt; }
+  figure { text-align:center; margin:10pt 0 14pt; page-break-inside:avoid; }
+  .note { background:#fffbea; border-left:4px solid #f0b429; padding:7pt 9pt; margin:8pt 0; }
+  .ok { background:#e3fcec; border-left:4px solid #2f9e44; padding:7pt 9pt; margin:8pt 0; }
+  .danger { background:#ffe3e3; border-left:4px solid #e03131; padding:7pt 9pt; margin:8pt 0; }
+</style>
+</head>
+<body>
+<h1>CR5 手眼标定与 ICP 视觉伺服复现记录</h1>
+<p class="caption">项目：D455 eye-in-hand 手眼标定 + 点云 ICP 闭环伺服</p>
+
+<h2>1. 项目目标</h2>
+<p>本文档用于复现本项目的核心开发流程：D455 深度相机固定在 DOBOT CR5 末端，先完成 eye-in-hand 手眼标定，再通过点云 ICP 估计当前视角到参考模板视角的偏差，最后驱动机械臂闭环补偿，使当前点云回到参考帧。</p>
+
+<h2>2. 环境与硬件</h2>
+<table><tr><th>类别</th><th>内容</th></tr><tr><td>机械臂</td><td>DOBOT CR5</td></tr><tr><td>相机</td><td>Intel RealSense D455，安装在机械臂末端</td></tr><tr><td>标定板</td><td>棋盘格，8 × 11 内角点，20 mm 方格</td></tr><tr><td>系统</td><td>ROS2 Humble</td></tr><tr><td>机械臂驱动</td><td><code>src/DOBOT_6Axis_ROS2_V4</code></td></tr><tr><td>相机驱动</td><td><code>src/realsense-ros</code></td></tr><tr><td>核心包</td><td><code>src/icp_servoing</code></td></tr></table>
+
+<h2>3. 启动顺序</h2><h3>终端 1：启动机械臂</h3><pre>ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py</pre><h3>终端 2：启动 D455 点云</h3><pre>ros2 launch realsense2_camera rs_launch.py pointcloud.enable:=true</pre><h3>终端 3：启动 ICP 伺服程序</h3><pre>cd ~/Robot_Arm_Project
+source install/setup.bash
+bash scripts/run_icp_servo.sh</pre>
+<table><tr><th>键</th><th>功能</th></tr><tr><td><code>r</code></td><td>录制模板点云，5 帧融合后建立 ICP 金字塔</td></tr><tr><td><code>1-6</code></td><td>按预设关节增量制造小/中/大扰动</td></tr><tr><td><code>m</code></td><td>执行一次 ICP 估计和补偿</td></tr><tr><td><code>a</code></td><td>闭环对齐，最多 15 次</td></tr><tr><td><code>H/h</code></td><td>记录 home / 回到 home</td></tr><tr><td><code>q</code></td><td>退出</td></tr></table>
+
+<h2>4. 手眼标定</h2><p>固定棋盘格，使相机在多个末端位姿下都能完整看到棋盘，执行：</p><pre>python3 scripts/handeye_chessboard.py</pre><p>采集流程：机械臂自动移动到多个小幅扰动态；每帧用 <code>solvePnP</code> 求棋盘到相机的位姿；过滤角点不完整、重投影误差大和距离异常的数据；最后用 <strong>AX = XB</strong> 求解相机到工具坐标系的手眼矩阵。</p><div class="formula">A X = X B</div><div class="formula">X = T<sub>camera_in_tool</sub></div>
+<table><tr><th>项目</th><th>结果</th></tr><tr><td>有效帧数</td><td>10</td></tr><tr><td>运动对数</td><td>44</td></tr><tr><td>棋盘格重投影 RMSE</td><td>约 0.37–0.42 px</td></tr><tr><td>棋盘格距离</td><td>约 645–717 mm</td></tr><tr><td><code>T_camera_in_tool</code> 平移</td><td>[8.17, 89.52, -300.96] mm</td></tr><tr><td><code>T_camera_in_tool</code> 姿态</td><td>[-2.05, -0.08, -12.23] deg</td></tr></table><figure><img src="file:///home/ylx/Robot_Arm_Project/docs/assets/calib.png" style="width:16cm; height:9cm;" /><figcaption>图 1  手眼标定角点检测</figcaption></figure>
+
+<h2>5. 标定验证</h2><p>执行：</p><pre>python3 scripts/verify_calib.py</pre><p>验证方法：将多帧棋盘格角点统一变换到基座坐标系，检查同一个固定棋盘在世界坐标中的一致性。</p><div class="formula">P<sub>base</sub> = T<sub>base_tool</sub> · T<sub>camera_in_tool</sub> · P<sub>camera</sub></div><div class="ok">验收判据：RMS &lt; 3 mm 时，可用于 ICP 视觉伺服。</div><figure><img src="file:///home/ylx/Robot_Arm_Project/docs/assets/calib_error.png" style="width:9cm; height:10.5cm;" /><figcaption>图 2  手眼标定误差验证</figcaption></figure>
+
+<h2>6. ICP 伺服流程</h2><pre>启动机械臂和相机
+  -&gt; 启动 scripts/run_icp_servo.sh
+  -&gt; 按 r 录制模板
+  -&gt; 按 1-6 人为扰动机械臂
+  -&gt; 按 m 做单步补偿，或按 a 做闭环对齐</pre><figure><img src="file:///home/ylx/Robot_Arm_Project/docs/assets/icp_closed_loop.png" style="width:16cm; height:6cm;" /><figcaption>图 3  闭环 ICP 伺服</figcaption></figure><p>核心链路如下：</p><pre>当前点云 + 模板点云
+  -&gt; 金字塔 ICP 得到 T_icp
+  -&gt; T_delta = X · T_icp · X⁻¹
+  -&gt; T_correction = T_delta⁻¹
+  -&gt; 提取平移和旋转，按比例补偿
+  -&gt; 雅可比伪逆求关节增量
+  -&gt; JointMovJ 执行</pre><div class="formula">T<sub>icp</sub>: current → template</div><div class="formula">T<sub>delta</sub> = X · T<sub>icp</sub> · X<sup>−1</sup></div><div class="formula">T<sub>correction</sub> = T<sub>delta</sub><sup>−1</sup></div><div class="formula">T<sub>target</sub> = T<sub>cur</sub> · partial(T<sub>correction</sub>)</div><p>当前稳定版本采用 <code>JointMovJ</code>，不使用 <code>MovL</code>。原因是本项目 CR5 固件下 <code>MovL</code> 兼容性不稳定，关节移动更可靠。</p>
+
+<h2>7. ICP 金字塔实现</h2><p>录制模板时只做一次预处理：5 帧点云融合，先 5 mm 体素压缩，再建立 20/10/5 mm 三层模板金字塔。每层预建 KDTree，后续补偿只对当前点云降采样并查询已有树。</p><table><tr><th>层级</th><th>体素</th><th>最近邻阈值</th></tr><tr><td>L0</td><td>20 mm</td><td>100 mm</td></tr><tr><td>L1</td><td>10 mm</td><td>50 mm</td></tr><tr><td>L2</td><td>5 mm</td><td>25 mm</td></tr></table><p>该优化把单次 ICP 从约 25 s 降到约 0.5 s 量级。</p>
+
+<h2>8. 控制参数</h2><table><tr><th>项目</th><th>数值</th></tr><tr><td>模板录制帧数</td><td>5</td></tr><tr><td>收敛判据</td><td>|t| &lt; 10 mm 且 |r| &lt; 1°</td></tr><tr><td>最大闭环次数</td><td>15</td></tr><tr><td>单步平移限幅</td><td>30 mm</td></tr><tr><td>补偿比例</td><td>第 1–2 步 70%，第 3–5 步 50%，第 6 步后 20%</td></tr><tr><td>ICP RMSE 门控</td><td>&lt; 60 mm</td></tr><tr><td>ICP inliers 门控</td><td>≥ 500</td></tr><tr><td>ICP 平移门控</td><td>&lt; 500 mm</td></tr><tr><td>ICP 旋转门控</td><td>&lt; 60°</td></tr><tr><td>机械臂速度</td><td>15%</td></tr><tr><td>碰撞等级</td><td>5</td></tr></table><p>CR5 初始化顺序：</p><pre>ClearError -&gt; DisableRobot -&gt; EnableRobot -&gt; SpeedFactor -&gt; SetCollisionLevel(5)</pre><div class="danger">不要额外调用 <code>PowerOn</code>。该调用在本项目设备上会导致异常下电或状态不一致。</div>
+
+<h2>9. 坐标与单位约定</h2><table><tr><th>项目</th><th>约定</th></tr><tr><td>手眼矩阵</td><td>X = T<sub>camera_in_tool</sub></td></tr><tr><td>机器人位姿</td><td>G = T<sub>base_tool</sub>，来自 ToolVectorActual</td></tr><tr><td>ToolVectorActual RPY</td><td>Rot.from_euler('xyz', [rx, ry, rz], degrees=True)</td></tr><tr><td>AX=XB</td><td>A = G<sub>j</sub><sup>−1</sup> · G<sub>i</sub>，B = C<sub>j</sub> · C<sub>i</sub><sup>−1</sup></td></tr><tr><td>ICP 内部单位</td><td>米</td></tr><tr><td>机械臂链路单位</td><td>毫米</td></tr></table><div class="formula">T<sub>init</sub>[:3,3] 需要从 mm 除以 1000</div><div class="formula">T<sub>icp</sub> 表示 current → template</div><div class="formula">T<sub>target</sub> = T<sub>cur</sub> · partial((X · T<sub>icp</sub> · X<sup>−1</sup>)<sup>−1</sup>)</div>
+
+<h2>10. 复现实验检查表</h2><ul><li><code>/camera/camera/depth/color/points</code> 有点云。</li><li><code>/dobot_msgs_v4/msg/ToolVectorActual</code> 有有效 TCP 位姿。</li><li><code>scripts/handeye_chessboard_result.json</code> 存在。</li><li>机械臂附近无障碍物，碰撞等级为 5。</li><li>重投影误差约小于 0.5 px，标定 RMS 小于 3 mm。</li><li>按 <code>r</code> 后能看到三层金字塔点数输出。</li><li>按 <code>m</code> 后能看到 RMSE、inliers、overlap 和补偿量。</li></ul>
+
+<h2>11. 常见问题</h2><h3>点云收不到</h3><ul><li>确认相机启动命令包含 <code>pointcloud.enable:=true</code>。</li><li>确认订阅话题为 <code>/camera/camera/depth/color/points</code>。</li></ul><h3>补偿方向反了</h3><ul><li>检查 <code>X = T_camera_in_tool</code> 是否被误写成 <code>T_tool_in_camera</code>。</li><li>检查 ICP 输出是否按 <code>current → template</code> 使用。</li><li>检查 <code>T_correction = inverse(T_delta)</code> 是否遗漏。</li></ul><h3>ICP 匹配点不足</h3><ul><li>模板录制时视野内应包含稳定几何结构。</li><li>扰动不宜过大，先用 <code>1</code> 或 <code>4</code> 小扰动验证。</li><li>检查深度图是否有大面积空洞。</li></ul><h3>机械臂移动失败</h3><ul><li>程序会执行 recover：ClearError → DisableRobot → EnableRobot → SpeedFactor → SetCollisionLevel。</li><li>若仍失败，检查控制柜状态、急停、碰撞状态和网络连接。</li><li>若出现 -40001 或 ToolVectorActual 中 xyz 全 0，建议重启驱动。</li></ul>
+
+<h2>12. 夹爪 TCP 标定（已完成）</h2><p>夹爪安装后，默认 <code>tool=0</code> 的 TCP 不再等于实际夹爪工作点。本项目已使用固定尖点 pivot calibration 完成夹爪 TCP 标定。</p><h3>目标</h3><ul><li>得到 <code>T_flange_tcp_gripper</code>，即法兰/默认工具坐标系到夹爪实际工作点的位姿。</li><li>将新的 TCP 写入机器人控制器，或在代码中作为工具偏置使用。</li><li>验证夹爪尖端在多姿态下指向同一空间点，误差控制在毫米级。</li></ul><h3>固定尖点法</h3><pre>固定一个尖点或小球作为空间参考
+  -&gt; 用夹爪尖端轻触同一参考点
+  -&gt; 采集 6-10 个不同姿态的 ToolVectorActual
+  -&gt; 求解 TCP 相对法兰/默认工具坐标系的平移偏置
+  -&gt; 保存样本和结果
+  -&gt; 多姿态回点验证</pre><p>计算模型：</p><div class="formula">p<sub>base_fixed</sub> = R<sub>base_tool_i</sub> · p<sub>tool_tcp</sub> + t<sub>base_tool_i</sub></div><p>多帧联立最小二乘，求解 <code>p_tool_tcp</code> 和 <code>p_base_fixed</code>。</p>
+<h3>实际结果</h3><table><tr><th>项目</th><th>结果</th></tr><tr><td>样本数</td><td>10</td></tr><tr><td><code>tcp_offset_tool_mm</code></td><td>[-18.971, 38.867, 56.246] mm</td></tr><tr><td>固定点基座坐标</td><td>[-301.055, 376.630, 269.670] mm</td></tr><tr><td>平均残差</td><td>0.712 mm</td></tr><tr><td>最大残差</td><td>0.905 mm</td></tr><tr><td>残差标准差</td><td>0.134 mm</td></tr></table><div class="ok">平均残差和最大残差均小于 1 mm，本次夹爪 TCP 标定通过。</div>
+<h3>已实现文件</h3><ul><li><code>scripts/tcp_calibration/tcp_pivot_calibrator.py</code>：拖拽采集、解算并保存 TCP。</li><li><code>scripts/tcp_calibration/tcp_analyze_json.py</code>：复算残差、逐样本诊断和剔除样本分析。</li><li><code>scripts/tcp_calibration/tcp_calibration_20260706_150548.json</code>：本次 10 组样本及最终结果。</li><li><code>scripts/tcp_calibration/README.md</code>：操作步骤、数学模型和安全说明。</li></ul><h3>复算命令</h3><pre>python3 scripts/tcp_calibration/tcp_analyze_json.py \
+  scripts/tcp_calibration/tcp_calibration_20260706_150548.json</pre>
+
+<h2>13. 当前开发进度（2026-07-09）</h2>
+<h3>13.1 ICP 与收敛控制</h3>
+<ul><li>闭环最大执行次数由 15 次调整为 30 次。</li><li>ICP 使用 20/10/5 mm 三层 point-to-point 金字塔；进入精修区间后增加 L3 point-to-plane。</li><li>每层及整次 ICP 均输出耗时、RMSE、inliers 和 overlap。</li><li>最终收敛只使用 ICP 残差判断；<code>T_cur-T_ref</code> 误差仅打印监控，不参与控制判定。</li><li>精修采用分段增益和限幅：中段约 70%/4 mm，末段约 50%/2 mm，小于最终阈值后连续确认。</li><li>模板融合后先生成一次 5 mm 基础点云，再由该结果构建金字塔，避免 L2 重复处理原始大点云。</li></ul>
+
+<h3>13.2 标定采集</h3>
+<ul><li>手眼标定已改为拖拽机械臂后按键采集位姿和图像，再按键统一计算。</li><li>每次结果保存到独立运行目录，不覆盖历史标定文件。</li><li><code>GetPose()</code> 使用无可选参数格式，避免旧固件对 <code>user=0,tool=0</code> 返回 <code>-40001</code>。</li></ul>
+
+<h3>13.3 CR5 MovJ 兼容结论</h3>
+<p>当前 CR5 固件使用旧版位置参数格式：</p><pre>MovJ(x,y,z,rx,ry,rz)</pre>
+<table><tr><th>指令格式</th><th>现场结果</th></tr><tr><td><code>MovJ(x,y,z,rx,ry,rz)</code></td><td>ErrorID=0</td></tr><tr><td><code>MovJ(x,y,z,rx,ry,rz,0,0,20,20,0)</code></td><td>ErrorID=0</td></tr><tr><td><code>MovJ(pose={...})</code></td><td>-30001</td></tr><tr><td>六个位置参数后追加命名 a/v/cp</td><td>-1</td></tr></table>
+<p>ICP 补偿目前直接发送笛卡尔 <code>MovJ</code>，已删除 Jacobian 伪逆和关节运动兜底。<code>ErrorID=0</code> 只表示队列接收，不能代表轨迹已经执行完成。</p>
+<p>到位判定：</p><pre>发送 MovJ
+  -&gt; 轮询 ToolVectorActual，确认 TCP 已启动
+  -&gt; 连续 3 帧满足目标残差 &lt;= 1.0 mm / 0.15 deg
+  -&gt; 判定到位</pre>
+<p>运动等待期间每 150 ms 查询 <code>RobotMode()</code>。若进入 <code>9 (ERROR)</code> 或 <code>11 (COLLISION)</code>，立即查询并打印 <code>GetErrorID()</code>，且不自动清错，以保留故障现场。</p>
+<div class="note">当前待查：大位移 ICP 目标虽然收到 MovJ ErrorID=0，控制器仍可能在后续规划或逆解阶段进入 Error。下一轮需依据 RobotMode + GetErrorID 区分目标不可达、关节限位、奇异位姿或碰撞。</div>
+
+<h3>13.4 持续伺服 C++ 模块化</h3>
+<p><code>continuous_icp_servo</code> 已从单文件拆分为职责模块：</p>
+<ul><li><code>types</code>：公共点云、矩阵、位姿和 ICP 结果类型。</li><li><code>geometry</code>：欧拉角、位姿矩阵和几何变换。</li><li><code>point_cloud_utils</code>：体素降采样与点云工具。</li><li><code>spatial_index</code>：空间索引和金字塔层。</li><li><code>icp_solver</code>：Kabsch/ICP 求解。</li><li><code>handeye_loader</code>：手眼标定矩阵加载。</li><li><code>continuous_icp_servo_node</code>：ROS2 编排、状态机和机械臂控制入口。</li></ul>
+<div class="ok">模块化版本已通过：<code>colcon build --packages-select continuous_icp_servo</code>，1 package finished。</div>
+<h3>13.5 夹爪 TCP 标定</h3><ul><li>固定尖点 pivot calibration 已完成。</li><li>10 组样本全部参与解算。</li><li>TCP 工具坐标偏移为 <code>[-18.971, 38.867, 56.246] mm</code>。</li><li>平均/最大残差为 <code>0.712/0.905 mm</code>，标定通过。</li><li>原始样本、结果和诊断工具均保存在 <code>scripts/tcp_calibration</code>。</li></ul>
+</body></html>

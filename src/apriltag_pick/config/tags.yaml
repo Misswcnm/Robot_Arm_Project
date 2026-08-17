@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    family: 36h11
+    size: 0.15
+    max_hamming: 0
+    qos_profile: sensor_data
+    detector:
+      threads: 2
+      decimate: 1.0
+      blur: 0.0
+      refine: true
+      sharpening: 0.25
+      debug: false
+    pose_estimation_method: pnp
+    # Do not configure tag.ids/tag.frames: apriltag_ros then publishes every
+    # detected 36h11 ID with its default frame name tag36h11:<id>. The station
+    # point's saved tag_id selects one target when several tags are visible.

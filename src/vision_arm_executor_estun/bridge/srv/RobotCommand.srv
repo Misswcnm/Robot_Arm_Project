@@ -1,0 +1,12 @@
+uint8 SWITCH_ON=1
+uint8 SWITCH_OFF=2
+uint8 TO_READY=3
+uint8 TO_AUTO=5
+uint8 ACKNOWLEDGE_ERROR=100
+uint16 CLEAR_WARNING=501
+uint16 STOP_MOTION=1000
+uint16 command
+---
+bool success
+int32 state
+string message

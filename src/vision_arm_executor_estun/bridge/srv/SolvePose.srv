@@ -1,0 +1,9 @@
+# Cartesian flange target in [x, y, z, roll, pitch, yaw], mm/deg.
+float64[6] target
+# Optional joint reference selects the nearest kinematic branch.
+bool use_reference
+float64[6] reference_joints
+---
+bool success
+float64[6] joints
+string message

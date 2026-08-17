@@ -1,0 +1,12 @@
+uint8 MOVE_JOINT=0
+uint8 MOVE_CARTESIAN_J=1
+uint8 MOVE_CARTESIAN_L=2
+uint8 move_type
+# Joint target is degrees. Cartesian target is
+# [x, y, z, roll, pitch, yaw] in millimetres/degrees.
+float64[6] target
+float64 speed
+float64 acceleration
+---
+bool success
+string message

@@ -1,0 +1,61 @@
+#!/usr/bin/env python2
+#coding=utf-8
+import rospy
+import master_node.Master_node as MasterNode
+from master_node.mechanical_arm_controller import MechanicalArmController
+import roslaunch
+from tornado.httpserver import HTTPServer
+####main Funtion####
+if __name__ == "__main__":
+
+    rospy.init_node("rosbridge_http")
+    retry_startup_delay = rospy.get_param('~retry_startup_delay', 2.0)  # seconds
+    # rospy.on_shutdown(h)这个函数为Ctrl+C这类shutdown事件创建一个退出之前的回调函数h，可以在程序退出之前做点什么。如果在h函数内Publish消息，不保证能成功发出消息！
+    rospy.on_shutdown(MasterNode.shutdown_hook)
+    print("Hello start http server listening to port 1819")
+    uuid = roslaunch.rlutil.get_or_generate_uuid(None, False) # start 
+    print("master_node xc *********************000************************")
+    roslaunch.configure_logging(uuid)
+    # launch 是机械臂配置的唯一来源；缺少参数时直接失败，禁止静默回退。
+    arm_controller = MechanicalArmController(
+        nx_host=rospy.get_param('~nx_host'),
+        nx_port=rospy.get_param('~nx_port'),
+        arm_vendor=rospy.get_param('~arm_vendor'))
+    rospy.loginfo("机械臂启动配置: %s:%s, vendor=%s",
+                  arm_controller.nx_host,
+                  arm_controller.nx_port,
+                  arm_controller.arm_vendor)
+    master_node = MasterNode.MasterNode(uuid, arm_controller)
+
+    print("master_node xc *********************001************************")
+    # Tornado是一个web server,Application传入参数，通过正则表达式匹配回调函数
+    app = MasterNode.Application([
+                        (r"/robot/notification",MasterNode.WebSocket, dict(mn = master_node)),
+                        (r"/robot/notification/sensor_scan",MasterNode.SensorWebSocket, dict(mn = master_node)),
+                        (r"/robot/ws/notice",MasterNode.NoticeWebSocket, dict(mn = master_node)),
+                        (r"/robot/(.*)",MasterNode.IndexHandler,dict(mn = master_node))])
+#    application = Application([(r"/", EchoWebSocket), (r"", EchoWebSocket)])
+    print("master_node xc *********************002************************")
+    server = HTTPServer(app, max_buffer_size=504857600, max_body_size=504857600)
+   # app.listen(1819)
+    connected = False
+    address = ""
+    port = 1819
+    print("master_node xc *********************003************************")
+    while not connected and not rospy.is_shutdown():
+        try:
+            server.bind(port)
+            server.start(1)
+            # app.listen(port, address)
+            rospy.loginfo("Rosbridge WebSocket server started on port %d", port)
+            connected = True
+        except Exception as e:
+            rospy.logwarn("Unable to start server: " + str(e) +
+                          " Retrying in " + str(retry_startup_delay) + "s.")
+            rospy.sleep(retry_startup_delay)
+
+    print("master_node xc *********************004************************")
+    MasterNode.IOLoop.current().start()
+    print ("[master_node] Delete master_node")
+    # del master_node
+    print ("[master_node] ShutDown")
