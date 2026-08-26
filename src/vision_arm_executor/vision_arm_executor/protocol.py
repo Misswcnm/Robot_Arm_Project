@@ -4,6 +4,7 @@ import uuid
 MAX_MESSAGE_BYTES = 65536
 VALID_ACTIONS = set(['arm_status',
  'vision_point_teach','vision_station_points','vision_station_execute',
+ 'vision_station_delete',
  'vision_icp_align',
  'vision_icp_align_and_move_b',
  'apriltag_locate','apriltag_locate_and_pick',

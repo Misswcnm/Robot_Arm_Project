@@ -1,0 +1,48 @@
+//启动teamviewer 连接机器人的网络SLK-Router_5G-5ED0   或者  SLK-Router_2G-5ED0
+
+连接192.168.2.103进入nx(密码nvidia)
+
+机械臂是自启动的
+
+//检测开机自启程序
+sudo systemctl status robot-arm.service
+//停止自启动程序
+sudo systemctl stop robot-arm.service
+
+
+手动启动机械臂之前需要 先停止自启动程序
+sudo systemctl stop robot-arm.service   (密码nvidia)
+cd /home/nvidia/TCP_asdun_arm/CodroidApi
+./runDemo.sh
+
+//如果需要自己示教机械臂
+//启动检测程序，可以自动检测示教文件并解析成对应格式并放在对应位置
+nvidia@nvidia-desktop:~/TCP_asdun_arm/CodroidApi$ python3 auto_process.py 
+下面四行是log
+启动示教文件自动监控...
+监控目录: /home/nvidia/Downloads
+解析脚本: /home/nvidia/TCP_asdun_arm/CodroidApi/jiexi.py
+基础路径: /home/nvidia/TCP_asdun_arm/CodroidApi/src
+
+
+
+//启动机械臂
+cd /home/nvidia/TCP_asdun_arm/CodroidApi
+./runDemo.sh
+
+导航盒子发type1时 web示教完成
+
+然后可以作任务
+
+
+
+//检查自启动程序是否启动了  这个如果后台启动 前台启会显示端口战用
+(Address already in use
+Failed to start position server!)
+
+
+
+//车子即停按下 机械臂是启动不起来的 会报以下错误
+Failed to send move command to reset point!
+Failed to go to global reset point
+

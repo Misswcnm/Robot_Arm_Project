@@ -13,7 +13,6 @@ apriltag_pick:
     samples: 10
     sample_window_sec: 2.0
     max_detection_age_sec: 1.0
-    max_sample_spread_mm: 8.0
     min_base_z_mm: 20.0
     max_base_radius_mm: 850.0
     pregrasp_height_mm: 80.0

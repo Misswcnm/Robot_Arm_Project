@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 from apriltag_pick.pick_node import AprilTagPickNode
 from apriltag_pick.transforms import load_tcp_offset
@@ -303,6 +305,43 @@ def test_apriltag_pick_dispatches_only_final_cached_target():
     assert len(moved) == 1
     np.testing.assert_allclose(moved[0], target)
     assert [stage for stage, _ in stages] == ['before_contact']
+
+
+def test_apriltag_localization_keeps_large_spread_as_diagnostic_only():
+    node = object.__new__(AprilTagPickNode)
+    node.robot = type('Robot', (), {
+        'use_base_frame': lambda self: True,
+        'get_tool': lambda self, warn=False: [0.0] * 6,
+    })()
+    node.tag_frame = 'tag36h11:0'
+    first = np.eye(4)
+    second = np.eye(4)
+    second[0, 3] = 157.8
+    node.tag_histories = {
+        node.tag_frame: [(9.8, first), (9.9, second)],
+    }
+    node.lock = threading.Lock()
+    node.get_clock = lambda: type('Clock', (), {
+        'now': lambda self: type('Time', (), {
+            'nanoseconds': int(10.0e9),
+        })(),
+    })()
+    node.max_detection_age = 1.0
+    node.sample_window = 2.0
+    node.samples = 10
+    node.flange_from_camera = np.eye(4)
+    node.tag_to_tcp = np.eye(4)
+    node.tcp_offset_flange = np.zeros(3)
+    node.motion_limits_enabled = False
+    node.localization_index = 0
+    node.last_localization = None
+    node.localization_cache = []
+    node.save_detection_debug = lambda *args, **kwargs: None
+
+    target = node.locate(wait_for_new_detection=False)
+
+    np.testing.assert_allclose(target[:3, 3], [78.9, 0.0, 0.0])
+    assert node.last_localization['spread_mm'] == 78.9
 
 
 def test_estun_apriltag_solves_approach_and_contact_before_motion():

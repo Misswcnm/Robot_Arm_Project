@@ -19,11 +19,19 @@ setup(
         ('share/' + PACKAGE_NAME, ['package.xml']),
         (
             os.path.join('share', PACKAGE_NAME, 'config'),
-            glob('config/*.yaml'),
+            glob('config/*.yaml') + glob('config/*.rviz'),
         ),
         (
             os.path.join('share', PACKAGE_NAME, 'launch'),
             glob('launch/*.launch.py'),
+        ),
+        (
+            os.path.join('share', PACKAGE_NAME, 'systemd'),
+            glob('systemd/*.service'),
+        ),
+        (
+            os.path.join('lib', PACKAGE_NAME),
+            glob('scripts/*.sh'),
         ),
     ],
     install_requires=['setuptools'],

@@ -70,6 +70,52 @@ ros2 launch vision_arm_executor_estun estun_vision_backend.launch.py \
   nx_allowed_clients:=127.0.0.1/32,192.168.2.15/32
 ```
 
+### NX 开机自启动
+
+包内置的 `estun-vision-backend.service` 使用上述固定启动参数，默认不启动
+RViz。它与历史 `robot-arm.service` 互斥，避免两个进程同时抢占 NX
+TCP 8888 端口。编译完成后在 NX 上执行：
+
+```bash
+sudo systemctl disable --now robot-arm.service 2>/dev/null || true
+sudo install -m 0644 \
+  install/vision_arm_executor_estun/share/vision_arm_executor_estun/systemd/estun-vision-backend.service \
+  /etc/systemd/system/estun-vision-backend.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now estun-vision-backend.service
+systemctl status estun-vision-backend.service --no-pager -l
+```
+
+重启后端：
+
+```bash
+sudo systemctl restart estun-vision-backend.service
+```
+
+关闭后端：
+
+```bash
+sudo systemctl stop estun-vision-backend.service
+```
+
+监听日志：
+
+```bash
+sudo journalctl -u estun-vision-backend.service -f -o cat
+```
+
+RealSense 话题边界：Foxy `4.51.1` 默认发布到 `/camera/...`，较新的
+ROS 2/RealSense 组合默认发布到 `/camera/camera/...`。后端会根据
+`ROS_DISTRO` 同时调整 AprilTag 图像、相机内参和 ICP 点云订阅；自定义
+相机命名空间时，用同一个环境变量显式覆盖：
+
+```bash
+export REALSENSE_TOPIC_ROOT=/my_camera
+```
+
+启动日志中的 `image_topic=...` 是最终生效的话题。该变量只定义 ROS
+话题边界，不改变 D455 配置、标定坐标系或 NX 协议。
+
 只读检查：
 
 ```bash
@@ -86,39 +132,13 @@ ros2 launch estun_codroid_bridge codroid_bridge.launch.py \
   robot_ip:=192.168.2.5 robot_port:=9000
 ```
 
-以下探针命令在终端 2 执行；测试期间不得让 NX 或其他节点并发下发机械臂指令。
+独立步进电机夹爪测试（不属于 ESTUN Codroid DO 自动夹爪链路）：
 
-先完全绕过观察关节位，只以当前笛卡尔位姿为基准沿 base X 移动 `5 mm`：
+先构建嵌套工作区中的 `serial` 和 `step_motor` 包。该节点只订阅
+`/motor_control`；正式视觉后端中的 `gripper.enabled` 与
+`EstunRobot.set_gripper()` 当前使用 `/estun_codroid/set_do`，不会自动转发到
+这个步进电机节点。
 
-```bash
-ros2 run vision_arm_executor_estun estun_apriltag_motion_probe \
-  --mode delta --delta-mm 5,0,0 --execute --speed 5
-```
-
-先只读检查缓存坐标链和最终 `MovJ(CPos)` 报文；该命令不会运动：
-
-```bash
-ros2 run vision_arm_executor_estun estun_apriltag_motion_probe --mode inspect
-```
-
-针对指定站点先测试从观察关节位直接到预接近点：
-
-```bash
-ros2 run vision_arm_executor_estun estun_apriltag_motion_probe \
-  --mode pregrasp --skip-observation --execute --speed 5 \
-  --manifest ~/Robot_Arm_Project/data/vision_arm_estun/tasks/862dbce9-72c5-46cb-98c3-62b6c7b7ec7e/d3f3e006-c6c0-4e88-9806-63aa23b3c6d2/862dbce9-72c5-46cb-98c3-62b6c7b7ec7e_d3f3e006-c6c0-4e88-9806-63aa23b3c6d2.json
-```
-
-若直接预接近失败，用同一姿态按 `5% → 100%` 分段探测第一个失败端点：
-
-```bash
-ros2 run vision_arm_executor_estun estun_apriltag_motion_probe \
-  --mode sweep --execute --speed 5 \
-  --manifest ~/Robot_Arm_Project/data/vision_arm_estun/tasks/862dbce9-72c5-46cb-98c3-62b6c7b7ec7e/d3f3e006-c6c0-4e88-9806-63aa23b3c6d2/862dbce9-72c5-46cb-98c3-62b6c7b7ec7e_d3f3e006-c6c0-4e88-9806-63aa23b3c6d2.json
-```
-
-探针只使用 `MovJ(CPos)`，不使用雅可比/APos 回退，不操作夹爪，也不会自动复位；
-控制器拒绝后会保留现场并输出请求前后位姿、`state/status_flag` 和首个失败比例。
 ros2 run step_motor motor_node
 ros2 topic pub --once /motor_control step_motor/msg/Motor "{id: 1,speed:
 200,dir: 1,mode: 2,angle: 30000,state: 0,sub_divide: 32}"

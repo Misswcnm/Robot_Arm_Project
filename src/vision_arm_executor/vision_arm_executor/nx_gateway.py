@@ -203,11 +203,10 @@ class NxMessageHandler:
         response['command'] = int(command)
         if teaching_command:
             response['teaching_command'] = teaching_command
-            if int(command) in {1, 2}:
-                # Commands 1/2 are intentionally scoped to ICP A/B only while
-                # a type1 teaching session is active.  Do not claim that
-                # reset/enable ran in that context.
-                return response
+            # A station-scoped command is exclusively a teaching message.  Do
+            # not add fuwei/shangdian/xiadian/tuozhuai fields that would claim
+            # a controller action ran.
+            return response
         value = (
             'success' if result.get('status') == 'succeeded' else 'failed')
         field = LEGACY_COMMAND_FIELDS[int(command)]
@@ -266,7 +265,13 @@ class NxMessageHandler:
     def _executor_params(message):
         params = dict(message.get('params', {}) or {})
         params.pop('pointType', None)
-        for field in ('mapid', 'poseid', 'label'):
+        for field in ('mapid', 'poseid', 'task_command'):
+            if message.get(field) not in (None, ''):
+                params.setdefault(field, message[field])
+        # These fields historically appeared both at top level and in params.
+        # Preserve an explicit params value; otherwise forward the top-level
+        # value.  Omitting both leaves executor defaults unchanged.
+        for field in ('tag_id', 'tag_offset_xyz_mm', 'frames'):
             if message.get(field) not in (None, ''):
                 params.setdefault(field, message[field])
         point_type = message.get('point_type', message.get('pointType'))
@@ -278,45 +283,22 @@ class NxMessageHandler:
         message = parsed.message
         command = parsed.command
         action = COMMAND_ACTIONS[command]
-        with self.resource_lock:
-            if command in {1, 2, 4, 5}:
-                health = self.rpc.run(
-                    'health', {}, 2.0, True,
-                    request_id=_request_id('nx-teach-state'))
-                if health.get('status') != 'succeeded':
-                    return self._legacy_command_response(
-                        message, health, command)
-                metrics = health.get('metrics', {})
-                teaching_active = bool(metrics.get(
-                    'teaching_active',
-                    metrics.get('icp_teaching_active', False)))
-                if teaching_active:
-                    point_type = metrics.get('teaching_point_type')
-                    if command == 4:
-                        teaching_command = 'drag_already_active'
-                        teaching_value = 4
-                        timeout = 10.0
-                    elif command == 5:
-                        teaching_command = 'abort'
-                        teaching_value = 3
-                        timeout = 30.0
-                    else:
-                        teaching_value = command
-                        timeout = 60.0
-                        teaching_command = (
-                            'record_apriltag_pose'
-                            if command == 1 and point_type == 0
-                            else ('record_a' if command == 1 else 'record_b'))
-                    params = {'command': teaching_value}
-                    if point_type not in (None, ''):
-                        params['point_type'] = int(point_type)
-                    result = self.rpc.run(
-                        'vision_point_teach', params, timeout, False,
-                        request_id=_request_id(
-                            'nx-teach-command-%d' % command))
-                    return self._legacy_command_response(
-                        message, result, command,
-                        teaching_command=teaching_command)
+        # Do not queue reset/enable/drag retries behind a long vision task.
+        # A vehicle may reconnect and resend while it is waiting; executing all
+        # those stale commands later would cause repeated robot motion.
+        if not self.resource_lock.acquire(blocking=False):
+            result = {
+                'action': action,
+                'status': 'failed',
+                'error_code': 'busy',
+                'message': (
+                    'another robot/vision task is running; command was not '
+                    'queued'),
+                'metrics': {},
+                'artifacts': [],
+            }
+            return self._legacy_command_response(message, result, command)
+        try:
             # ESTUN Codroid may return the movJ response only after the reset
             # motion completes.  Keep the legacy command alive longer than the
             # controller's 30 second motion-request timeout.
@@ -324,7 +306,30 @@ class NxMessageHandler:
             result = self.rpc.run(
                 action, {}, timeout, False,
                 request_id=_request_id('nx-command-%d' % command))
+        finally:
+            self.resource_lock.release()
         return self._legacy_command_response(message, result, command)
+
+    def _handle_teaching_command(self, parsed):
+        """Forward a station-scoped Ref/Work/finish/cancel command."""
+        message = parsed.message
+        command = parsed.command
+        params = self._executor_params(message)
+        params['command'] = command
+        timeout = 90.0 if command > 0 else 30.0
+        teaching_command = (
+            'cancel' if command == -1 else
+            ('finish' if command == 0 else
+             ('record_reference_or_work_1' if command == 1
+              else 'record_work')))
+        result = self._run({
+            'action': 'vision_point_teach',
+            'params': params,
+            'timeout_sec': timeout,
+            'dry_run': bool(message.get('dry_run', False)),
+        })
+        return self._legacy_command_response(
+            message, result, command, teaching_command=teaching_command)
 
     def _handle_locked(self, parsed):
         message = parsed.message
@@ -335,7 +340,7 @@ class NxMessageHandler:
                 # manifest.  Point type and label only belong to teaching and
                 # stored point records.
                 params.pop('point_type', None)
-                params.pop('label', None)
+                params.pop('task_command', None)
             elif parsed.point_type is not None:
                 params['point_type'] = parsed.point_type
             if ('command' in message and
@@ -355,18 +360,72 @@ class NxMessageHandler:
                     'apriltag_validate'})
 
         if parsed.kind == 'query':
+            params = self._executor_params(message)
+            health = self.rpc.run(
+                'health', {}, 2.0, True,
+                request_id=_request_id('nx-type2-teach-state'))
+            if health.get('status') != 'succeeded':
+                return self._legacy_response(message, health)
+            metrics = health.get('metrics', {})
+            teaching_active = bool(metrics.get(
+                'teaching_active',
+                metrics.get('icp_teaching_active', False)))
+            finish_result = None
+            if teaching_active:
+                active_mapid = metrics.get(
+                    'teaching_mapid', metrics.get('icp_mapid'))
+                active_poseid = metrics.get(
+                    'teaching_poseid', metrics.get('icp_poseid'))
+                if (str(active_mapid) != str(params.get('mapid')) or
+                        str(active_poseid) != str(params.get('poseid'))):
+                    raise RuntimeError(
+                        'type2 station does not match active teaching: '
+                        '%s/%s' % (active_mapid, active_poseid))
+                finish_result = self._run({
+                    'action': 'vision_point_teach',
+                    'params': {'command': 0,
+                               'mapid': params.get('mapid'),
+                               'poseid': params.get('poseid')},
+                    'timeout_sec': 30.0,
+                    'dry_run': False,
+                })
+                if finish_result.get('status') != 'succeeded':
+                    return self._legacy_response(message, finish_result)
             result = self._run({
                 'action': 'vision_station_points',
-                'params': self._executor_params(message),
+                'params': params,
                 'timeout_sec': 10.0,
                 'dry_run': True,
             })
+            if finish_result is not None and result.get('status') == 'succeeded':
+                result.setdefault('metrics', {})['teaching_finished'] = True
+                result['metrics']['finish_metrics'] = finish_result.get(
+                    'metrics', {})
             return self._legacy_response(message, result)
+
+        if parsed.kind == 'delete':
+            params = self._executor_params(message)
+            if parsed.command is None:
+                params.pop('task_command', None)
+            else:
+                params['task_command'] = str(parsed.command)
+            result = self._run({
+                'action': 'vision_station_delete',
+                'params': params,
+                'timeout_sec': 30.0,
+                'dry_run': bool(message.get('dry_run', False)),
+            })
+            return self._legacy_response(message, result)
+
+        if parsed.kind == 'teaching_command':
+            return self._handle_teaching_command(parsed)
 
         if parsed.kind == 'teaching_start':
             params = self._executor_params(message)
-            params.update(
-                command='start', point_type=parsed.point_type)
+            params.pop('task_command', None)
+            params['command'] = 'start'
+            if parsed.point_type is not None:
+                params['point_type'] = parsed.point_type
             result = self._run({
                 'action': 'vision_point_teach',
                 'params': params,
@@ -380,7 +439,7 @@ class NxMessageHandler:
             # Preserve the Asdun vehicle contract: mapid + poseid triggers all
             # saved points at that station in manifest order.
             params.pop('point_type', None)
-            params.pop('label', None)
+            params.pop('task_command', None)
             invocation = {
                 'action': 'vision_station_execute',
                 'params': params,
@@ -399,18 +458,22 @@ class NxMessageHandler:
         except Exception as error:
             return self._failure(message, error)
 
-        # Permission cancellation intentionally bypasses the resource lock so a
-        # second TCP connection can stop a long task at its next checkpoint.
-        if parsed.kind == 'permission':
-            result = self.rpc.run(
-                parsed.message_type,
-                dict(message.get('params', {}) or {}), 30.0, False,
-                request_id=_request_id('nx-' + parsed.message_type))
-            return self._legacy_response(message, result)
-        if parsed.kind == 'command':
-            return self._handle_command(parsed)
-        with self.resource_lock:
-            return self._handle_locked(parsed)
+        try:
+            # Permission cancellation intentionally bypasses the resource lock
+            # so a second TCP connection can stop a long task at its next
+            # checkpoint.
+            if parsed.kind == 'permission':
+                result = self.rpc.run(
+                    parsed.message_type,
+                    dict(message.get('params', {}) or {}), 30.0, False,
+                    request_id=_request_id('nx-' + parsed.message_type))
+                return self._legacy_response(message, result)
+            if parsed.kind == 'command':
+                return self._handle_command(parsed)
+            with self.resource_lock:
+                return self._handle_locked(parsed)
+        except Exception as error:
+            return self._failure(message, error)
 
 
 class NxCompatServer:
@@ -508,9 +571,10 @@ class NxCompatServer:
         payload = (json.dumps(
             response, ensure_ascii=False,
             separators=(',', ':')) + '\n').encode('utf-8')
-        print('NX result: action=%s status=%s error=%s' % (
+        print('NX result: action=%s status=%s error=%s message=%s' % (
             response.get('action', ''), response.get('status', ''),
-            response.get('error_code', '')), flush=True)
+            response.get('error_code', ''), response.get('message', '')),
+            flush=True)
         try:
             with send_lock:
                 client.sendall(payload)

@@ -49,10 +49,12 @@ class BlockingRpc(FakeRpc):
 
 
 class TeachingRpc(FakeRpc):
-    def __init__(self, point_type=1):
+    def __init__(self, point_type=1, mapid='m', poseid='p'):
         super().__init__()
         self.teaching_active = True
         self.point_type = point_type
+        self.mapid = mapid
+        self.poseid = poseid
 
     def run(self, action, params=None, timeout_sec=120.0, dry_run=False,
             request_id=None):
@@ -61,10 +63,15 @@ class TeachingRpc(FakeRpc):
         if action == 'health':
             result['metrics'].update(
                 teaching_active=self.teaching_active,
-                teaching_point_type=self.point_type)
+                teaching_point_type=self.point_type,
+                teaching_mapid=self.mapid,
+                teaching_poseid=self.poseid)
         elif action == 'vision_point_teach' and int(params['command']) in {
-                2, 3}:
+                -1, 0}:
             self.teaching_active = False
+        elif action == 'vision_station_points':
+            result['metrics']['points'] = [
+                {'command': '1', 'point_type': self.point_type}]
         return result
 
 
@@ -105,7 +112,7 @@ class HandlerTests(unittest.TestCase):
         response = handler.handle({
             'type': 'mechanical_arm_command', 'command': 2})
         self.assertEqual(
-            ['health', 'robot_enable'],
+            ['robot_enable'],
             [call['action'] for call in rpc.calls])
         self.assertEqual('succeeded', response['status'])
         self.assertEqual(2, response['command'])
@@ -142,28 +149,37 @@ class HandlerTests(unittest.TestCase):
                 if command == 5:
                     self.assertEqual('success', response['shoudong'])
 
-    def test_asdun_command_precedence_does_not_require_type(self):
+    def test_untyped_bare_command_remains_legacy_control(self):
         rpc = FakeRpc()
         response = NxMessageHandler(GatewayConfig({}), rpc).handle({
-            'command': 6, 'mapid': 'ignored', 'poseid': 'ignored'})
+            'command': 6})
         self.assertEqual('robot_clear_error', rpc.calls[-1]['action'])
         self.assertEqual('success', response['qingchu'])
+
+    def test_untyped_station_command_is_rejected_as_ambiguous(self):
+        rpc = FakeRpc()
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'command': 1, 'mapid': 'm', 'poseid': 'p'})
+        self.assertEqual('failed', response['status'])
+        self.assertIn('type=mechanical_arm_command', response['message'])
+        self.assertEqual([], rpc.calls)
 
     def test_failed_enable_has_correct_and_historical_typo_fields(self):
         response = NxMessageHandler(
             GatewayConfig({}), FakeRpc(status='failed')).handle({
-                'type': 'mechanical_arm_enable', 'command': 2})
+                'type': 'mechanical_arm_command', 'command': 2})
         self.assertEqual('failed', response['shangdian'])
         self.assertEqual('failed', response['sahngdian'])
 
-    def test_active_teaching_reinterprets_legacy_commands_one_and_two(self):
+    def test_station_commands_one_and_two_are_always_teaching(self):
         rpc = TeachingRpc()
         handler = NxMessageHandler(GatewayConfig({}), rpc)
         first = handler.handle({
             'type': 'mechanical_arm_command', 'command': 1,
-            'params': {'frames': 5}})
+            'mapid': 'm', 'poseid': 'p', 'params': {'frames': 5}})
         second = handler.handle({
-            'type': 'mechanical_arm_command', 'command': 2})
+            'type': 'mechanical_arm_command', 'command': 2,
+            'mapid': 'm', 'poseid': 'p'})
         self.assertEqual('succeeded', first['status'])
         self.assertEqual('succeeded', second['status'])
         teaching_calls = [
@@ -171,14 +187,64 @@ class HandlerTests(unittest.TestCase):
             if call['action'] == 'vision_point_teach']
         self.assertEqual([1, 2], [
             call['params']['command'] for call in teaching_calls])
-        self.assertNotIn('frames', teaching_calls[0]['params'])
-        self.assertFalse(rpc.teaching_active)
-        self.assertEqual('record_a', first['teaching_command'])
-        self.assertEqual('record_b', second['teaching_command'])
+        self.assertEqual(5, teaching_calls[0]['params']['frames'])
+        self.assertEqual(
+            'record_reference_or_work_1', first['teaching_command'])
+        self.assertEqual('record_work', second['teaching_command'])
         self.assertNotIn('fuwei', first)
         self.assertNotIn('shangdian', second)
 
-    def test_drag_commands_are_idempotent_or_abort_during_teaching(self):
+    def test_station_commands_three_and_four_never_run_control_actions(self):
+        for command in (3, 4):
+            with self.subTest(command=command):
+                rpc = FakeRpc()
+                response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+                    'type': 'mechanical_arm_command', 'command': command,
+                    'mapid': 'm', 'poseid': 'p'})
+                self.assertEqual(
+                    ['vision_point_teach'],
+                    [call['action'] for call in rpc.calls])
+                self.assertEqual(command, rpc.calls[0]['params']['command'])
+                self.assertEqual('record_work', response['teaching_command'])
+                self.assertNotIn('xiadian', response)
+                self.assertNotIn('tuozhuai', response)
+
+    def test_bare_command_one_and_two_are_control_even_while_teaching(self):
+        # A bare command (no mapid/poseid) is always the 1-6 robot control
+        # mapping: command=1 is a reset, never an ICP/AprilTag record.
+        rpc = TeachingRpc()
+        handler = NxMessageHandler(GatewayConfig({}), rpc)
+        first = handler.handle({
+            'type': 'mechanical_arm_command', 'command': 1})
+        second = handler.handle({
+            'type': 'mechanical_arm_command', 'command': 2})
+        self.assertEqual('succeeded', first['status'])
+        self.assertEqual('succeeded', second['status'])
+        teaching_calls = [
+            call for call in rpc.calls
+            if call['action'] == 'vision_point_teach']
+        self.assertEqual([], teaching_calls)
+        self.assertEqual(
+            ['robot_reset', 'robot_enable'],
+            [call['action'] for call in rpc.calls])
+        self.assertEqual('success', first['fuwei'])
+        self.assertEqual('success', second['shangdian'])
+
+    def test_bare_control_retry_is_rejected_instead_of_queued(self):
+        rpc = FakeRpc()
+        handler = NxMessageHandler(GatewayConfig({}), rpc)
+        handler.resource_lock.acquire()
+        try:
+            response = handler.handle({
+                'type': 'mechanical_arm_command', 'command': 1})
+        finally:
+            handler.resource_lock.release()
+        self.assertEqual('failed', response['status'])
+        self.assertEqual('busy', response['error_code'])
+        self.assertEqual('failed', response['fuwei'])
+        self.assertEqual([], rpc.calls)
+
+    def test_bare_drag_commands_are_control_actions_during_teaching(self):
         rpc = TeachingRpc()
         handler = NxMessageHandler(GatewayConfig({}), rpc)
         start = handler.handle({
@@ -188,11 +254,11 @@ class HandlerTests(unittest.TestCase):
         teaching_calls = [
             call for call in rpc.calls
             if call['action'] == 'vision_point_teach']
-        self.assertEqual([4, 3], [
-            call['params']['command'] for call in teaching_calls])
-        self.assertEqual('drag_already_active', start['teaching_command'])
+        self.assertEqual([], teaching_calls)
+        self.assertEqual(
+            ['robot_start_drag', 'robot_stop_drag'],
+            [call['action'] for call in rpc.calls])
         self.assertEqual('success', start['tuozhuai'])
-        self.assertEqual('abort', stop['teaching_command'])
         self.assertEqual('success', stop['quxiaotuozhuai'])
 
     def test_execution_route_returns_done_only_on_success(self):
@@ -238,13 +304,13 @@ class HandlerTests(unittest.TestCase):
         response = NxMessageHandler(GatewayConfig({}), rpc).handle({
             'type': 'vision_point_teach', 'command': 1,
             'point_type': 1,
-            'mapid': 'm', 'poseid': 'p', 'label': 'P2'})
+            'mapid': 'm', 'poseid': 'p', 'task_command': '2'})
         self.assertEqual('vision_point_teach', rpc.calls[0]['action'])
         self.assertEqual(1, rpc.calls[0]['params']['command'])
         self.assertEqual('m', rpc.calls[0]['params']['mapid'])
         self.assertEqual('p', rpc.calls[0]['params']['poseid'])
         self.assertEqual(1, rpc.calls[0]['params']['point_type'])
-        self.assertEqual('P2', rpc.calls[0]['params']['label'])
+        self.assertEqual('2', rpc.calls[0]['params']['task_command'])
         self.assertEqual('succeeded', response['status'])
 
     def test_type1_starts_scoped_icp_teaching(self):
@@ -260,7 +326,7 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual('p', rpc.calls[0]['params']['poseid'])
         self.assertEqual(1, rpc.calls[0]['params']['point_type'])
 
-    def test_type2_string_and_numeric_forms_only_query_points(self):
+    def test_idle_type2_string_and_numeric_forms_query_points(self):
         for message_type in ('type2', '2', 2):
             with self.subTest(message_type=message_type):
                 rpc = FakeRpc()
@@ -268,9 +334,27 @@ class HandlerTests(unittest.TestCase):
                     GatewayConfig({}), rpc).handle({
                         'type': message_type, 'mapid': 'm', 'poseid': 'p'})
                 self.assertEqual('succeeded', response['status'])
-                self.assertEqual(1, len(rpc.calls))
                 self.assertEqual(
-                    'vision_station_points', rpc.calls[0]['action'])
+                    ['health', 'vision_station_points'],
+                    [call['action'] for call in rpc.calls])
+
+    def test_active_type2_finishes_then_queries_points(self):
+        rpc = TeachingRpc()
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'type': 'type2', 'mapid': 'm', 'poseid': 'p'})
+        self.assertEqual('succeeded', response['status'])
+        self.assertEqual(
+            ['health', 'vision_point_teach', 'vision_station_points'],
+            [call['action'] for call in rpc.calls])
+        self.assertEqual(0, rpc.calls[1]['params']['command'])
+        self.assertTrue(response['metrics']['teaching_finished'])
+
+    def test_type2_rejects_different_active_station(self):
+        rpc = TeachingRpc(mapid='other', poseid='other')
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'type': 'type2', 'mapid': 'm', 'poseid': 'p'})
+        self.assertEqual('failed', response['status'])
+        self.assertEqual(['health'], [call['action'] for call in rpc.calls])
 
     def test_numeric_type1_starts_teaching(self):
         rpc = FakeRpc()
@@ -332,15 +416,36 @@ class HandlerTests(unittest.TestCase):
             'vision_station_points',
             [current['action'] for current in rpc.calls])
 
+    def test_type1_apriltag_allows_defaults_and_top_level_override(self):
+        for extra, expected in (({}, {}), ({'tag_id': 3}, {'tag_id': 3})):
+            with self.subTest(extra=extra):
+                rpc = FakeRpc()
+                message = {
+                    'type': 'type1', 'mapid': 'm', 'poseid': 'tag',
+                    'point_type': 0,
+                }
+                message.update(extra)
+                response = NxMessageHandler(
+                    GatewayConfig({}), rpc).handle(message)
+                self.assertEqual('succeeded', response['status'])
+                for key, value in expected.items():
+                    self.assertEqual(value, rpc.calls[0]['params'][key])
+                if not extra:
+                    self.assertNotIn('tag_id', rpc.calls[0]['params'])
+                    self.assertNotIn(
+                        'tag_offset_xyz_mm', rpc.calls[0]['params'])
+
     def test_apriltag_record_command_does_not_query_saved_points(self):
         rpc = TeachingRpc(point_type=0)
         response = NxMessageHandler(GatewayConfig({}), rpc).handle({
             'type': 'mechanical_arm_command',
             'command': 1,
+            'mapid': 'm',
+            'poseid': 'p',
         })
         self.assertEqual('succeeded', response['status'])
         self.assertEqual(
-            ['health', 'vision_point_teach'],
+            ['vision_point_teach'],
             [call['action'] for call in rpc.calls])
         self.assertNotIn(
             'vision_station_points',
@@ -349,13 +454,52 @@ class HandlerTests(unittest.TestCase):
     def test_active_apriltag_teaching_command_one_records_pose(self):
         rpc = TeachingRpc(point_type=0)
         response = NxMessageHandler(GatewayConfig({}), rpc).handle({
-            'type': 'mechanical_arm_command', 'command': 1})
+            'type': 'mechanical_arm_command', 'command': 1,
+            'mapid': 'm', 'poseid': 'p'})
         teaching = [
             call for call in rpc.calls
             if call['action'] == 'vision_point_teach'][0]
-        self.assertEqual(0, teaching['params']['point_type'])
-        self.assertEqual('record_apriltag_pose', response['teaching_command'])
+        self.assertEqual(1, teaching['params']['command'])
+        self.assertEqual(
+            'record_reference_or_work_1', response['teaching_command'])
         self.assertNotIn('fuwei', response)
+
+    def test_type3_deletes_one_command_group(self):
+        for message_type in ('type3', '3', 3):
+            with self.subTest(message_type=message_type):
+                rpc = FakeRpc()
+                response = NxMessageHandler(
+                    GatewayConfig({}), rpc).handle({
+                        'type': message_type, 'mapid': 'm', 'poseid': 'p',
+                        'command': 2})
+                self.assertEqual('succeeded', response['status'])
+                self.assertEqual('vision_station_delete', rpc.calls[0]['action'])
+                self.assertEqual('2', rpc.calls[0]['params']['task_command'])
+
+    def test_type3_without_command_deletes_unique_pose(self):
+        rpc = FakeRpc()
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'type': 'type3', 'mapid': 'm', 'poseid': 'pose-uuid'})
+        self.assertEqual('succeeded', response['status'])
+        self.assertEqual('vision_station_delete', rpc.calls[0]['action'])
+        self.assertEqual(
+            {'mapid': 'm', 'poseid': 'pose-uuid'}, rpc.calls[0]['params'])
+
+    def test_unknown_typed_station_request_never_executes_production(self):
+        rpc = FakeRpc()
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'type': 'type_typo', 'mapid': 'm', 'poseid': 'p'})
+        self.assertEqual('failed', response['status'])
+        self.assertEqual([], rpc.calls)
+
+    def test_partial_station_identity_is_rejected(self):
+        rpc = FakeRpc()
+        response = NxMessageHandler(GatewayConfig({}), rpc).handle({
+            'type': 'mechanical_arm_command', 'command': 1,
+            'mapid': 'm'})
+        self.assertEqual('failed', response['status'])
+        self.assertIn('provided together', response['message'])
+        self.assertEqual([], rpc.calls)
 
     def test_invalid_point_type_fails_before_rpc(self):
         rpc = FakeRpc()
@@ -366,13 +510,13 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual('invalid_request', response['error_code'])
         self.assertEqual([], rpc.calls)
 
-    def test_missing_point_type_fails_before_rpc(self):
+    def test_missing_point_type_starts_normal_teaching(self):
         rpc = FakeRpc()
         response = NxMessageHandler(GatewayConfig({}), rpc).handle({
             'type': 'type1', 'mapid': 'm', 'poseid': 'p'})
-        self.assertEqual('failed', response['status'])
-        self.assertEqual('invalid_request', response['error_code'])
-        self.assertEqual([], rpc.calls)
+        self.assertEqual('succeeded', response['status'])
+        self.assertEqual('vision_point_teach', rpc.calls[0]['action'])
+        self.assertNotIn('point_type', rpc.calls[0]['params'])
 
     def test_explicit_station_execution_ignores_point_filter_fields(self):
         rpc = FakeRpc()

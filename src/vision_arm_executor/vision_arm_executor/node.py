@@ -1,7 +1,9 @@
 import os
+import threading
 import time
 
 import rclpy
+from apriltag_pick.camera_topics import camera_topic
 from apriltag_pick.pick_node import AprilTagPickNode
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -23,11 +25,18 @@ class ExecutorNode(Node):
             'handeye_path': (
                 '~/Robot_Arm_Project/scripts/active_handeye_calibration.json'),
             'tcp_calibration_path': '',
+            'pointcloud_topic': camera_topic('depth/color/points'),
             'robot_speed': 15,
             'max_message_bytes': 65536,
             'socket_timeout_sec': 5.0,
             'task_ttl_sec': 3600.0,
             'apriltag_cache_ttl_sec': 60.0,
+            'apriltag_detection_timeout_sec': 5.0,
+            'apriltag_search_detection_timeout_sec': 2.0,
+            'apriltag_post_observation_settle_sec': 2.0,
+            'apriltag_search_lateral_mm': 20.0,
+            'teaching_stable_sec': 2.0,
+            'teaching_stable_timeout_sec': 8.0,
             'apriltag_max_robot_drift_mm': 10.0,
             'apriltag_max_robot_drift_deg': 3.0,
             'max_move_translation_mm': 500.0,
@@ -61,8 +70,9 @@ class ExecutorNode(Node):
             self.cfg['rpc_auth_token'] = rpc_token
         self.latest_pc = None
         self.pc_seq = 0
+        self._pc_lock = threading.Lock()
         self.create_subscription(
-            PointCloud2, '/camera/camera/depth/color/points', self._pc, 10)
+            PointCloud2, self.cfg['pointcloud_topic'], self._pc, 10)
         self.tag_node = AprilTagPickNode()
         # Only execution_enable on this executor may authorize a cached pick.
         self.tag_node.execute_enabled = False
@@ -91,17 +101,25 @@ class ExecutorNode(Node):
             self.get_logger().error(
                 'PointCloud2 conversion failed; frame skipped: %s' % error)
             return
-        self.latest_pc = points
-        self.pc_seq += 1
+        with self._pc_lock:
+            self.latest_pc = points
+            self.pc_seq += 1
+
+    def capture_fresh_pointcloud(self, min_frames=1, timeout=2.0):
+        required = max(1, int(min_frames))
+        with self._pc_lock:
+            target = self.pc_seq + required
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._pc_lock:
+                if self.pc_seq >= target and self.latest_pc is not None:
+                    return self.latest_pc.copy()
+            time.sleep(0.02)
+        return None
 
     def wait_fresh(self, timeout=2.0):
-        target = self.pc_seq + 1
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.pc_seq >= target:
-                return True
-            time.sleep(0.02)
-        return False
+        return self.capture_fresh_pointcloud(
+            min_frames=1, timeout=timeout) is not None
 
     def destroy_node(self):
         self.server.close()

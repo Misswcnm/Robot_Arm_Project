@@ -12,6 +12,14 @@ vision_arm_executor:
     socket_timeout_sec: 5.0
     task_ttl_sec: 3600.0
     apriltag_cache_ttl_sec: 60.0
+    # Every localization waits at most 5 s for a new Tag frame. Production
+    # settles 2 s and searches the camera horizontal axis by +/-20 mm.
+    apriltag_detection_timeout_sec: 5.0
+    apriltag_search_detection_timeout_sec: 2.0
+    apriltag_post_observation_settle_sec: 2.0
+    apriltag_search_lateral_mm: 20.0
+    teaching_stable_sec: 2.0
+    teaching_stable_timeout_sec: 8.0
     apriltag_max_robot_drift_mm: 10.0
     apriltag_max_robot_drift_deg: 3.0
     motion_limits_enabled: false
@@ -19,7 +27,17 @@ vision_arm_executor:
     icp_max_iters: 30
     icp_final_trans_thresh_mm: 4.0
     icp_final_rot_thresh_deg: 1.5
-    icp_final_stable_frames: 1
+    # NX refreshes PointCloud2 more slowly than the development machine.
+    # Drain three post-motion frames and require two consistent estimates.
+    icp_final_stable_frames: 2
+    icp_fresh_frames_after_motion: 3
+    icp_pointcloud_timeout_sec: 5.0
+    icp_motion_confirmation_frames: 2
+    icp_motion_confirmation_translation_mm: 5.0
+    icp_motion_confirmation_rotation_deg: 1.0
+    # Reject a point-to-plane refinement that jumps away from its p2p seed.
+    icp_p2plane_max_refinement_translation_mm: 5.0
+    icp_p2plane_max_refinement_rotation_deg: 1.0
     estun_service_namespace: "/estun_codroid"
     # RobotDemo.cpp legacy global reset APos. command=1 and every completed
     # production point return to this joint position.
@@ -47,7 +65,7 @@ vision_arm_executor:
 apriltag_pick:
   ros__parameters:
     tag_frame: "tag36h11:0"
-    tag_size_m: 0.152
+    tag_size_m: 0.045
     handeye_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/handeye/active.json"
     tcp_calibration_path: "~/Robot_Arm_Project/data/vision_arm_estun/calibration/tcp/active.json"
     debug_output_dir: "~/Robot_Arm_Project/data/vision_arm_estun/apriltag_validation_runs"
@@ -56,7 +74,6 @@ apriltag_pick:
     samples: 10
     sample_window_sec: 2.0
     max_detection_age_sec: 1.0
-    max_sample_spread_mm: 8.0
     motion_limits_enabled: false
     pregrasp_height_mm: 80.0
     tag_to_tcp.xyz_mm: [0.0, 0.0, 0.0]

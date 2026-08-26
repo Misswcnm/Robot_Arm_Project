@@ -9,6 +9,8 @@ ICP Visual Servoing — 闭环补偿核心逻辑
   → 控制器IK求最终目标
     ESTUN无解时 → 完整可逆的平滑空间过渡点 → 原目标
 """
+from __future__ import annotations
+
 import os
 import tempfile
 import time
@@ -19,6 +21,31 @@ from scipy.spatial.transform import Rotation as Rot
 
 from icp_servoing.robot import CR5Robot
 from icp_servoing.pointcloud import voxel_down
+from icp_servoing.rotation_compat import (
+    rotation_as_matrix,
+    rotation_from_matrix,
+)
+
+
+def _tree_query(tree, points, **kwargs):
+    """Run cKDTree.query on both Foxy-era and current SciPy releases.
+
+    SciPy renamed the parallelism argument from ``n_jobs`` to ``workers`` in
+    1.6.  Ubuntu 20.04/Foxy commonly ships the older signature, while the
+    development machine uses the newer one.  Fall back once by capability;
+    the neighbour-search result and all geometric thresholds stay unchanged.
+    """
+    try:
+        return tree.query(points, workers=-1, **kwargs)
+    except TypeError as error:
+        if 'workers' not in str(error):
+            raise
+    try:
+        return tree.query(points, n_jobs=-1, **kwargs)
+    except TypeError as error:
+        if 'n_jobs' not in str(error):
+            raise
+    return tree.query(points, **kwargs)
 
 
 class VisualServo:
@@ -35,18 +62,26 @@ class VisualServo:
         self._T_base_camera_ref = None
         self._step_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
-        # Allow one residual-qualified ICP result within 4 mm.  The extra
+        # Allow a residual-qualified ICP estimate within 4 mm.  The extra
         # 2 mm absorbs the measured calibration/reconstruction deviation.
         self.final_icp_trans_thresh_mm = 4.0
         self.final_icp_rot_thresh_deg = 0.2
-        # One residual-qualified frame is sufficient after the explicit
-        # production recovery move to the taught A pose.
-        self.final_stable_frames = 1
+        # Do not let one low-rate/noisy NX frame declare convergence.
+        self.final_stable_frames = 2
         self._stable_count = 0
         self.point_to_plane_trigger_mm = 10.0
         self.point_to_plane_dmax = 0.010
         self.point_to_plane_iters = 6
         self.point_to_plane_max_points = 80000
+        self.p2plane_max_refinement_translation_mm = 5.0
+        self.p2plane_max_refinement_rotation_deg = 1.0
+        self.fresh_frames_after_motion = 3
+        self.pointcloud_timeout_sec = 5.0
+        self.motion_confirmation_frames = 2
+        self.motion_confirmation_translation_mm = 5.0
+        self.motion_confirmation_rotation_deg = 1.0
+        self._pending_motion_estimate = None
+        self._pending_motion_count = 0
         self.template_capture_max_motion_mm = 2.0
         self.template_capture_max_rotation_deg = 0.5
         self._cartesian_movj_disabled = False
@@ -60,14 +95,16 @@ class VisualServo:
                    min_inliers: int = 500,
                    max_translation: float = 0.500,
                    max_rotation_deg: float = 60.0) -> bool:
-        """宽松门控 — 大偏移下ICP overlap会很低, 只要>500匹配点且|t|<500mm就允许补偿"""
+        """Reject estimates outside the configured fit and motion bounds."""
         if info.get('inliers', 0) < min_inliers:
             return False
         if info.get('rmse', 99) > max_rmse:
             return False
+        if info.get('overlap', 0.0) < min_overlap:
+            return False
         t_norm = np.linalg.norm(T_icp[:3, 3])
         r_deg = np.degrees(np.linalg.norm(
-            Rot.from_matrix(T_icp[:3, :3]).as_rotvec()))
+            rotation_from_matrix(T_icp[:3, :3]).as_rotvec()))
         if t_norm > max_translation:
             return False
         if r_deg > max_rotation_deg:
@@ -81,7 +118,8 @@ class VisualServo:
         """判断视觉剩余校正是否已收敛: T_icp ≈ I"""
         t_norm = np.linalg.norm(T_icp[:3, 3])
         r_angle = np.degrees(
-            np.linalg.norm(Rot.from_matrix(T_icp[:3, :3]).as_rotvec()))
+            np.linalg.norm(rotation_from_matrix(
+                T_icp[:3, :3]).as_rotvec()))
         return t_norm < trans_thresh and r_angle < rot_thresh_deg
 
     @staticmethod
@@ -90,8 +128,29 @@ class VisualServo:
         T_err = np.linalg.inv(T_ref) @ T_cur
         t_err = np.linalg.norm(T_err[:3, 3])
         r_err = np.degrees(
-            np.linalg.norm(Rot.from_matrix(T_err[:3, :3]).as_rotvec()))
+            np.linalg.norm(rotation_from_matrix(
+                T_err[:3, :3]).as_rotvec()))
         return float(t_err), float(r_err)
+
+    @staticmethod
+    def transform_gap(T_first: np.ndarray, T_second: np.ndarray,
+                      translation_scale: float = 1.0) -> tuple[float, float]:
+        """Return the relative transform gap as translation and rotation."""
+        relative = np.linalg.inv(T_first) @ T_second
+        translation = float(
+            np.linalg.norm(relative[:3, 3]) * translation_scale)
+        rotation = float(np.degrees(np.linalg.norm(
+            rotation_from_matrix(relative[:3, :3]).as_rotvec())))
+        return translation, rotation
+
+    def _p2plane_refinement_is_local(self, seed: np.ndarray,
+                                     refined: np.ndarray) -> tuple[bool, float, float]:
+        translation_mm, rotation_deg = self.transform_gap(
+            seed, refined, translation_scale=1000.0)
+        accepted = (
+            translation_mm <= self.p2plane_max_refinement_translation_mm and
+            rotation_deg <= self.p2plane_max_refinement_rotation_deg)
+        return accepted, translation_mm, rotation_deg
 
     @staticmethod
     def _estimate_normals(pts: np.ndarray, tree, k: int = 16) -> np.ndarray:
@@ -105,7 +164,7 @@ class VisualServo:
         if len(pts) == 0:
             return np.empty((0, 3), dtype=np.float64)
         kk = min(k, len(pts))
-        _, idx = tree.query(pts, k=kk, workers=-1)
+        _, idx = _tree_query(tree, pts, k=kk)
         if kk == 1:
             return np.tile(np.array([0.0, 0.0, 1.0]), (len(pts), 1))
         normals = np.empty_like(pts)
@@ -143,7 +202,8 @@ class VisualServo:
 
         for _ in range(max_iter):
             src_tf = (T[:3, :3] @ src.T).T + T[:3, 3]
-            dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
+            dist, idx = _tree_query(
+                tree, src_tf, distance_upper_bound=dmax)
             mask = dist < dmax
             inliers = int(mask.sum())
             overlap = inliers / len(src) if len(src) else 0.0
@@ -177,7 +237,7 @@ class VisualServo:
             if t_norm > 0.003:
                 t_step *= 0.003 / t_norm
 
-            R_step = Rot.from_rotvec(rotvec).as_matrix()
+            R_step = rotation_as_matrix(Rot.from_rotvec(rotvec))
             T[:3, :3] = R_step @ T[:3, :3]
             T[:3, 3] = R_step @ T[:3, 3] + t_step
 
@@ -188,7 +248,8 @@ class VisualServo:
             last_rmse = rmse
 
         src_tf = (T[:3, :3] @ src.T).T + T[:3, 3]
-        dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
+        dist, idx = _tree_query(
+            tree, src_tf, distance_upper_bound=dmax)
         mask = dist < dmax
         inliers = int(mask.sum())
         overlap = inliers / len(src) if len(src) else 0.0
@@ -213,7 +274,9 @@ class VisualServo:
 
         frames = []
         for i in range(n_frames):
-            pc = self._capture_pc(vs=0.005)
+            # Template recording already collects n distinct frames.  Do not
+            # drain another three frames before every sample.
+            pc = self._capture_pc(vs=0.005, fresh_frames=1)
             if pc is not None:
                 frames.append(pc)
                 print(f'  [{i+1}/{n_frames}] {len(pc)} 点')
@@ -230,7 +293,7 @@ class VisualServo:
         T_motion = np.linalg.inv(T_before) @ T_after
         capture_motion_mm = float(np.linalg.norm(T_motion[:3, 3]))
         capture_rotation_deg = float(np.degrees(np.linalg.norm(
-            Rot.from_matrix(T_motion[:3, :3]).as_rotvec())))
+            rotation_from_matrix(T_motion[:3, :3]).as_rotvec())))
         if (capture_motion_mm > self.template_capture_max_motion_mm or
                 capture_rotation_deg >
                 self.template_capture_max_rotation_deg):
@@ -266,6 +329,8 @@ class VisualServo:
 
         self._step_count = 0  # reset for new template
         self._stable_count = 0
+        self._pending_motion_estimate = None
+        self._pending_motion_count = 0
         t = self._T_base_tool_ref[:3, 3]
         elapsed = time.perf_counter() - started
         print(
@@ -321,6 +386,8 @@ class VisualServo:
             self._T_base_camera_ref = np.asarray(
                 saved['T_base_camera_ref'], dtype=float)
         self._stable_count = 0
+        self._pending_motion_estimate = None
+        self._pending_motion_count = 0
         return True
 
     def _read_tool_matrix(self) -> np.ndarray | None:
@@ -329,22 +396,37 @@ class VisualServo:
         if tool is None:
             return None
         x, y, z = tool[:3]
-        R = Rot.from_euler(
-            'xyz', [tool[3], tool[4], tool[5]], degrees=True).as_matrix()
+        R = rotation_as_matrix(Rot.from_euler(
+            'xyz', [tool[3], tool[4], tool[5]], degrees=True))
         T = np.eye(4)
         T[:3, :3] = R
         T[:3, 3] = [x, y, z]
         return T
 
-    def _capture_pc(self, vs: float = 0.005) -> np.ndarray | None:
-        """等停稳后的新点云帧"""
+    def _capture_pc(self, vs: float = 0.005,
+                    fresh_frames: int | None = None) -> np.ndarray | None:
+        """After settling, drain old NX frames and copy the newest cloud."""
         pc_node = getattr(self, '_pc_node', None)
         if pc_node is None:
             return None
-        if not pc_node.wait_fresh(timeout=2.0):
-            print('  ⚠ 等待新点云帧超时')
+        required = (
+            self.fresh_frames_after_motion
+            if fresh_frames is None else max(1, int(fresh_frames)))
+        capture = getattr(pc_node, 'capture_fresh_pointcloud', None)
+        if capture is not None:
+            pc = capture(
+                min_frames=required, timeout=self.pointcloud_timeout_sec)
+        else:
+            if not pc_node.wait_fresh(timeout=self.pointcloud_timeout_sec):
+                pc = None
+            else:
+                pc = getattr(pc_node, 'latest_pc', None)
+                if pc is not None:
+                    pc = pc.copy()
+        if pc is None:
+            print(f'  ⚠ 等待 {required} 帧新点云超时 '
+                  f'({self.pointcloud_timeout_sec:.1f}s)')
             return None
-        pc = pc_node.latest_pc
         if pc is not None and len(pc) > 500:
             return voxel_down(pc, vs)
         return None
@@ -415,7 +497,8 @@ class VisualServo:
             src_tf = (T_acc[:3,:3] @ src_ds.T).T + T_acc[:3,3]
 
             # Use tree.query directly (pre-built, fast)
-            dist, idx = tree.query(src_tf, distance_upper_bound=dmax, workers=-1)
+            dist, idx = _tree_query(
+                tree, src_tf, distance_upper_bound=dmax)
             mask = dist < dmax
             if mask.sum() < 10:
                 scales_info.append({'rmse': float('inf'), 'inliers': 0, 'overlap': 0,
@@ -449,13 +532,19 @@ class VisualServo:
                 fine_src_ds, fine_tgt_pts, fine_tree, fine_normals, T_acc,
                 dmax=self.point_to_plane_dmax,
                 max_iter=self.point_to_plane_iters)
-            if p2l_info['inliers'] >= 30 and np.isfinite(p2l_info['rmse']):
+            local, refine_t_mm, refine_r_deg = (
+                self._p2plane_refinement_is_local(T_acc, T_p2l))
+            if (p2l_info['inliers'] >= 30 and
+                    np.isfinite(p2l_info['rmse']) and local):
                 T_acc = T_p2l
                 p2l_info['scale_vs_mm'] = 5.0
                 p2l_info['scale_dmax_mm'] = self.point_to_plane_dmax * 1000
                 p2l_info['method'] = 'p2plane'
                 p2l_info['time_ms'] = (time.perf_counter() - p2l_t0) * 1000.0
                 scales_info.append(p2l_info)
+            elif not local:
+                print('    L3(p2plane): 拒绝偏离p2p初值的细化 '
+                      f'gap={refine_t_mm:.1f}mm/{refine_r_deg:.2f}°')
 
         # Convert back to mm
         icp_time_ms = (time.perf_counter() - icp_t0) * 1000.0
@@ -480,7 +569,8 @@ class VisualServo:
             return out
 
         t_norm = np.linalg.norm(T_icp_mm[:3, 3])
-        r_deg = np.degrees(np.linalg.norm(Rot.from_matrix(T_icp_mm[:3,:3]).as_rotvec()))
+        r_deg = np.degrees(np.linalg.norm(
+            rotation_from_matrix(T_icp_mm[:3, :3]).as_rotvec()))
         out['icp_delta_mm'] = round(t_norm, 1)
         out['icp_rot_deg'] = round(r_deg, 2)
         print(f'  ICP: RMSE={out["rmse"]:.1f}mm  overl={out["overlap"]:.2f}  '
@@ -497,6 +587,8 @@ class VisualServo:
                             f'|t|={t_norm:.1f}mm |r|={r_deg:.1f}°')
             print(f'  ❌ {out["error"]}')
             self._stable_count = 0
+            self._pending_motion_estimate = None
+            self._pending_motion_count = 0
             return out
 
         # 4. 收敛判断: 只使用ICP估计的剩余校正量。
@@ -506,6 +598,8 @@ class VisualServo:
             self.final_icp_trans_thresh_mm,
             self.final_icp_rot_thresh_deg)
         if icp_converged:
+            self._pending_motion_estimate = None
+            self._pending_motion_count = 0
             self._stable_count += 1
             if self._stable_count < self.final_stable_frames:
                 out['ok'] = True
@@ -519,6 +613,47 @@ class VisualServo:
                   f'Tool误差(仅监控)={pose_t_err:.1f}mm/{pose_r_err:.2f}°')
             return out
         self._stable_count = 0
+
+        # A single low-rate NX cloud can settle into a plausible local
+        # minimum.  Confirm the proposed correction on independent fresh
+        # snapshots while the robot remains stationary before sending motion.
+        required_confirmations = max(1, int(self.motion_confirmation_frames))
+        if required_confirmations > 1:
+            if self._pending_motion_estimate is None:
+                self._pending_motion_estimate = T_icp_mm.copy()
+                self._pending_motion_count = 1
+                out['ok'] = True
+                out['motion_confirmation'] = 'pending'
+                print('  ↳ 暂不运动，等待独立新点云确认 '
+                      f'1/{required_confirmations}')
+                return out
+            gap_t_mm, gap_r_deg = self.transform_gap(
+                self._pending_motion_estimate, T_icp_mm)
+            consistent = (
+                gap_t_mm <= self.motion_confirmation_translation_mm and
+                gap_r_deg <= self.motion_confirmation_rotation_deg)
+            if not consistent:
+                self._pending_motion_estimate = T_icp_mm.copy()
+                self._pending_motion_count = 1
+                out['ok'] = True
+                out['motion_confirmation'] = 'restarted'
+                print('  ↳ 两次ICP结果不一致，丢弃前一候选并重新确认: '
+                      f'gap={gap_t_mm:.1f}mm/{gap_r_deg:.2f}°')
+                return out
+            self._pending_motion_count += 1
+            if self._pending_motion_count < required_confirmations:
+                self._pending_motion_estimate = T_icp_mm.copy()
+                out['ok'] = True
+                out['motion_confirmation'] = 'pending'
+                print('  ↳ ICP运动候选一致，继续等待确认 '
+                      f'{self._pending_motion_count}/'
+                      f'{required_confirmations}')
+                return out
+            print('  ↳ ICP运动候选连续确认通过: '
+                  f'{self._pending_motion_count}/{required_confirmations}, '
+                  f'gap={gap_t_mm:.1f}mm/{gap_r_deg:.2f}°')
+            self._pending_motion_estimate = None
+            self._pending_motion_count = 0
 
         # ICP计算与真实运动之间的安全取消点。
         if should_stop is not None and should_stop():
@@ -534,7 +669,8 @@ class VisualServo:
         T_delta = self.X @ T_icp_mm @ self.X_inv
         T_correction = np.linalg.inv(T_delta)
 
-        rotvec_full = Rot.from_matrix(T_correction[:3, :3]).as_rotvec()
+        rotvec_full = rotation_from_matrix(
+            T_correction[:3, :3]).as_rotvec()
         T_target = T_cur @ T_correction
         dp = [T_target[i,3]-T_cur[i,3] for i in range(3)]
         out['delta_mm'] = [round(v,1) for v in dp]
@@ -576,12 +712,12 @@ class VisualServo:
                 if after and pre_move:
                     dp_real = np.linalg.norm(
                         np.array(after[:3]) - np.array(pre_move[:3]))
-                    Ra = Rot.from_euler(
-                        'xyz', after[3:6], degrees=True).as_matrix()
-                    Rb = Rot.from_euler(
-                        'xyz', pre_move[3:6], degrees=True).as_matrix()
+                    Ra = rotation_as_matrix(Rot.from_euler(
+                        'xyz', after[3:6], degrees=True))
+                    Rb = rotation_as_matrix(Rot.from_euler(
+                        'xyz', pre_move[3:6], degrees=True))
                     dr = np.degrees(np.linalg.norm(
-                        Rot.from_matrix(Ra @ Rb.T).as_rotvec()))
+                        rotation_from_matrix(Ra @ Rb.T).as_rotvec()))
                     self._total_dp += dp_real
                     self._total_dr += dr
                     print(f'  → Solved JointMovJ '
@@ -609,9 +745,12 @@ class VisualServo:
                 after = self.robot.get_tool()
                 if after and pre_move:
                     dp_real = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
-                    Ra = Rot.from_euler('xyz',after[3:6],degrees=True).as_matrix()
-                    Rb = Rot.from_euler('xyz',pre_move[3:6],degrees=True).as_matrix()
-                    dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra@Rb.T).as_rotvec()))
+                    Ra = rotation_as_matrix(Rot.from_euler(
+                        'xyz', after[3:6], degrees=True))
+                    Rb = rotation_as_matrix(Rot.from_euler(
+                        'xyz', pre_move[3:6], degrees=True))
+                    dr = np.degrees(np.linalg.norm(
+                        rotation_from_matrix(Ra @ Rb.T).as_rotvec()))
                     self._total_dp += dp_real; self._total_dr += dr
                     print(f'  → MovJ {dp_real/10:.1f}cm  {dr:.1f}°')
                 out['ok'] = True; return out
@@ -654,9 +793,12 @@ class VisualServo:
             after = self.robot.get_tool()
             if after and pre_move:
                 dp_real = np.linalg.norm(np.array(after[:3])-np.array(pre_move[:3]))
-                Ra = Rot.from_euler('xyz', after[3:6], degrees=True).as_matrix()
-                Rb = Rot.from_euler('xyz', pre_move[3:6], degrees=True).as_matrix()
-                dr = np.degrees(np.linalg.norm(Rot.from_matrix(Ra @ Rb.T).as_rotvec()))
+                Ra = rotation_as_matrix(Rot.from_euler(
+                    'xyz', after[3:6], degrees=True))
+                Rb = rotation_as_matrix(Rot.from_euler(
+                    'xyz', pre_move[3:6], degrees=True))
+                dr = np.degrees(np.linalg.norm(
+                    rotation_from_matrix(Ra @ Rb.T).as_rotvec()))
                 self._total_dp += dp_real; self._total_dr += dr
                 print(f'  → JointMovJ {dp_real/10:.1f}cm  {dr:.1f}°')
             out['ok'] = True; return out
@@ -673,6 +815,8 @@ class VisualServo:
         self._stable_count = 0
         self._total_dp = 0.0; self._total_dr = 0.0
         self._cartesian_movj_disabled = False
+        self._pending_motion_estimate = None
+        self._pending_motion_count = 0
         self.last_align_result = {
             'converged': False, 'iterations': 0, 'reason': ''}
         i = 0
@@ -770,5 +914,5 @@ def _compute_jacobian(jd, eps=0.0005):
         T1 = _fk(np.eye(4), jp)
         J[0:3, i] = (T1[:3, 3] - p0) / eps
         dR = T1[:3, :3] @ T0[:3, :3].T
-        J[3:6, i] = Rot.from_matrix(dR).as_rotvec() / eps
+        J[3:6, i] = rotation_from_matrix(dR).as_rotvec() / eps
     return J

@@ -1,12 +1,15 @@
 """ESTUN entrypoint reusing the existing executor, protocol and storage."""
 
 import os
+import threading
 import time
 
 import rclpy
 from apriltag_pick import pick_node as apriltag_pick_module
+from apriltag_pick.camera_topics import camera_topic
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 
 from vision_arm_executor.executor import VisionExecutor
@@ -78,6 +81,7 @@ class EstunExecutorNode(Node):
             'tcp_calibration_path': (
                 '~/Robot_Arm_Project/data/vision_arm_estun/'
                 'calibration/tcp/active.json'),
+            'pointcloud_topic': camera_topic('depth/color/points'),
             'robot_speed': 15,
             'estun_reset_joints': [
                 86.0, 23.0, -112.0, -176.0, -85.0, 0.0],
@@ -86,6 +90,12 @@ class EstunExecutorNode(Node):
             'socket_timeout_sec': 5.0,
             'task_ttl_sec': 3600.0,
             'apriltag_cache_ttl_sec': 60.0,
+            'apriltag_detection_timeout_sec': 5.0,
+            'apriltag_search_detection_timeout_sec': 2.0,
+            'apriltag_post_observation_settle_sec': 2.0,
+            'apriltag_search_lateral_mm': 20.0,
+            'teaching_stable_sec': 2.0,
+            'teaching_stable_timeout_sec': 8.0,
             'apriltag_max_robot_drift_mm': 10.0,
             'apriltag_max_robot_drift_deg': 3.0,
             'motion_limits_enabled': False,
@@ -93,7 +103,14 @@ class EstunExecutorNode(Node):
             'icp_max_iters': 30,
             'icp_final_trans_thresh_mm': 4.0,
             'icp_final_rot_thresh_deg': 1.5,
-            'icp_final_stable_frames': 1,
+            'icp_final_stable_frames': 2,
+            'icp_fresh_frames_after_motion': 3,
+            'icp_pointcloud_timeout_sec': 5.0,
+            'icp_motion_confirmation_frames': 2,
+            'icp_motion_confirmation_translation_mm': 5.0,
+            'icp_motion_confirmation_rotation_deg': 1.0,
+            'icp_p2plane_max_refinement_translation_mm': 5.0,
+            'icp_p2plane_max_refinement_rotation_deg': 1.0,
         }
         self.cfg = {
             key: self.declare_parameter(key, value).value
@@ -116,8 +133,13 @@ class EstunExecutorNode(Node):
 
         self.latest_pc = None
         self.pc_seq = 0
-        self.create_subscription(
-            PointCloud2, '/camera/camera/depth/color/points', self._pc, 10)
+        self._pc_lock = threading.Lock()
+        self._pc_subscription = None
+        self._pc_waiters = 0
+        self._pc_session_users = 0
+        self._pc_last_request = 0.0
+        self._pc_idle_timeout_sec = 2.0
+        self.create_timer(1.0, self._release_idle_pointcloud_subscription)
 
         # AprilTagPickNode contains the proven localization/pick workflow but
         # constructs its robot internally. Replace that construction boundary
@@ -158,17 +180,81 @@ class EstunExecutorNode(Node):
             self.get_logger().error(
                 'PointCloud2 conversion failed; frame skipped: %s' % error)
             return
-        self.latest_pc = points
-        self.pc_seq += 1
+        with self._pc_lock:
+            self.latest_pc = points
+            self.pc_seq += 1
+
+    def _ensure_pointcloud_subscription(self):
+        if self._pc_subscription is None:
+            self._pc_subscription = self.create_subscription(
+                PointCloud2, self.cfg['pointcloud_topic'], self._pc,
+                qos_profile_sensor_data)
+            self.get_logger().info(
+                'ICP pointcloud subscription enabled on %s' %
+                self.cfg['pointcloud_topic'])
+
+    def _release_idle_pointcloud_subscription(self):
+        subscription = None
+        with self._pc_lock:
+            idle = time.monotonic() - self._pc_last_request
+            if (self._pc_subscription is not None and
+                    self._pc_waiters == 0 and
+                    self._pc_session_users == 0 and
+                    idle >= self._pc_idle_timeout_sec):
+                subscription = self._pc_subscription
+                self._pc_subscription = None
+                self.latest_pc = None
+        if subscription is not None:
+            self.destroy_subscription(subscription)
+            self.get_logger().info(
+                'ICP pointcloud subscription disabled while idle')
+
+    def begin_pointcloud_session(self):
+        """Keep the NX point-cloud subscription alive for one ICP run."""
+        with self._pc_lock:
+            self._ensure_pointcloud_subscription()
+            self._pc_session_users += 1
+            self._pc_last_request = time.monotonic()
+
+    def end_pointcloud_session(self):
+        with self._pc_lock:
+            if self._pc_session_users > 0:
+                self._pc_session_users -= 1
+            self._pc_last_request = time.monotonic()
+
+    def capture_fresh_pointcloud(self, min_frames=1, timeout=2.0):
+        """Drain old frames and atomically return the newest XYZ snapshot."""
+        required = max(1, int(min_frames))
+        with self._pc_lock:
+            self._ensure_pointcloud_subscription()
+            self._pc_waiters += 1
+            self._pc_last_request = time.monotonic()
+            start = self.pc_seq
+            target = start + required
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                with self._pc_lock:
+                    if self.pc_seq >= target and self.latest_pc is not None:
+                        snapshot = self.latest_pc.copy()
+                        captured = self.pc_seq
+                        self.get_logger().info(
+                            'ICP fresh pointcloud snapshot: seq=%d->%d '
+                            'drained=%d points=%d' % (
+                                start, captured, captured - start,
+                                len(snapshot)))
+                        return snapshot
+                time.sleep(0.02)
+            return None
+        finally:
+            with self._pc_lock:
+                self._pc_waiters -= 1
+                self._pc_last_request = time.monotonic()
 
     def wait_fresh(self, timeout=2.0):
-        target = self.pc_seq + 1
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.pc_seq >= target:
-                return True
-            time.sleep(0.02)
-        return False
+        """Compatibility API used by older icp_servoing checkouts."""
+        return self.capture_fresh_pointcloud(
+            min_frames=1, timeout=timeout) is not None
 
     def destroy_node(self):
         self.server.close()

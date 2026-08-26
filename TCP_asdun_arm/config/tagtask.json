@@ -1,0 +1,6 @@
+{
+  "record_root": "../records",
+  "tag_size_mm": 45.0,
+  "handeye_json": "../../data/vision_arm_estun/calibration/handeye/active.json",
+  "tcp_calibration_json": "../../data/vision_arm_estun/calibration/tcp/active.json"
+}

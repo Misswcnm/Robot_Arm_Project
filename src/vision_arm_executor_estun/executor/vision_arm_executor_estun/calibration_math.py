@@ -3,6 +3,12 @@
 from dataclasses import asdict, dataclass
 
 import numpy as np
+from apriltag_pick.rotation_compat import (
+    rotation_as_matrix,
+    rotation_from_matrix,
+    rotation_magnitude,
+    rotation_mean,
+)
 from scipy.spatial.transform import Rotation
 
 
@@ -30,8 +36,8 @@ def pose_to_matrix(pose):
     if values.size != 6 or not np.all(np.isfinite(values)):
         raise ValueError('pose must contain six finite values')
     transform = np.eye(4)
-    transform[:3, :3] = Rotation.from_euler(
-        'xyz', values[3:6], degrees=True).as_matrix()
+    transform[:3, :3] = rotation_as_matrix(Rotation.from_euler(
+        'xyz', values[3:6], degrees=True))
     transform[:3, 3] = values[:3]
     return transform
 
@@ -40,7 +46,7 @@ def matrix_to_pose(transform):
     transform = np.asarray(transform, dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
         raise ValueError('transform must be a finite 4x4 matrix')
-    rpy = Rotation.from_matrix(transform[:3, :3]).as_euler(
+    rpy = rotation_from_matrix(transform[:3, :3]).as_euler(
         'xyz', degrees=True)
     return [*transform[:3, 3].tolist(), *rpy.tolist()]
 
@@ -58,8 +64,8 @@ def pose_delta(first, second):
     translation = float(np.linalg.norm(second[:3] - first[:3]))
     first_rotation = Rotation.from_euler('xyz', first[3:6], degrees=True)
     second_rotation = Rotation.from_euler('xyz', second[3:6], degrees=True)
-    angle = float(np.degrees(
-        (second_rotation * first_rotation.inv()).magnitude()))
+    angle = float(np.degrees(rotation_magnitude(
+        second_rotation * first_rotation.inv())))
     return translation, angle
 
 
@@ -78,10 +84,10 @@ def solve_handeye(robot_transforms, camera_transforms):
                 inverse(robot_transforms[second]) @ robot_transforms[first])
             camera_motion = (
                 camera_transforms[second] @ inverse(camera_transforms[first]))
-            robot_angle = Rotation.from_matrix(
-                robot_motion[:3, :3]).magnitude()
-            camera_angle = Rotation.from_matrix(
-                camera_motion[:3, :3]).magnitude()
+            robot_angle = rotation_magnitude(rotation_from_matrix(
+                robot_motion[:3, :3]))
+            camera_angle = rotation_magnitude(rotation_from_matrix(
+                camera_motion[:3, :3]))
             robot_distance = np.linalg.norm(robot_motion[:3, 3])
             camera_distance = np.linalg.norm(camera_motion[:3, 3])
             if ((robot_angle < np.radians(0.5) and robot_distance < 3.0) or
@@ -97,9 +103,9 @@ def solve_handeye(robot_transforms, camera_transforms):
 
     correlation = np.zeros((3, 3))
     for motion_a, motion_b in zip(motions_a, motions_b):
-        vector_a = Rotation.from_matrix(
+        vector_a = rotation_from_matrix(
             motion_a[:3, :3]).as_rotvec()
-        vector_b = Rotation.from_matrix(
+        vector_b = rotation_from_matrix(
             motion_b[:3, :3]).as_rotvec()
         if np.linalg.norm(vector_a) < 1e-12:
             continue
@@ -133,13 +139,14 @@ def handeye_consistency(robot_transforms, camera_transforms, handeye):
     translations = np.asarray([
         transform[:3, 3] for transform in board_transforms])
     translation_mean = translations.mean(axis=0)
-    rotation_mean = Rotation.from_matrix(np.asarray([
-        transform[:3, :3] for transform in board_transforms])).mean()
+    rotation_average = rotation_mean(rotation_from_matrix(np.asarray([
+        transform[:3, :3] for transform in board_transforms])))
     translation_errors = np.linalg.norm(
         translations - translation_mean, axis=1)
     rotation_errors = [
-        np.degrees((Rotation.from_matrix(transform[:3, :3]) *
-                    rotation_mean.inv()).magnitude())
+        np.degrees(rotation_magnitude(
+            rotation_from_matrix(transform[:3, :3]) *
+            rotation_average.inv()))
         for transform in board_transforms
     ]
     return {

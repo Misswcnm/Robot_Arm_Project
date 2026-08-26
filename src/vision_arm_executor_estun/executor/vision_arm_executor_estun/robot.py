@@ -7,6 +7,13 @@ import time
 
 import numpy as np
 import rclpy
+from apriltag_pick.rotation_compat import (
+    rotation_as_matrix,
+    rotation_between_vectors,
+    rotation_from_matrix,
+    rotation_magnitude,
+    rotation_stack,
+)
 from estun_codroid_bridge.srv import (
     GetJoints,
     GetPose,
@@ -201,7 +208,7 @@ class EstunRobot:
     @staticmethod
     def matrix_to_pose(transform):
         transform = np.asarray(transform, dtype=float)
-        rpy = Rotation.from_matrix(transform[:3, :3]).as_euler(
+        rpy = rotation_from_matrix(transform[:3, :3]).as_euler(
             'xyz', degrees=True)
         return [
             float(transform[0, 3]), float(transform[1, 3]),
@@ -218,8 +225,8 @@ class EstunRobot:
             'xyz', actual[3:6], degrees=True)
         target_rotation = Rotation.from_euler(
             'xyz', target[3:6], degrees=True)
-        rotation = float(np.degrees(
-            (target_rotation * actual_rotation.inv()).magnitude()))
+        rotation = float(np.degrees(rotation_magnitude(
+            target_rotation * actual_rotation.inv())))
         return position, rotation
 
     def get_tool(self, warn=True):
@@ -267,6 +274,21 @@ class EstunRobot:
 
     def get_robot_mode(self):
         return self.get_mode()
+
+    def _wait_mode(self, target_mode, timeout=5.0):
+        """Poll until the controller confirms ``target_mode``.
+
+        Codroid's Standby -> Ready -> Auto transition is asynchronous, so a
+        single ``get_mode()`` immediately after SwitchOn/ToAuto/ToReady can
+        read a stale state and report a false failure. This bounds the wait
+        and only returns True once the requested mode is actually observed.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.get_mode() == target_mode:
+                return True
+            time.sleep(0.1)
+        return False
 
     def _robot_error(self):
         return self._state() == self.ESTUN_STATE_ERROR
@@ -322,7 +344,7 @@ class EstunRobot:
         if not self._command(RobotCommand.Request.TO_AUTO):
             return False
         self.dragging = False
-        return self.get_mode() == self.MODE_ENABLED
+        return self._wait_mode(self.MODE_ENABLED)
 
     def enable(self):
         return self.enable_robot()
@@ -374,7 +396,7 @@ class EstunRobot:
                 'pendant or configured hand-guiding function, then send the '
                 'unchanged command=1/2; ToReady itself is not freedrive.')
             self._warned_manual_drag = True
-        return self.get_mode() == self.MODE_BACKDRIVE
+        return self._wait_mode(self.MODE_BACKDRIVE)
 
     def stop_drag(self):
         # Keep the original frontend semantics: finish teaching restores the
@@ -384,7 +406,7 @@ class EstunRobot:
         if not self._command(RobotCommand.Request.TO_AUTO):
             return False
         self.dragging = False
-        return self.get_mode() == self.MODE_ENABLED
+        return self._wait_mode(self.MODE_ENABLED)
 
     def _stop_motion(self):
         return self._command(RobotCommand.Request.STOP_MOTION, timeout=5.0)
@@ -538,8 +560,8 @@ class EstunRobot:
     @staticmethod
     def _pose_transform(pose):
         transform = np.eye(4)
-        transform[:3, :3] = Rotation.from_euler(
-            'xyz', pose[3:], degrees=True).as_matrix()
+        transform[:3, :3] = rotation_as_matrix(Rotation.from_euler(
+            'xyz', pose[3:], degrees=True))
         transform[:3, 3] = pose[:3]
         return transform
 
@@ -576,7 +598,7 @@ class EstunRobot:
             fractions = np.linspace(0.0, 1.0, steps + 1)[1:]
             rotations = Slerp(
                 [0.0, 1.0],
-                Rotation.concatenate([start_rotation, target_rotation]))(
+                rotation_stack([start_rotation, target_rotation]))(
                     fractions).as_euler('xyz', degrees=True)
             for azimuth_deg in np.arange(0.0, 360.0, 45.0):
                 azimuth = np.radians(azimuth_deg)
@@ -696,8 +718,8 @@ class EstunRobot:
 
     @staticmethod
     def _rotation_distance_deg(left, right):
-        return float(np.degrees(Rotation.from_matrix(
-            np.asarray(left).T @ np.asarray(right)).magnitude()))
+        return float(np.degrees(rotation_magnitude(rotation_from_matrix(
+            np.asarray(left).T @ np.asarray(right)))))
 
     def _apriltag_candidate_rotations(
             self, nominal_rotation, tag_normal, tcp_axis_flange):
@@ -735,14 +757,12 @@ class EstunRobot:
 
         candidates = [nominal_rotation]
         for direction in directions:
-            align, unused = Rotation.align_vectors(
-                [direction], [tcp_axis_flange])
-            del unused
-            aligned = align.as_matrix()
+            align = rotation_between_vectors(tcp_axis_flange, direction)
+            aligned = rotation_as_matrix(align)
             twists = []
             for twist_deg in np.arange(-180.0, 180.0, 5.0):
-                twist = Rotation.from_rotvec(
-                    direction * np.radians(twist_deg)).as_matrix()
+                twist = rotation_as_matrix(Rotation.from_rotvec(
+                    direction * np.radians(twist_deg)))
                 candidate = twist @ aligned
                 twists.append((
                     self._rotation_distance_deg(
@@ -886,8 +906,8 @@ class EstunRobot:
             'xyz', start[3:], degrees=True)
         target_rotation = Rotation.from_euler(
             'xyz', target[3:], degrees=True)
-        rotation_deg = float(np.degrees(
-            (start_rotation.inv() * target_rotation).magnitude()))
+        rotation_deg = float(np.degrees(rotation_magnitude(
+            start_rotation.inv() * target_rotation)))
         steps = max(
             1,
             int(np.ceil(
@@ -897,7 +917,7 @@ class EstunRobot:
         fractions = np.linspace(0.0, 1.0, steps + 1)[1:]
         rotations = Slerp(
             [0.0, 1.0],
-            Rotation.concatenate([start_rotation, target_rotation]))(
+            rotation_stack([start_rotation, target_rotation]))(
                 fractions).as_euler('xyz', degrees=True)
         start_xyz = np.asarray(start[:3], dtype=float)
         target_xyz = np.asarray(target[:3], dtype=float)

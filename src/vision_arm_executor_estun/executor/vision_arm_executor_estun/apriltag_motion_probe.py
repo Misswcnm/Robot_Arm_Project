@@ -17,8 +17,11 @@ from apriltag_pick.transforms import (
     matrix_to_tool_pose,
     tool_pose_matrix,
 )
+from apriltag_pick.rotation_compat import (
+    rotation_from_matrix,
+    rotation_magnitude,
+)
 from estun_codroid_bridge.srv import GetRobotState
-from scipy.spatial.transform import Rotation
 
 from .robot import EstunRobot
 
@@ -35,9 +38,9 @@ def _matrix(value, name):
 
 
 def _rotation_error_deg(first, second):
-    delta = Rotation.from_matrix(second[:3, :3]) * Rotation.from_matrix(
+    delta = rotation_from_matrix(second[:3, :3]) * rotation_from_matrix(
         first[:3, :3]).inv()
-    return float(np.degrees(delta.magnitude()))
+    return float(np.degrees(rotation_magnitude(delta)))
 
 
 def load_probe_data(cache_path, pregrasp_mm=80.0):

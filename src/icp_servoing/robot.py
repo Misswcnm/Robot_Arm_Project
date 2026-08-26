@@ -1,4 +1,6 @@
 """CR5 robot interface: init, movj, GetPose, wait_stop."""
+from __future__ import annotations
+
 import threading
 import time
 import numpy as np
@@ -10,6 +12,10 @@ from dobot_msgs_v4.srv import (EnableRobot, DisableRobot, ClearError,
                                 MovJ, SpeedFactor, GetAngle, GetPose, GetErrorID,
                                 SetCollisionLevel, RobotMode, StartDrag, StopDrag,
                                 Tool, User, ResetRobot)
+from icp_servoing.rotation_compat import (
+    rotation_from_matrix,
+    rotation_magnitude,
+)
 
 
 class CR5Robot:
@@ -225,7 +231,8 @@ class CR5Robot:
     @staticmethod
     def matrix_to_pose(T: np.ndarray) -> list:
         """4x4工具位姿矩阵 -> Dobot xyz/rpy(mm,deg)."""
-        rpy = Rot.from_matrix(T[:3, :3]).as_euler('xyz', degrees=True)
+        rpy = rotation_from_matrix(T[:3, :3]).as_euler(
+            'xyz', degrees=True)
         return [float(T[0, 3]), float(T[1, 3]), float(T[2, 3]),
                 float(rpy[0]), float(rpy[1]), float(rpy[2])]
 
@@ -273,7 +280,7 @@ class CR5Robot:
             np.asarray(target[:3], dtype=float)))
         Ra = Rot.from_euler('xyz', actual[3:6], degrees=True)
         Rt = Rot.from_euler('xyz', target[3:6], degrees=True)
-        rot_err = float(np.degrees((Rt * Ra.inv()).magnitude()))
+        rot_err = float(np.degrees(rotation_magnitude(Rt * Ra.inv())))
         return pos_err, rot_err
 
     def wait_pose_arrival(self, target, start_pose=None, timeout: float = 12.0,

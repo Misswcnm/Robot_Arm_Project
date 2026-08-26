@@ -101,6 +101,17 @@ class FakeServo:
         return True
 
 
+class FakePointCloudSessionNode:
+    def __init__(self):
+        self.events = []
+
+    def begin_pointcloud_session(self):
+        self.events.append('begin')
+
+    def end_pointcloud_session(self):
+        self.events.append('end')
+
+
 class FakeTagNode:
     def __init__(self):
         self.robot = FakeRobot()
@@ -116,7 +127,10 @@ class FakeTagNode:
     def _target_tag_id(self, tag_frame=None):
         return int(str(tag_frame or self.tag_frame).rsplit(':', 1)[1])
 
-    def locate(self, tag_id=None):
+    def locate(self, tag_id=None, wait_for_new_detection=True,
+               detection_timeout_sec=5.0):
+        self.wait_for_new_detection = bool(wait_for_new_detection)
+        self.detection_timeout_sec = float(detection_timeout_sec)
         selected = self._target_tag_id() if tag_id is None else int(tag_id)
         self.requested_tag_ids.append(selected)
         target = self.tag_to_tcp.copy()
@@ -140,11 +154,12 @@ class FakeTagNode:
 
 
 class IcpBackendTests(unittest.TestCase):
-    def make(self):
+    def make(self, node=None):
         robot = FakeRobot()
         cfg = {'robot_speed': 15, 'handeye_path': '/dev/null'}
         backend = IcpBackend(
-            object(), cfg, robot_factory=lambda *unused: robot,
+            object() if node is None else node, cfg,
+            robot_factory=lambda *unused: robot,
             servo_factory=FakeServo,
             handeye_loader=lambda unused: np.eye(4))
         return backend, robot
@@ -195,6 +210,27 @@ class IcpBackendTests(unittest.TestCase):
         self.assertEqual('icp_residual_converged', result.metrics['reason'])
         self.assertEqual(1, len(guarded))
         self.assertEqual(1, len(progressed))
+
+    def test_align_keeps_pointcloud_subscription_for_whole_session(self):
+        node = FakePointCloudSessionNode()
+        backend, unused_robot = self.make(node=node)
+        result = backend.align(
+            '/tmp/reference.npz', 5, lambda: False,
+            lambda *unused: None, lambda unused: None)
+        self.assertTrue(result.converged)
+        self.assertEqual(['begin', 'end'], node.events)
+
+    def test_align_releases_pointcloud_session_after_exception(self):
+        node = FakePointCloudSessionNode()
+        backend, unused_robot = self.make(node=node)
+        servo = backend._servo()
+        servo.align = mock.Mock(side_effect=RuntimeError('ICP crashed'))
+        with self.assertRaisesRegex(RuntimeError, 'ICP crashed'):
+            backend.align(
+                '/tmp/reference.npz', 5, lambda: False,
+                lambda *unused: None, lambda unused: None)
+        self.assertEqual(['begin', 'end'], node.events)
+        self.assertIsNone(servo.motion_guard)
 
     def test_move_to_reference_uses_absolute_taught_a_pose(self):
         backend, robot = self.make()

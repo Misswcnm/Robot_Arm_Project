@@ -11,6 +11,8 @@
       refine: true
       sharpening: 0.25
       debug: false
+      # NX only needs fresh detections, not full-rate video processing.
+      max_rate_hz: 5.0
     pose_estimation_method: pnp
     # Do not configure tag.ids/tag.frames: apriltag_ros then publishes every
     # detected 36h11 ID with its default frame name tag36h11:<id>. The station

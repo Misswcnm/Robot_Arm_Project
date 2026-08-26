@@ -9,6 +9,7 @@ import time
 import cv2
 import numpy as np
 import rclpy
+from apriltag_pick.camera_topics import camera_topic
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -260,9 +261,9 @@ def parser():
     result.add_argument('--output-root', default=DEFAULT_ROOT)
     result.add_argument('--activate', action='store_true')
     result.add_argument('--image-topic',
-                        default='/camera/camera/color/image_raw')
+                        default=camera_topic('color/image_raw'))
     result.add_argument('--camera-info-topic',
-                        default='/camera/camera/color/camera_info')
+                        default=camera_topic('color/camera_info'))
     result.add_argument('--chess-cols', type=int, default=8)
     result.add_argument('--chess-rows', type=int, default=11)
     result.add_argument('--square-mm', type=float, default=20.0)

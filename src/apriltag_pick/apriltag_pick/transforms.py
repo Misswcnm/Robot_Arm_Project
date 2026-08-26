@@ -4,15 +4,18 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from .rotation_compat import rotation_as_matrix, rotation_from_matrix
+
 
 def pose_matrix(xyz, quat_xyzw=None, rpy_deg=None):
     transform = np.eye(4, dtype=float)
     transform[:3, 3] = np.asarray(xyz, dtype=float)
     if quat_xyzw is not None:
-        transform[:3, :3] = Rotation.from_quat(quat_xyzw).as_matrix()
+        transform[:3, :3] = rotation_as_matrix(
+            Rotation.from_quat(quat_xyzw))
     elif rpy_deg is not None:
-        transform[:3, :3] = Rotation.from_euler(
-            'xyz', rpy_deg, degrees=True).as_matrix()
+        transform[:3, :3] = rotation_as_matrix(Rotation.from_euler(
+            'xyz', rpy_deg, degrees=True))
     return transform
 
 
@@ -89,6 +92,6 @@ def tool_pose_matrix(pose):
 
 
 def matrix_to_tool_pose(transform):
-    rpy = Rotation.from_matrix(transform[:3, :3]).as_euler(
+    rpy = rotation_from_matrix(transform[:3, :3]).as_euler(
         'xyz', degrees=True)
     return [*transform[:3, 3].tolist(), *rpy.tolist()]

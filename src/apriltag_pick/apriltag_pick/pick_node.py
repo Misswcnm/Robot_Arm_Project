@@ -14,10 +14,15 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
+from .camera_topics import camera_topic
 from .robot import CR5Robot
 from .transforms import (
     load_handeye, load_handeye_document, load_tcp_offset, pose_matrix,
     tool_pose_matrix)
+
+
+class TagDetectionTimeout(RuntimeError):
+    """No new transform for the requested Tag arrived before the deadline."""
 
 
 class AprilTagPickNode(Node):
@@ -38,7 +43,6 @@ class AprilTagPickNode(Node):
         self.max_detection_age = float(p('max_detection_age_sec', 1.0).value)
         self.sample_window = float(p('sample_window_sec', 2.0).value)
         self.samples = int(p('samples', 10).value)
-        self.max_sample_spread_mm = float(p('max_sample_spread_mm', 8.0).value)
         self.pregrasp_height = float(p('pregrasp_height_mm', 80.0).value)
         self.motion_limits_enabled = bool(
             p('motion_limits_enabled', True).value)
@@ -74,6 +78,9 @@ class AprilTagPickNode(Node):
         self.history = []
         self.tag_histories = {}
         self.image_history = []
+        self.image_history_rate_hz = float(
+            p('image_history_rate_hz', 5.0).value)
+        self.last_image_history_stamp = None
         self.detection_history = []
         self.camera_info = None
         self.last_localization = None
@@ -84,17 +91,24 @@ class AprilTagPickNode(Node):
         self.tag_diagnostic_save_index = 0
         self.debug_save_index = 0
         self.lock = threading.Lock()
+        self.tag_condition = threading.Condition(self.lock)
+        self.tag_generations = {}
+        self.image_topic = str(p(
+            'camera_image_topic', camera_topic('color/image_raw')).value)
+        self.camera_info_topic = str(p(
+            'camera_info_topic', camera_topic('color/camera_info')).value)
         self.create_subscription(TFMessage, '/tf', self._tf_callback, 20)
         self.create_subscription(
-            Image, '/camera/camera/color/image_raw', self._image_callback,
+            Image, self.image_topic, self._image_callback,
             qos_profile_sensor_data)
         self.create_subscription(
-            CameraInfo, '/camera/camera/color/camera_info',
+            CameraInfo, self.camera_info_topic,
             self._camera_info_callback, qos_profile_sensor_data)
         self.create_subscription(
             AprilTagDetectionArray, '/detections', self._detection_callback, 10)
         self.get_logger().info(
-            f'等待 {self.tag_frame}; execute_enabled={self.execute_enabled}')
+            f'等待 {self.tag_frame}; execute_enabled={self.execute_enabled}; '
+            f'image_topic={self.image_topic}')
 
     @staticmethod
     def _uses_flange_tcp(path):
@@ -162,19 +176,31 @@ class AprilTagPickNode(Node):
                 [t.x * 1000.0, t.y * 1000.0, t.z * 1000.0],
                 quat_xyzw=[q.x, q.y, q.z, q.w])
             stamp = item.header.stamp.sec + item.header.stamp.nanosec * 1e-9
-            with self.lock:
+            with self.tag_condition:
                 history = self.tag_histories.setdefault(child_frame, [])
                 history.append((stamp, transform))
                 del history[:-max(30, self.samples * 3)]
+                self.tag_generations[child_frame] = (
+                    self.tag_generations.get(child_frame, 0) + 1)
                 if child_frame == self.tag_frame:
                     self.latest = (stamp, transform)
                     self.history = list(history)
+                self.tag_condition.notify_all()
 
     @staticmethod
     def _message_stamp(message):
         return message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
 
     def _image_callback(self, message):
+        stamp = self._message_stamp(message)
+        if self.image_history_rate_hz > 0.0:
+            period = 1.0 / self.image_history_rate_hz
+            with self.lock:
+                previous = self.last_image_history_stamp
+                if (previous is not None and stamp >= previous and
+                        stamp - previous < period):
+                    return
+                self.last_image_history_stamp = stamp
         try:
             height, width = message.height, message.width
             data = np.frombuffer(message.data, dtype=np.uint8)
@@ -196,7 +222,6 @@ class AprilTagPickNode(Node):
                 return
         except (ValueError, cv2.error):
             return
-        stamp = self._message_stamp(message)
         with self.lock:
             self.image_history.append((stamp, image, message.header.frame_id))
             self.image_history = self.image_history[-15:]
@@ -458,16 +483,33 @@ class AprilTagPickNode(Node):
             json.dump(record, stream, ensure_ascii=False, indent=2)
         return pnp3d_path
 
-    def locate(self, tag_id=None):
+    def locate(self, tag_id=None, wait_for_new_detection=True,
+               detection_timeout_sec=5.0):
         if not self.robot.use_base_frame():
             raise RuntimeError('定位前无法锁定 User(0) 基座原点')
-        flange_pose = self.robot.get_tool(warn=False)
-        if flange_pose is None:
-            raise RuntimeError('GetPose无有效位姿')
         target_frame = (
             self.tag_frame if tag_id is None
             else self._tag_frame_for_id(tag_id))
         target_id = self._target_tag_id(target_frame)
+        if wait_for_new_detection:
+            timeout = max(0.1, float(detection_timeout_sec))
+            deadline = time.monotonic() + timeout
+            with self.tag_condition:
+                generation = self.tag_generations.get(target_frame, 0)
+                while self.tag_generations.get(target_frame, 0) <= generation:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise TagDetectionTimeout(
+                            f'等待Tag ID {target_id}新检测帧超时: '
+                            f'{timeout:.1f}s')
+                    self.tag_condition.wait(timeout=min(0.2, remaining))
+
+        # Read GetPose after the selected Tag frame arrives. This keeps the
+        # hand-eye chain tied to the stopped teaching pose instead of mixing a
+        # cached camera pose with an earlier/later robot pose.
+        flange_pose = self.robot.get_tool(warn=False)
+        if flange_pose is None:
+            raise RuntimeError('GetPose无有效位姿')
         now = self.get_clock().now().nanoseconds * 1e-9
         with self.lock:
             history = list(self.tag_histories.get(target_frame, []))
@@ -475,9 +517,6 @@ class AprilTagPickNode(Node):
             raise RuntimeError('尚未检测到Tag ID %s' % target_id)
         newest_stamp = history[-1][0]
         age = now - newest_stamp
-        if age > self.max_detection_age:
-            raise RuntimeError(
-                f'Tag已过期: age={age:.2f}s > {self.max_detection_age:.2f}s')
         # One command performs one localization. Reuse up to N recent frames
         # for robustness, but never wait for a fixed frame count.
         recent = [
@@ -487,9 +526,8 @@ class AprilTagPickNode(Node):
         translations = np.asarray([item[:3, 3] for item in recent])
         center = np.median(translations, axis=0)
         spread = float(np.max(np.linalg.norm(translations - center, axis=1)))
-        if spread > self.max_sample_spread_mm:
-            raise RuntimeError(
-                f'Tag检测抖动过大: {spread:.1f}mm > {self.max_sample_spread_mm:.1f}mm')
+        # Spread remains observable in logs and metrics, but is not an
+        # execution gate. Any fresh detection is accepted.
 
         # Robust translation median; use the pose nearest that median for rotation.
         camera_tag = min(recent, key=lambda item: np.linalg.norm(item[:3, 3] - center)).copy()

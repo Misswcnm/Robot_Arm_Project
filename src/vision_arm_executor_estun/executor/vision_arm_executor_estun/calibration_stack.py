@@ -7,11 +7,12 @@ import subprocess
 import time
 
 from . import handeye_calibration
+from apriltag_pick.camera_topics import camera_topic
 
 
 ESTUN_POSE_SERVICE = '/estun_codroid/get_pose'
-CAMERA_IMAGE_TOPIC = '/camera/camera/color/image_raw'
-CAMERA_INFO_TOPIC = '/camera/camera/color/camera_info'
+CAMERA_IMAGE_TOPIC = camera_topic('color/image_raw')
+CAMERA_INFO_TOPIC = camera_topic('color/camera_info')
 
 
 def driver_command(model, robot_ip, use_fake_hardware=False):

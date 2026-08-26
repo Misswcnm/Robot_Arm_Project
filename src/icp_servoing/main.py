@@ -13,6 +13,10 @@ from icp_servoing.robot import CR5Robot
 from icp_servoing.handeye import load_X
 from icp_servoing.servoing import VisualServo
 from icp_servoing.pointcloud import cloud_to_xyz
+from icp_servoing.rotation_compat import (
+    rotation_as_matrix,
+    rotation_from_matrix,
+)
 
 PERTURB = {
     '1': {'label': '小-', 'delta': [-5,  0,  0, -3,  0,  0]},
@@ -25,7 +29,8 @@ PERTURB = {
 
 
 def tool_to_matrix(tool):
-    R = Rot.from_euler('xyz', tool[3:6], degrees=True).as_matrix()
+    R = rotation_as_matrix(
+        Rot.from_euler('xyz', tool[3:6], degrees=True))
     T = np.eye(4)
     T[:3, :3] = R
     T[:3, 3] = tool[:3]
@@ -35,7 +40,7 @@ def tool_to_matrix(tool):
 def pose_error(T_cur, T_target):
     dp = T_target[:3, 3] - T_cur[:3, 3]
     dR = T_target[:3, :3] @ T_cur[:3, :3].T
-    dr = Rot.from_matrix(dR).as_rotvec()
+    dr = rotation_from_matrix(dR).as_rotvec()
     return dp, dr
 
 
@@ -184,7 +189,7 @@ def main():
                         delta_A2B = np.linalg.inv(T_tool_A) @ T_tool_B
                         d_mm = np.linalg.norm(delta_A2B[:3,3])
                         dr_deg = np.degrees(np.linalg.norm(
-                            Rot.from_matrix(
+                            rotation_from_matrix(
                                 delta_A2B[:3,:3]).as_rotvec()))
                         print(
                             f'  ✅ 点B已记录: '

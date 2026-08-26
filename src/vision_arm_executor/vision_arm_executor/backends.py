@@ -11,6 +11,10 @@ import threading
 import time
 
 import numpy as np
+from apriltag_pick.rotation_compat import (
+    rotation_as_matrix,
+    rotation_magnitude,
+)
 from scipy.spatial.transform import Rotation
 
 
@@ -74,8 +78,8 @@ def _pose_transform(pose):
         raise RuntimeError('GetPose failed')
     transform = np.eye(4)
     transform[:3, 3] = pose[:3]
-    transform[:3, :3] = Rotation.from_euler(
-        'xyz', pose[3:6], degrees=True).as_matrix()
+    transform[:3, :3] = rotation_as_matrix(Rotation.from_euler(
+        'xyz', pose[3:6], degrees=True))
     return transform
 
 
@@ -126,7 +130,21 @@ class IcpBackend:
                     ('icp_final_rot_thresh_deg',
                      'final_icp_rot_thresh_deg', float),
                     ('icp_final_stable_frames',
-                     'final_stable_frames', int)):
+                     'final_stable_frames', int),
+                    ('icp_fresh_frames_after_motion',
+                     'fresh_frames_after_motion', int),
+                    ('icp_pointcloud_timeout_sec',
+                     'pointcloud_timeout_sec', float),
+                    ('icp_motion_confirmation_frames',
+                     'motion_confirmation_frames', int),
+                    ('icp_motion_confirmation_translation_mm',
+                     'motion_confirmation_translation_mm', float),
+                    ('icp_motion_confirmation_rotation_deg',
+                     'motion_confirmation_rotation_deg', float),
+                    ('icp_p2plane_max_refinement_translation_mm',
+                     'p2plane_max_refinement_translation_mm', float),
+                    ('icp_p2plane_max_refinement_rotation_deg',
+                     'p2plane_max_refinement_rotation_deg', float)):
                 if key in self.cfg:
                     setattr(
                         self._servo_instance, attribute,
@@ -320,18 +338,63 @@ class IcpBackend:
         self._require_teaching_drag()
         return self._teaching_joints(required=True)
 
+    def wait_teaching_stable(self, min_duration_sec=1.0, timeout_sec=8.0):
+        """Require the manually dragged arm to remain still continuously."""
+        self._require_teaching_drag()
+        minimum = max(0.0, float(min_duration_sec))
+        deadline = time.monotonic() + max(minimum, float(timeout_sec))
+        previous = None
+        stable_since = None
+        while time.monotonic() < deadline:
+            pose = self._robot().get_tool(warn=False)
+            current_time = time.monotonic()
+            if pose is None:
+                previous = None
+                stable_since = None
+                time.sleep(0.1)
+                continue
+            current = np.asarray(pose[:6], dtype=float)
+            if previous is not None:
+                position_delta = float(np.linalg.norm(
+                    current[:3] - previous[:3]))
+                rotation_delta = float(np.linalg.norm(
+                    (current[3:6] - previous[3:6] + 180.0) % 360.0 -
+                    180.0))
+                if position_delta < 0.3 and rotation_delta < 0.1:
+                    if stable_since is None:
+                        stable_since = current_time
+                    if current_time - stable_since >= minimum:
+                        return True
+                else:
+                    stable_since = None
+            previous = current
+            time.sleep(0.1)
+        raise RuntimeError(
+            '机械臂未连续停稳 %.1fs，未记录示教点' % minimum)
+
     def align(self, template_path, max_iters, should_stop,
               progress_callback, motion_guard):
         self.initialize_robot()
         servo = self._servo()
-        servo.load_template(template_path)
-        servo.motion_guard = motion_guard
+        begin_session = getattr(
+            self.node, 'begin_pointcloud_session', None)
+        end_session = getattr(self.node, 'end_pointcloud_session', None)
+        session_started = False
         try:
-            converged = servo.align(
-                int(max_iters), should_stop=should_stop,
-                progress_callback=progress_callback)
+            if begin_session is not None:
+                begin_session()
+                session_started = True
+            servo.load_template(template_path)
+            servo.motion_guard = motion_guard
+            try:
+                converged = servo.align(
+                    int(max_iters), should_stop=should_stop,
+                    progress_callback=progress_callback)
+            finally:
+                servo.motion_guard = None
         finally:
-            servo.motion_guard = None
+            if session_started and end_session is not None:
+                end_session()
         return IcpAlignment(
             bool(converged), dict(servo.last_align_result))
 
@@ -357,9 +420,14 @@ class IcpBackend:
         return target.copy()
 
     def move_relative(self, delta, label, motion_guard,
-                      reference_transform=None, reference_joints=None):
-        current = self.flange_transform()
-        target = current @ np.asarray(delta, dtype=float)
+                      reference_transform=None, reference_joints=None,
+                      base_transform=None):
+        base = (
+            self.flange_transform() if base_transform is None
+            else np.asarray(base_transform, dtype=float))
+        if base.shape != (4, 4) or not np.all(np.isfinite(base)):
+            raise RuntimeError('corrected Ref flange transform is invalid')
+        target = base @ np.asarray(delta, dtype=float)
         # Preserve the demonstrated shoulder/elbow/wrist branch with APos,
         # then apply only the small ICP correction in Cartesian space.  This
         # mirrors TCP_asdun_arm, whose production task points are all APos.
@@ -379,6 +447,18 @@ class IcpBackend:
         if not moved:
             raise RuntimeError('relative B move failed')
         return target
+
+    def move_joints(self, joints, label, motion_guard=None,
+                    target_transform=None):
+        self.initialize_robot()
+        values = np.asarray(joints, dtype=float).reshape(-1)
+        if values.shape != (6,) or not np.all(np.isfinite(values)):
+            raise RuntimeError('%s has invalid six-axis joints' % label)
+        if target_transform is not None and motion_guard is not None:
+            motion_guard(np.asarray(target_transform, dtype=float))
+        if not self._robot().movj(values.astype(float).tolist()):
+            raise RuntimeError('%s joint move failed' % label)
+        return values.astype(float).tolist()
 
 
 class AprilTagBackend:
@@ -433,11 +513,17 @@ class AprilTagBackend:
                 'tag_offset_xyz_mm must contain three finite numbers')
         return values
 
-    def locate(self, tag_id=None, tag_offset_xyz_mm=None):
+    def locate(self, tag_id=None, tag_offset_xyz_mm=None,
+               wait_for_new_detection=True, detection_timeout_sec=5.0):
         identity = self.identity(tag_id)
+        locate_kwargs = {}
+        if wait_for_new_detection:
+            locate_kwargs.update(
+                wait_for_new_detection=True,
+                detection_timeout_sec=detection_timeout_sec)
         if tag_offset_xyz_mm is None:
             target = np.asarray(
-                self._tag.locate(tag_id=identity.tag_id),
+                self._tag.locate(tag_id=identity.tag_id, **locate_kwargs),
                 dtype=float).copy()
             localization = dict(self._tag.last_localization or {})
             if not localization:
@@ -454,7 +540,8 @@ class AprilTagBackend:
             self._tag.tag_to_tcp = configured
             try:
                 target = np.asarray(
-                    self._tag.locate(tag_id=identity.tag_id),
+                    self._tag.locate(
+                        tag_id=identity.tag_id, **locate_kwargs),
                     dtype=float).copy()
                 localization = dict(self._tag.last_localization or {})
             finally:
@@ -488,6 +575,35 @@ class AprilTagBackend:
             raise RuntimeError('AprilTag observation pose move failed')
         return target
 
+    def move_flange_target(self, target, safety_check, label='AprilTag Work'):
+        target = np.asarray(target, dtype=float)
+        if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+            raise RuntimeError('%s target transform is invalid' % label)
+        self._ensure_robot_ready()
+        safety_check('before_work', target)
+        solved_move = getattr(self._tag.robot, 'movj_solved_pose', None)
+        if solved_move is not None:
+            moved = solved_move(target, label)
+        else:
+            moved = self._tag.robot.move_pose(target)
+        if not moved:
+            raise RuntimeError('%s move failed' % label)
+        return target.copy()
+
+    def lateral_observation_target(self, observation_target, offset_mm):
+        """Shift an observation pose along the camera image horizontal axis."""
+        target = np.asarray(observation_target, dtype=float).copy()
+        flange_camera = np.asarray(
+            self._tag.flange_from_camera, dtype=float)
+        if (target.shape != (4, 4) or flange_camera.shape != (4, 4) or
+                not np.all(np.isfinite(target)) or
+                not np.all(np.isfinite(flange_camera))):
+            raise RuntimeError('AprilTag search transform is invalid')
+        camera_x_in_base = (
+            target[:3, :3] @ flange_camera[:3, :3])[:, 0]
+        target[:3, 3] += camera_x_in_base * float(offset_mm)
+        return target
+
     def validate_manual(self):
         state = self.robot_state()
         if not state.dragging and state.mode != state.backdrive_mode:
@@ -519,8 +635,8 @@ class AprilTagBackend:
             'xyz', current[3:6], degrees=True)
         detection_rotation = Rotation.from_euler(
             'xyz', detection[3:6], degrees=True)
-        rotation = float(np.degrees(
-            (current_rotation * detection_rotation.inv()).magnitude()))
+        rotation = float(np.degrees(rotation_magnitude(
+            current_rotation * detection_rotation.inv())))
         return translation, rotation
 
     def pick(self, safety_check):

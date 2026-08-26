@@ -1,8 +1,8 @@
-"""Pure parsing and classification for the legacy NX JSON protocol."""
+"""Pure parsing and deterministic classification for the NX JSON protocol."""
 
 from dataclasses import dataclass
 
-from .station_store import normalize_point_type
+from .station_store import normalize_point_type, normalize_task_command
 
 
 COMMAND_ACTIONS = {
@@ -18,6 +18,7 @@ EXPLICIT_ACTIONS = {
     'vision_point_teach',
     'vision_station_points',
     'vision_station_execute',
+    'vision_station_delete',
     'vision_icp_align',
     'vision_icp_align_and_move_b',
     'apriltag_locate',
@@ -42,7 +43,7 @@ class ParsedNxRequest:
     point_type: object = None
 
 
-def _message_point_type(message, required=False):
+def _message_point_type(message):
     values = []
     for source in (message, message.get('params', {})):
         if not isinstance(source, dict):
@@ -52,9 +53,17 @@ def _message_point_type(message, required=False):
                 values.append(normalize_point_type(source.get(key)))
     if values and any(value != values[0] for value in values[1:]):
         raise RuntimeError('conflicting point_type fields')
-    if values:
-        return values[0]
-    return normalize_point_type(None, required=required)
+    return values[0] if values else None
+
+
+def _message_type(value):
+    if not isinstance(value, bool) and value in (1, '1'):
+        return 'type1'
+    if not isinstance(value, bool) and value in (2, '2'):
+        return 'type2'
+    if not isinstance(value, bool) and value in (3, '3'):
+        return 'type3'
+    return str(value or '')
 
 
 def parse_nx_request(message):
@@ -63,49 +72,84 @@ def parse_nx_request(message):
     params = message.get('params', {})
     if params is not None and not isinstance(params, dict):
         raise RuntimeError('params must be an object')
-    raw_type = message.get('type', '')
-    # The historical clients use both "type1"/"type2" and numeric 1/2.
-    # Normalize them before classification so {"type": 2, ...} cannot fall
-    # through to the mapid+poseid production route.
-    if not isinstance(raw_type, bool) and raw_type in (1, '1'):
-        message_type = 'type1'
-    elif not isinstance(raw_type, bool) and raw_type in (2, '2'):
-        message_type = 'type2'
-    else:
-        message_type = str(raw_type or '')
+    message_type = _message_type(message.get('type', ''))
+
+    has_mapid = message.get('mapid') not in (None, '')
+    has_poseid = message.get('poseid') not in (None, '')
+    if has_mapid != has_poseid:
+        raise RuntimeError('mapid and poseid must be provided together')
+    has_station = has_mapid and has_poseid
 
     if message_type in {'execution_enable', 'execution_disable'}:
         return ParsedNxRequest('permission', message, message_type)
-
-    # Preserve the old controller's precedence: an untyped JSON containing
-    # command=1..6 is a control command. Explicit executor actions keep their
-    # own command field semantics.
-    if 'command' in message and message_type not in EXPLICIT_ACTIONS:
-        try:
-            command = int(message.get('command'))
-        except (TypeError, ValueError):
-            raise RuntimeError('command must be an integer from 1 to 6')
-        if command not in COMMAND_ACTIONS:
-            raise RuntimeError('unsupported legacy command')
-        return ParsedNxRequest('command', message, message_type, command)
 
     if message_type in EXPLICIT_ACTIONS:
         return ParsedNxRequest(
             'explicit', message, message_type,
             point_type=(
-                None if message_type == 'vision_station_execute'
-                else _message_point_type(message, required=False)))
+                None if message_type in {
+                    'vision_station_execute', 'vision_station_delete'}
+                else _message_point_type(message)))
 
-    if message_type == 'type2':
-        return ParsedNxRequest('query', message, message_type)
-
-    if message_type in {'demo_point_recorded', 'type1'}:
+    if message_type == 'type1':
+        if not has_station:
+            raise RuntimeError('type1 teaching requires mapid and poseid')
+        if 'command' in message:
+            raise RuntimeError(
+                'type1 starts teaching and must not contain command')
         return ParsedNxRequest(
             'teaching_start', message, message_type,
-            point_type=_message_point_type(message, required=True))
+            point_type=_message_point_type(message))
 
-    if message.get('mapid') not in (None, '') and message.get(
-            'poseid') not in (None, ''):
+    if message_type == 'type2':
+        if not has_station:
+            raise RuntimeError('type2 query requires mapid and poseid')
+        if 'command' in message:
+            raise RuntimeError('type2 must not contain command')
+        return ParsedNxRequest('query', message, message_type)
+
+    if message_type == 'type3':
+        if not has_station:
+            raise RuntimeError('type3 deletion requires mapid and poseid')
+        raw_command = message.get('command')
+        return ParsedNxRequest(
+            'delete', message, message_type,
+            command=(None if raw_command in (None, '')
+                     else normalize_task_command(raw_command)))
+
+    if message_type == 'mechanical_arm_command':
+        if 'command' not in message:
+            raise RuntimeError('mechanical_arm_command requires command')
+        try:
+            command = int(message.get('command'))
+        except (TypeError, ValueError):
+            raise RuntimeError('command must be an integer')
+        if has_station:
+            if command < -1:
+                raise RuntimeError(
+                    'teaching command must be -1, 0 or a positive integer')
+            return ParsedNxRequest(
+                'teaching_command', message, message_type, command)
+        if command not in COMMAND_ACTIONS:
+            raise RuntimeError('unsupported legacy command')
+        return ParsedNxRequest('command', message, message_type, command)
+
+    # Keep the oldest untyped controller form, but do not let a typed message
+    # fall through into an unrelated action.
+    if message_type == '' and 'command' in message:
+        try:
+            command = int(message.get('command'))
+        except (TypeError, ValueError):
+            raise RuntimeError('command must be an integer')
+        if has_station:
+            raise RuntimeError(
+                'station teaching command requires '
+                'type=mechanical_arm_command')
+        if command not in COMMAND_ACTIONS:
+            raise RuntimeError('unsupported legacy command')
+        return ParsedNxRequest('command', message, message_type, command)
+
+    if has_station and message_type == '':
         return ParsedNxRequest('production', message, message_type)
 
     raise RuntimeError('unsupported NX request')
