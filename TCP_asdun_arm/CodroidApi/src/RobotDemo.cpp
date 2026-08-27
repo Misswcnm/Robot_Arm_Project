@@ -35,6 +35,7 @@ namespace
 constexpr double kArrivalToleranceDeg = 0.5;
 constexpr double kArrivalStableSeconds = 0.5;
 constexpr double kArrivalTimeoutSeconds = 12.0;
+constexpr double kRobotStateTimeoutSeconds = 10.0;
 constexpr int kServerPort = 8888;
 const std::array<double, 6> kResetJoints{
     86.0, 23.0, -112.0, -176.0, -85.0, 0.0};
@@ -164,6 +165,54 @@ public:
         return false;
     }
 
+    bool readRobotState(c2::RobotState &state, std::string &error)
+    {
+        const c2::Response response = api_.getRobotState(2);
+        if (response.code != c2::ResponseCode::OK) {
+            error = response.msg.empty() ?
+                "cannot read ESTUN robot state" : response.msg;
+            return false;
+        }
+        try {
+            state = static_cast<c2::RobotState>(response.data.get<int>());
+            return true;
+        } catch (const std::exception &exception) {
+            error = std::string("ESTUN robot state parse failed: ") +
+                    exception.what();
+            return false;
+        }
+    }
+
+    bool waitRobotState(c2::RobotState expected, std::string &error,
+                        double timeout_seconds = kRobotStateTimeoutSeconds)
+    {
+        const auto deadline = Clock::now() +
+            std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(timeout_seconds));
+        c2::RobotState last_state = c2::RobotState::None;
+        std::string last_error;
+        while (Clock::now() < deadline) {
+            if (readRobotState(last_state, last_error)) {
+                if (last_state == expected) {
+                    std::cout << "[STARTUP] robot state confirmed: "
+                              << static_cast<int>(last_state) << std::endl;
+                    return true;
+                }
+                if (last_state == c2::RobotState::Error) {
+                    error = "ESTUN robot entered error state while waiting for mode change";
+                    return false;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        error = "timeout waiting for ESTUN robot state " +
+                std::to_string(static_cast<int>(expected)) +
+                "; last state=" +
+                std::to_string(static_cast<int>(last_state));
+        if (!last_error.empty()) error += "; last error: " + last_error;
+        return false;
+    }
+
     bool waitJointArrival(const std::array<double, 6> &target,
                           std::string &error,
                           double tolerance_deg = kArrivalToleranceDeg,
@@ -238,13 +287,33 @@ public:
 
     bool preflight(std::string &error)
     {
-        const c2::Response state = api_.getRobotState(5);
-        if (state.code != c2::ResponseCode::OK) {
-            error = "cannot connect to ESTUN Codroid: " + state.msg;
+        c2::RobotState state = c2::RobotState::None;
+        if (!readRobotState(state, error)) {
+            error = "cannot connect to ESTUN Codroid: " + error;
             return false;
         }
-        return userCommand(c2::UserCommand::SwitchOn, error) &&
-               userCommand(c2::UserCommand::ToAuto, error) && reset(error);
+        std::cout << "[STARTUP] initial robot state="
+                  << static_cast<int>(state) << std::endl;
+
+        if (state == c2::RobotState::Error) {
+            error = "ESTUN robot is in error state; clear the error before startup";
+            return false;
+        }
+        if (state == c2::RobotState::Init ||
+            state == c2::RobotState::StandBy) {
+            if (!userCommand(c2::UserCommand::SwitchOn, error) ||
+                !waitRobotState(c2::RobotState::Ready, error)) {
+                return false;
+            }
+            state = c2::RobotState::Ready;
+        }
+        if (state != c2::RobotState::Auto) {
+            if (!userCommand(c2::UserCommand::ToAuto, error) ||
+                !waitRobotState(c2::RobotState::Auto, error)) {
+                return false;
+            }
+        }
+        return reset(error);
     }
 
     void stopBestEffort()
