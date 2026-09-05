@@ -20,6 +20,23 @@
 
   </xacro:macro>
 
+  <!-- 引入 Robotiq 2F-85 的可复用宏。
+       不直接 include robotiq_2f_85_gripper.urdf.xacro，因为该文件会额外创建 world。 -->
+  <xacro:include
+    filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
+
+  <xacro:macro name="cr5_robotiq_2f_85" params="parent xyz rpy">
+    <xacro:robotiq_gripper
+      name="CR5Robotiq2F85"
+      prefix="gripper_"
+      parent="${parent}"
+      include_ros2_control="false">
+      <origin
+        xyz="${xyz}"
+        rpy="${rpy}"/>
+    </xacro:robotiq_gripper>
+  </xacro:macro>
+
   <link name="dummy_link" />
   <link
     name="base_link">
@@ -425,6 +442,13 @@
     parent="Link6"
     xyz="0 -0.06 -0.04"
     rpy="1.5708 -1.5708 0"/>
+    
+
+    <!-- Robotiq 底座坐标系安装在 CR5 末端法兰；实际转接板尺寸可通过 xyz/rpy 微调。 -->
+    <xacro:cr5_robotiq_2f_85
+      parent="Link6"
+      xyz="0 0 0"
+      rpy="0 0 0"/>
 
     <gazebo reference="base_link">
         <gravity>false</gravity>
