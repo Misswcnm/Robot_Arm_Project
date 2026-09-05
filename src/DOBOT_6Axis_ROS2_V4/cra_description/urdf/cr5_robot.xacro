@@ -440,9 +440,47 @@
 
     <xacro:cr5_camera
     parent="Link6"
-    xyz="0 -0.06 -0.04"
+    xyz="0 -0.1 -0.04"
     rpy="1.5708 -1.5708 0"/>
-    
+
+    <!-- Gazebo Classic RGB-D 仿真：随 camera_link 运动。
+         Gazebo 镜头沿局部 +X 观察，消息采用光学坐标系（+Z 向前）。
+         彩色与深度共用一个虚拟镜头，不模拟 D455 的双目基线及独立彩色镜头。 -->
+    <gazebo reference="camera_link">
+      <sensor name="d455_rgbd_sensor" type="depth">
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>true</always_on>
+        <update_rate>15</update_rate>
+        <visualize>true</visualize>
+        <camera>
+          <!-- 约 87 度水平视场角；以下参数为可调整的仿真设置。 -->
+          <horizontal_fov>1.5184364492350666</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>5.0</far>
+          </clip>
+        </camera>
+        <plugin name="d455_camera_plugin" filename="libgazebo_ros_camera.so">
+          <ros>
+            <namespace>/camera</namespace>
+            <remapping>d455/image_raw:=color/image_raw</remapping>
+            <remapping>d455/camera_info:=color/camera_info</remapping>
+            <remapping>d455/depth/image_raw:=depth/image_raw</remapping>
+            <remapping>d455/depth/camera_info:=depth/camera_info</remapping>
+            <remapping>d455/points:=depth/points</remapping>
+          </ros>
+          <camera_name>d455</camera_name>
+          <frame_name>camera_depth_optical_frame</frame_name>
+          <min_depth>0.1</min_depth>
+          <max_depth>5.0</max_depth>
+        </plugin>
+      </sensor>
+    </gazebo>
 
     <!-- Robotiq 底座坐标系安装在 CR5 末端法兰；实际转接板尺寸可通过 xyz/rpy 微调。 -->
     <xacro:cr5_robotiq_2f_85
